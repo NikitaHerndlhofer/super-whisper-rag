@@ -3,6 +3,7 @@ import { mkdir, unlink, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { userInfo } from "node:os";
 import { DEFAULTS } from "../paths.ts";
+import { run } from "../spawn.ts";
 import { PLIST_LABEL, renderPlist } from "./plist.ts";
 
 export interface InstallSyncOptions {
@@ -27,14 +28,11 @@ export async function installLaunchAgent(opts: InstallSyncOptions): Promise<stri
   // Make idempotent: bootout any existing instance first.
   bootout();
 
-  const uid = process.getuid?.() ?? 501;
-  const r = Bun.spawnSync({
-    cmd: ["launchctl", "bootstrap", `gui/${uid}`, plistPath],
-    timeout: 10_000,
+  const r = run(["launchctl", "bootstrap", `gui/${currentUid()}`, plistPath], {
+    timeoutMs: 10_000,
   });
   if (r.exitCode !== 0) {
-    const stderr = r.stderr ? new TextDecoder().decode(r.stderr) : "";
-    throw new Error(`launchctl bootstrap failed: ${stderr}`);
+    throw new Error(`launchctl bootstrap failed: ${r.stderr}`);
   }
   return plistPath;
 }
@@ -54,11 +52,27 @@ export async function uninstallLaunchAgent(): Promise<boolean> {
  * not consulted — `launchctl` looks the service up by label.
  */
 function bootout(): boolean {
-  const uid = process.getuid?.() ?? 501;
-  const r = Bun.spawnSync({
-    cmd: ["launchctl", "bootout", `gui/${uid}/${PLIST_LABEL}`],
-    timeout: 5_000,
+  const r = run(["launchctl", "bootout", `gui/${currentUid()}/${PLIST_LABEL}`], {
+    timeoutMs: 5_000,
   });
   // Exit non-zero is fine — service may not have been loaded.
   return r.exitCode === 0;
+}
+
+/**
+ * The current user's uid. `process.getuid` exists on every supported
+ * platform (we ship Darwin only), so failure here is exceptional and
+ * we'd rather error out than guess `501` and bootstrap into another
+ * user's session.
+ */
+function currentUid(): number {
+  const uid = process.getuid?.();
+  if (uid == null) {
+    throw new Error(
+      "cannot determine current uid; launchctl bootstrap requires it. " +
+        "This usually means the swrag binary is running in an environment " +
+        "where process.getuid is not available.",
+    );
+  }
+  return uid;
 }

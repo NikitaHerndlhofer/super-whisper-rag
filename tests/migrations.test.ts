@@ -1,10 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { z } from "zod";
-import {
-  ensureExtensionCapableSqlite,
-  openArchive,
-} from "../src/archive/open.ts";
+import { ensureExtensionCapableSqlite, openArchive } from "../src/archive/open.ts";
 import { runMigrations, splitSqlStatements } from "../src/archive/migrate.ts";
 import { LATEST_VERSION, MIGRATIONS } from "../src/archive/migrations.ts";
 import { vecDylibPath } from "../src/archive/vec-loader.ts";
@@ -119,9 +116,7 @@ describe("runMigrations idempotency", () => {
       const init = MIGRATIONS[0];
       if (!init) throw new Error("missing init migration");
       db.exec(init.sql);
-      expect(
-        queryOne(db, UserVersionRowSchema, "PRAGMA user_version").user_version,
-      ).toBe(0);
+      expect(queryOne(db, UserVersionRowSchema, "PRAGMA user_version").user_version).toBe(0);
 
       const result = runMigrations(db);
       expect(result.fromVersion).toBe(0);
@@ -146,9 +141,9 @@ describe("runMigrations idempotency", () => {
       db.exec("ALTER TABLE recording ADD COLUMN audio_hash TEXT");
 
       expect(() => runMigrations(db)).not.toThrow();
-      expect(
-        queryOne(db, UserVersionRowSchema, "PRAGMA user_version").user_version,
-      ).toBe(LATEST_VERSION);
+      expect(queryOne(db, UserVersionRowSchema, "PRAGMA user_version").user_version).toBe(
+        LATEST_VERSION,
+      );
     } finally {
       db.close();
     }
@@ -179,11 +174,7 @@ describe("openArchive runs migrations transparently", () => {
 describe("splitSqlStatements", () => {
   test("splits on top-level semicolons", () => {
     const stmts = splitSqlStatements("SELECT 1; SELECT 2; SELECT 3;");
-    expect(stmts.map((s) => s.trim())).toEqual([
-      "SELECT 1;",
-      "SELECT 2;",
-      "SELECT 3;",
-    ]);
+    expect(stmts.map((s) => s.trim())).toEqual(["SELECT 1;", "SELECT 2;", "SELECT 3;"]);
   });
 
   test("respects BEGIN…END trigger bodies", () => {
@@ -213,5 +204,28 @@ describe("splitSqlStatements", () => {
       .map((s) => s.trim())
       .filter(Boolean);
     expect(stmts).toHaveLength(2);
+  });
+
+  test("respects doubled-quote escapes inside string literals", () => {
+    // 'it''s' is one literal containing an apostrophe. A naive splitter
+    // would treat the first `'` of `''` as closing the string and then
+    // see `; SELECT 2` as a top-level boundary inside what it thinks is
+    // a freshly-opened string.
+    const sql = "INSERT INTO t (s) VALUES ('it''s; fine'); SELECT 2;";
+    const stmts = splitSqlStatements(sql)
+      .map((s) => s.trim())
+      .filter(Boolean);
+    expect(stmts).toHaveLength(2);
+    expect(stmts[0]).toContain("'it''s; fine'");
+    expect(stmts[1]).toBe("SELECT 2;");
+  });
+
+  test("respects doubled-quote escapes inside double-quoted identifiers", () => {
+    const sql = `CREATE TABLE "weird""name" (id INT); SELECT 1;`;
+    const stmts = splitSqlStatements(sql)
+      .map((s) => s.trim())
+      .filter(Boolean);
+    expect(stmts).toHaveLength(2);
+    expect(stmts[0]).toContain(`"weird""name"`);
   });
 });

@@ -31,8 +31,12 @@ export function runEmbed(opts: EmbedOptions): string {
 
 /**
  * Encode a Float32Array as a SQLite blob literal (`x'aabbcc…'`) suitable
- * for inlining into a SQL string. Endianness is host-native, matching what
- * sqlite-vec stores and reads.
+ * for inlining into a SQL string.
+ *
+ * Bytes are host-native order. This only works because every supported
+ * target (darwin-arm64, darwin-x64) is little-endian, which matches
+ * sqlite-vec's on-disk Float32 layout. If we ever ship a big-endian
+ * target we'd need to byte-swap here.
  */
 function floatVecToBlobLiteral(vec: Float32Array): string {
   const bytes = new Uint8Array(vec.buffer, vec.byteOffset, vec.byteLength);

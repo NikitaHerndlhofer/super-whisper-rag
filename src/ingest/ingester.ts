@@ -6,7 +6,7 @@ import { z } from "zod";
 import { EMBED_BATCH_SIZE } from "../config.ts";
 import { embedBatch } from "../embed/ollama.ts";
 import { info, verbose } from "../log.ts";
-import { getConfig, openArchive, setConfig } from "../archive/open.ts";
+import { getConfig, setConfig, withArchive } from "../archive/open.ts";
 import {
   readMetaContext,
   readSourceFolderNames,
@@ -84,71 +84,60 @@ export async function ensureFresh(opts: IngestOptions): Promise<IngestResult> {
   }
 
   // Open archive (creates if missing) just to check the fast-path config.
-  const archive = openArchive(opts.archive);
-  try {
-    const storedMtime = getConfig(archive, "source_mtime_ns");
-    const storedModel = getConfig(archive, "embed_model");
-    const sourceMtimeStr = sourceMtime.toString();
-    const modelSwitched = !!storedModel && storedModel !== opts.embedModel;
-
-    if (
-      !opts.full &&
-      storedMtime === sourceMtimeStr &&
-      !modelSwitched &&
-      !opts.dryRun
-    ) {
-      return {
-        fastPath: true,
-        newRows: 0,
-        updatedRows: 0,
-        embedded: 0,
-        sourceDeletions: 0,
-        audioChanges: 0,
-        modelSwitched: false,
-        durationMs: Date.now() - t0,
-      };
-    }
-
-    setConfig(archive, "last_sync_started_at", new Date().toISOString());
-    setConfig(archive, "super_whisper_db_path", opts.sourceDb);
-    setConfig(
-      archive,
-      "super_whisper_recordings_dir",
-      recordingsDir(opts.sourceDir),
-    );
-
-    if (modelSwitched || opts.full) {
-      info(
-        modelSwitched
-          ? `embed model changed (${storedModel} -> ${opts.embedModel}); re-embedding all rows`
-          : `--full: re-embedding all rows`,
-      );
-      archive.exec("DELETE FROM recording_vec");
-      archive.exec(
-        "UPDATE recording SET embed_text_hash = NULL, embed_model = NULL, embed_dim = NULL",
-      );
-    }
-
-    const snap = snapshotSourceDb(opts.sourceDb);
+  return withArchive(opts.archive, {}, async (archive) => {
     try {
-      const since = opts.full
-        ? null
-        : (getConfig(archive, "last_indexed_datetime") ?? null);
-      const newRows = readSourceRecordings(snap.path, since);
-      const sourceFolders = readSourceFolderNames(snap.path);
-      verbose(
-        `source has ${sourceFolders.size} rows total; ${newRows.length} new since ${since ?? "epoch"}`,
-      );
+      const storedMtime = getConfig(archive, "source_mtime_ns");
+      const storedModel = getConfig(archive, "embed_model");
+      const sourceMtimeStr = sourceMtime.toString();
+      const modelSwitched = !!storedModel && storedModel !== opts.embedModel;
 
-      const rdir = recordingsDir(opts.sourceDir);
-      const upserts = await Promise.all(
-        newRows.map((row) =>
-          readMetaContext(rdir, row.folderName).then((meta) => ({ row, meta })),
-        ),
-      );
+      if (!opts.full && storedMtime === sourceMtimeStr && !modelSwitched && !opts.dryRun) {
+        return {
+          fastPath: true,
+          newRows: 0,
+          updatedRows: 0,
+          embedded: 0,
+          sourceDeletions: 0,
+          audioChanges: 0,
+          modelSwitched: false,
+          durationMs: Date.now() - t0,
+        };
+      }
 
-      const nowIso = new Date().toISOString();
-      const upsertStmt = archive.prepare(`
+      setConfig(archive, "last_sync_started_at", new Date().toISOString());
+      setConfig(archive, "super_whisper_db_path", opts.sourceDb);
+      setConfig(archive, "super_whisper_recordings_dir", recordingsDir(opts.sourceDir));
+
+      if (modelSwitched || opts.full) {
+        info(
+          modelSwitched
+            ? `embed model changed (${storedModel} -> ${opts.embedModel}); re-embedding all rows`
+            : `--full: re-embedding all rows`,
+        );
+        archive.exec("DELETE FROM recording_vec");
+        archive.exec(
+          "UPDATE recording SET embed_text_hash = NULL, embed_model = NULL, embed_dim = NULL",
+        );
+      }
+
+      const snap = snapshotSourceDb(opts.sourceDb);
+      try {
+        const since = opts.full ? null : (getConfig(archive, "last_indexed_datetime") ?? null);
+        const newRows = readSourceRecordings(snap.path, since);
+        const sourceFolders = readSourceFolderNames(snap.path);
+        verbose(
+          `source has ${sourceFolders.size} rows total; ${newRows.length} new since ${since ?? "epoch"}`,
+        );
+
+        const rdir = recordingsDir(opts.sourceDir);
+        const upserts = await Promise.all(
+          newRows.map((row) =>
+            readMetaContext(rdir, row.folderName).then((meta) => ({ row, meta })),
+          ),
+        );
+
+        const nowIso = new Date().toISOString();
+        const upsertStmt = archive.prepare(`
         INSERT INTO recording (
           folder_name, recording_id_hex, datetime, duration_ms,
           mode_name, model_key, model_name, language_model_key, language_model_name,
@@ -185,95 +174,93 @@ export async function ensureFresh(opts: IngestOptions): Promise<IngestResult> {
           indexed_at = excluded.indexed_at
       `);
 
-      let upserted = 0;
-      let updated = 0;
-      let latestDt = since ?? "";
-      const existsStmt = archive.prepare(
-        "SELECT folder_name FROM recording WHERE folder_name = ?",
-      );
+        let upserted = 0;
+        let updated = 0;
+        let latestDt = since ?? "";
+        const existsStmt = archive.prepare(
+          "SELECT folder_name FROM recording WHERE folder_name = ?",
+        );
 
-      const tx = archive.transaction(() => {
-        for (const { row, meta } of upserts) {
-          const existedRaw: unknown = existsStmt.get(row.folderName);
-          const existed =
-            existedRaw != null && ExistsRowSchema.safeParse(existedRaw).success;
-          upsertStmt.run({
-            $folder_name: row.folderName,
-            $recording_id_hex: row.recordingIdHex,
-            $datetime: row.datetime,
-            $duration_ms: row.durationMs,
-            $mode_name: row.modeName,
-            $model_key: row.modelKey,
-            $model_name: row.modelName,
-            $language_model_key: row.languageModelKey,
-            $language_model_name: row.languageModelName,
-            $recording_device: row.recordingDevice,
-            $language: meta.language,
-            $app_name: meta.appName,
-            $app_category: meta.appCategory,
-            $raw_word_count: row.rawWordCount,
-            $llm_word_count: row.llmWordCount,
-            $result: row.result,
-            $llm_result: row.llmResult,
-            $raw_result: row.rawResult,
-            $has_audio: meta.hasAudio ? 1 : 0,
-            $meta_path: meta.metaPath,
-            $audio_path: meta.audioPath,
-            $indexed_at: nowIso,
-          });
-          if (existed) updated++;
-          else upserted++;
-          if (row.datetime > latestDt) latestDt = row.datetime;
-        }
-      });
-      tx();
-
-      const deletions = markSourceDeletions(archive, sourceFolders, nowIso);
-      const audioChanges = refreshAudioLiveness(archive, nowIso);
-
-      // After upserts: hash any new audio files and propagate supersedence.
-      // Same-audio reprocessings produce multiple rows in Super Whisper; we
-      // keep them all (the archive is append-only) but mark all but the
-      // newest as superseded so default queries can ignore the older ones.
-      hashNewAudioFiles(archive);
-      const superseded = refreshSupersedence(archive, nowIso);
-
-      let embedded = 0;
-      if (!opts.skipEmbeddings) {
-        embedded = await embedDirtyRows(archive, {
-          model: opts.embedModel,
-          host: opts.ollamaHost,
-          fn: opts.embedFn,
+        const tx = archive.transaction(() => {
+          for (const { row, meta } of upserts) {
+            const existedRaw: unknown = existsStmt.get(row.folderName);
+            const existed = existedRaw != null && ExistsRowSchema.safeParse(existedRaw).success;
+            upsertStmt.run({
+              $folder_name: row.folderName,
+              $recording_id_hex: row.recordingIdHex,
+              $datetime: row.datetime,
+              $duration_ms: row.durationMs,
+              $mode_name: row.modeName,
+              $model_key: row.modelKey,
+              $model_name: row.modelName,
+              $language_model_key: row.languageModelKey,
+              $language_model_name: row.languageModelName,
+              $recording_device: row.recordingDevice,
+              $language: meta.language,
+              $app_name: meta.appName,
+              $app_category: meta.appCategory,
+              $raw_word_count: row.rawWordCount,
+              $llm_word_count: row.llmWordCount,
+              $result: row.result,
+              $llm_result: row.llmResult,
+              $raw_result: row.rawResult,
+              $has_audio: meta.hasAudio ? 1 : 0,
+              $meta_path: meta.metaPath,
+              $audio_path: meta.audioPath,
+              $indexed_at: nowIso,
+            });
+            if (existed) updated++;
+            else upserted++;
+            if (row.datetime > latestDt) latestDt = row.datetime;
+          }
         });
+        tx();
+
+        const deletions = markSourceDeletions(archive, sourceFolders, nowIso);
+        const audioChanges = refreshAudioLiveness(archive, nowIso);
+
+        // After upserts: hash any new audio files and propagate supersedence.
+        // Same-audio reprocessings produce multiple rows in Super Whisper; we
+        // keep them all (the archive is append-only) but mark all but the
+        // newest as superseded so default queries can ignore the older ones.
+        hashNewAudioFiles(archive);
+        const superseded = refreshSupersedence(archive, nowIso);
+
+        let embedded = 0;
+        if (!opts.skipEmbeddings) {
+          embedded = await embedDirtyRows(archive, {
+            model: opts.embedModel,
+            host: opts.ollamaHost,
+            fn: opts.embedFn,
+          });
+        }
+        verbose(`supersedence pass marked ${superseded} rows as superseded`);
+
+        if (latestDt) setConfig(archive, "last_indexed_datetime", latestDt);
+        setConfig(archive, "source_mtime_ns", sourceMtimeStr);
+        setConfig(archive, "embed_model", opts.embedModel);
+        setConfig(archive, "last_sync_finished_at", new Date().toISOString());
+        setConfig(archive, "last_sync_error", "");
+
+        return {
+          fastPath: false,
+          newRows: upserted,
+          updatedRows: updated,
+          embedded,
+          sourceDeletions: deletions,
+          audioChanges,
+          modelSwitched,
+          durationMs: Date.now() - t0,
+        };
+      } finally {
+        snap.dispose();
       }
-      verbose(`supersedence pass marked ${superseded} rows as superseded`);
-
-      if (latestDt) setConfig(archive, "last_indexed_datetime", latestDt);
-      setConfig(archive, "source_mtime_ns", sourceMtimeStr);
-      setConfig(archive, "embed_model", opts.embedModel);
-      setConfig(archive, "last_sync_finished_at", new Date().toISOString());
-      setConfig(archive, "last_sync_error", "");
-
-      return {
-        fastPath: false,
-        newRows: upserted,
-        updatedRows: updated,
-        embedded,
-        sourceDeletions: deletions,
-        audioChanges,
-        modelSwitched,
-        durationMs: Date.now() - t0,
-      };
-    } finally {
-      snap.dispose();
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setConfig(archive, "last_sync_error", msg);
+      throw e;
     }
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    setConfig(archive, "last_sync_error", msg);
-    throw e;
-  } finally {
-    archive.close();
-  }
+  });
 }
 
 function recordingsDir(sourceDir: string): string {
@@ -286,10 +273,7 @@ interface EmbedDirtyOpts {
   fn?: (texts: string[]) => Promise<Float32Array[]>;
 }
 
-async function embedDirtyRows(
-  archive: Database,
-  opts: EmbedDirtyOpts,
-): Promise<number> {
+async function embedDirtyRows(archive: Database, opts: EmbedDirtyOpts): Promise<number> {
   // Only embed canonical rows. Superseded rows are duplicates of a later
   // reprocess of the same audio; embedding them wastes Ollama calls.
   const raw: unknown[] = archive
@@ -328,9 +312,7 @@ async function embedDirtyRows(
       ? await opts.fn(texts)
       : await embedBatch(texts, { model: opts.model, host: opts.host });
     if (vectors.length !== batch.length) {
-      throw new Error(
-        `embed returned ${vectors.length} vectors for batch of ${batch.length}`,
-      );
+      throw new Error(`embed returned ${vectors.length} vectors for batch of ${batch.length}`);
     }
     const tx = archive.transaction(() => {
       for (let j = 0; j < batch.length; j++) {
@@ -380,9 +362,7 @@ function hashNewAudioFiles(archive: Database): void {
     .all();
   const candidates = raw.map((r) => AudioHashRowSchema.parse(r));
   if (candidates.length === 0) return;
-  const update = archive.prepare(
-    "UPDATE recording SET audio_hash = ? WHERE folder_name = ?",
-  );
+  const update = archive.prepare("UPDATE recording SET audio_hash = ? WHERE folder_name = ?");
   const tx = archive.transaction(() => {
     let hashed = 0;
     for (const row of candidates) {
@@ -433,6 +413,12 @@ function refreshSupersedence(archive: Database, nowIso: string): number {
   const clearSuperseded = archive.prepare(
     "UPDATE recording SET superseded_by = NULL, superseded_at = NULL WHERE folder_name = ?",
   );
+  // Drop the vector for any row we mark as superseded. Without this,
+  // `recording_vec` would slowly accumulate orphans: queries already
+  // filter `superseded_by IS NULL` via the canonical join, so the bug
+  // is silent but it wastes space and risks confusing future readers
+  // who assume vec rows are canonical.
+  const deleteVec = archive.prepare("DELETE FROM recording_vec WHERE folder_name = ?");
   let changed = 0;
   const tx = archive.transaction(() => {
     for (const [, bucket] of groups) {
@@ -452,6 +438,7 @@ function refreshSupersedence(archive: Database, nowIso: string): number {
         const r = sorted[i];
         if (!r) continue;
         setSuperseded.run(canonical.folder_name, nowIso, r.folder_name);
+        deleteVec.run(r.folder_name);
         changed++;
       }
     }

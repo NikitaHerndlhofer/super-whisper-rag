@@ -20,7 +20,9 @@
  * filesystem reads.
  */
 import init from "./migrations/001_init.sql" with { type: "text" };
-import audioHashSupersedence from "./migrations/002_audio_hash_supersedence.sql" with { type: "text" };
+import audioHashSupersedence from "./migrations/002_audio_hash_supersedence.sql" with {
+  type: "text",
+};
 
 export interface Migration {
   /** Strictly increasing integer; matches the file name prefix. */
@@ -37,6 +39,4 @@ export const MIGRATIONS: readonly Migration[] = [
 ];
 
 /** Latest version known to this binary. */
-export const LATEST_VERSION: number = Math.max(
-  ...MIGRATIONS.map((m) => m.version),
-);
+export const LATEST_VERSION: number = Math.max(...MIGRATIONS.map((m) => m.version));

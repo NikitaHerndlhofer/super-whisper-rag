@@ -4,11 +4,7 @@ import { join } from "node:path";
 import { Database } from "bun:sqlite";
 import { z } from "zod";
 import { verbose, warn } from "../log.ts";
-import {
-  MetaJsonSchema,
-  SourceRecordingSchema,
-  type SourceRecording,
-} from "../schemas.ts";
+import { MetaJsonSchema, SourceRecordingSchema, type SourceRecording } from "../schemas.ts";
 
 export type { SourceRecording };
 
@@ -64,8 +60,7 @@ export function readSourceRecordings(
         ? `${SELECT_ROWS} WHERE r.datetime > ? ORDER BY r.datetime ASC`
         : `${SELECT_ROWS} ORDER BY r.datetime ASC`;
     const stmt = db.prepare(sql);
-    const raw: unknown[] =
-      sinceDatetime != null ? stmt.all(sinceDatetime) : stmt.all();
+    const raw: unknown[] = sinceDatetime != null ? stmt.all(sinceDatetime) : stmt.all();
     return raw.map((r) => SourceRecordingSchema.parse(r));
   } finally {
     db.close();
@@ -77,9 +72,7 @@ export function readSourceFolderNames(path: string): Set<string> {
   if (!existsSync(path)) return new Set();
   const db = new Database(path, { readonly: true });
   try {
-    const rows: unknown[] = db
-      .prepare("SELECT folderName FROM recording")
-      .all();
+    const rows: unknown[] = db.prepare("SELECT folderName FROM recording").all();
     const out = new Set<string>();
     for (const r of rows) {
       const parsed = FolderNameRowSchema.safeParse(r);

@@ -53,10 +53,7 @@ export function markSourceDeletions(
  * file has disappeared since the last sync. Audio that reappears is also
  * re-armed.
  */
-export function refreshAudioLiveness(
-  archive: Database,
-  nowIso: string,
-): number {
+export function refreshAudioLiveness(archive: Database, nowIso: string): number {
   const select = archive.prepare(
     "SELECT folder_name, audio_path, has_audio, source_audio_lost_at FROM recording",
   );
@@ -75,11 +72,7 @@ export function refreshAudioLiveness(
       if (!hasFile && r.has_audio === 1) {
         setLost.run(nowIso, r.folder_name);
         changed++;
-      } else if (
-        hasFile &&
-        r.has_audio === 0 &&
-        r.source_audio_lost_at != null
-      ) {
+      } else if (hasFile && r.has_audio === 0 && r.source_audio_lost_at != null) {
         setFound.run(r.folder_name);
         changed++;
       }

@@ -109,10 +109,12 @@ const FIXTURES: Fixture[] = [
     recordingDevice: "MacBook Pro Microphone",
     rawWordCount: 14,
     llmWordCount: 13,
-    result: "function debounce(fn, ms) { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; }",
+    result:
+      "function debounce(fn, ms) { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; }",
     llmResult:
       "function debounce(fn, ms) {\n  let t;\n  return (...a) => {\n    clearTimeout(t);\n    t = setTimeout(() => fn(...a), ms);\n  };\n}",
-    rawResult: "function debounce fn ms let t return dot dot dot a clear timeout t t equals set timeout arrow fn dot dot dot a comma ms",
+    rawResult:
+      "function debounce fn ms let t return dot dot dot a clear timeout t t equals set timeout arrow fn dot dot dot a comma ms",
     language: "en",
     appName: "Cursor",
     appCategory: "developer-tools",
@@ -276,9 +278,7 @@ async function main() {
         rawResult: f.rawResult,
         rawWordCount: f.rawWordCount,
         llmWordCount: f.llmWordCount,
-        segments: [
-          { start: 0, end: f.durationMs / 1000, text: f.result.slice(0, 80) },
-        ],
+        segments: [{ start: 0, end: f.durationMs / 1000, text: f.result.slice(0, 80) }],
         promptContext: {
           modeContext: { language: f.language },
           applicationContext: {
@@ -295,10 +295,7 @@ async function main() {
         // empty-file fixtures together and mark all-but-the-latest as
         // superseded — which is correct behaviour but breaks tests that
         // assume one canonical row per fixture.
-        await writeFile(
-          join(folder, "output.wav"),
-          Buffer.from(`fixture-audio-${f.folderName}`),
-        );
+        await writeFile(join(folder, "output.wav"), Buffer.from(`fixture-audio-${f.folderName}`));
       }
     }
   }

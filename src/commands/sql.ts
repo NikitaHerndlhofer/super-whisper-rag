@@ -1,10 +1,6 @@
 import { ensureFresh } from "../ingest/ingester.ts";
 import { warn } from "../log.ts";
-import {
-  execSqlite3Interactive,
-  runSqlite3,
-  type Sqlite3Result,
-} from "../sqlite3.ts";
+import { execSqlite3Interactive, runSqlite3, type Sqlite3Result } from "../sqlite3.ts";
 
 /**
  * Run a SQL query against the archive by exec'ing the sqlite3 CLI.

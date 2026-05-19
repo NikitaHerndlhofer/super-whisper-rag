@@ -3,6 +3,7 @@ import { dirname } from "node:path";
 import { Database } from "bun:sqlite";
 import { z } from "zod";
 import { EMBED_DIM } from "../config.ts";
+import { getEnv } from "../env.ts";
 import { BREW_SQLITE_PATHS } from "../paths.ts";
 import { runMigrations } from "./migrate.ts";
 import { vecDylibPath } from "./vec-loader.ts";
@@ -23,10 +24,8 @@ let customSqliteFailed = false;
 export function ensureExtensionCapableSqlite(): { dylib: string | null } {
   if (appliedDylib != null) return { dylib: appliedDylib };
   if (customSqliteFailed) return { dylib: null };
-  const envPath = Bun.env.SWRAG_SQLITE_DYLIB;
-  const candidates = envPath
-    ? [envPath, ...BREW_SQLITE_PATHS]
-    : [...BREW_SQLITE_PATHS];
+  const envPath = getEnv().SWRAG_SQLITE_DYLIB;
+  const candidates = envPath ? [envPath, ...BREW_SQLITE_PATHS] : [...BREW_SQLITE_PATHS];
   for (const p of candidates) {
     if (existsSync(p)) {
       try {
@@ -84,14 +83,33 @@ export function openArchive(path: string, options: OpenOptions = {}): Database {
   return db;
 }
 
+/**
+ * Open the archive, hand the connection to `fn`, and close it on the way
+ * out — including when `fn` throws. Centralises the
+ *
+ *   const db = openArchive(...); try { … } finally { db.close(); }
+ *
+ * pattern that previously appeared at every callsite. Async-aware.
+ */
+export async function withArchive<T>(
+  path: string,
+  options: OpenOptions,
+  fn: (db: Database) => T | Promise<T>,
+): Promise<T> {
+  const db = openArchive(path, options);
+  try {
+    return await fn(db);
+  } finally {
+    db.close();
+  }
+}
+
 const INITIAL_CONFIG: Record<string, string> = {
   embed_dim: String(EMBED_DIM),
 };
 
 function initialiseConfig(db: Database): void {
-  const insert = db.prepare(
-    "INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)",
-  );
+  const insert = db.prepare("INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)");
   for (const [key, value] of Object.entries(INITIAL_CONFIG)) {
     insert.run(key, value);
   }
@@ -100,9 +118,7 @@ function initialiseConfig(db: Database): void {
 const ConfigRowSchema = z.object({ value: z.string() });
 
 export function getConfig(db: Database, key: string): string | undefined {
-  const raw: unknown = db
-    .prepare("SELECT value FROM config WHERE key = ?")
-    .get(key);
+  const raw: unknown = db.prepare("SELECT value FROM config WHERE key = ?").get(key);
   if (raw == null) return undefined;
   return ConfigRowSchema.parse(raw).value;
 }

@@ -1,9 +1,8 @@
 import { EMBED_TIMEOUT_MS } from "../config.ts";
+import { getEnv } from "../env.ts";
 import { DEFAULTS } from "../paths.ts";
-import {
-  OllamaEmbedResponseSchema,
-  OllamaTagsResponseSchema,
-} from "../schemas.ts";
+import { OllamaEmbedResponseSchema, OllamaTagsResponseSchema } from "../schemas.ts";
+import { run } from "../spawn.ts";
 
 export interface EmbedOptions {
   host?: string;
@@ -22,7 +21,7 @@ export interface EmbedOptions {
   keepAlive?: string;
 }
 
-const DEFAULT_KEEP_ALIVE = Bun.env.SWRAG_KEEP_ALIVE ?? "15m";
+const DEFAULT_KEEP_ALIVE = getEnv().SWRAG_KEEP_ALIVE ?? "15m";
 
 /**
  * Synchronous single-text embedding via curl.
@@ -41,8 +40,8 @@ export function embedSync(text: string, opts: EmbedOptions = {}): Float32Array {
   const keepAlive = opts.keepAlive ?? DEFAULT_KEEP_ALIVE;
   const maxTime = Math.max(1, Math.ceil(timeoutMs / 1000));
 
-  const r = Bun.spawnSync({
-    cmd: [
+  const r = run(
+    [
       "curl",
       "-sS",
       "--max-time",
@@ -55,16 +54,12 @@ export function embedSync(text: string, opts: EmbedOptions = {}): Float32Array {
       "-d",
       JSON.stringify({ model, input: [text], keep_alive: keepAlive }),
     ],
-    timeout: timeoutMs + 500,
-  });
+    { timeoutMs: timeoutMs + 500 },
+  );
   if (r.exitCode !== 0) {
-    const stderr = r.stderr ? new TextDecoder().decode(r.stderr) : "";
-    throw new Error(
-      `embed via curl failed (exit ${r.exitCode}): ${stderr || "no stderr"}`,
-    );
+    throw new Error(`embed via curl failed (exit ${r.exitCode}): ${r.stderr || "no stderr"}`);
   }
-  const stdout = new TextDecoder().decode(r.stdout);
-  const body = OllamaEmbedResponseSchema.parse(JSON.parse(stdout));
+  const body = OllamaEmbedResponseSchema.parse(JSON.parse(r.stdout));
   const first = body.embeddings[0];
   if (!first) throw new Error("ollama returned no embeddings");
   return new Float32Array(first);
@@ -81,40 +76,54 @@ export async function embedBatch(
   const timeoutMs = opts.timeoutMs ?? EMBED_TIMEOUT_MS * 6;
   const keepAlive = opts.keepAlive ?? DEFAULT_KEEP_ALIVE;
 
+  const body = JSON.stringify({ model, input: texts, keep_alive: keepAlive });
   const r = await fetchWithRetry(
     `${host}/api/embed`,
-    {
+    () => ({
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ model, input: texts, keep_alive: keepAlive }),
+      body,
+      // A fresh timeout signal per attempt: AbortSignal.timeout fires
+      // once and stays aborted forever, so reusing the same signal across
+      // retries would make retries 2+ abort immediately. See the rationale
+      // in `fetchWithRetry`.
       signal: AbortSignal.timeout(timeoutMs),
-    },
+    }),
     3,
   );
   if (!r.ok) {
-    const body = await r.text().catch(() => "");
-    throw new Error(`ollama /api/embed ${r.status}: ${body}`);
+    const errBody = await r.text().catch(() => "");
+    throw new Error(`ollama /api/embed ${r.status}: ${errBody}`);
   }
   const json: unknown = await r.json();
-  const body = OllamaEmbedResponseSchema.parse(json);
-  if (body.embeddings.length !== texts.length) {
+  const parsed = OllamaEmbedResponseSchema.parse(json);
+  if (parsed.embeddings.length !== texts.length) {
     throw new Error(
-      `ollama returned ${body.embeddings.length} vectors for ${texts.length} inputs`,
+      `ollama returned ${parsed.embeddings.length} vectors for ${texts.length} inputs`,
     );
   }
-  return body.embeddings.map((arr) => new Float32Array(arr));
+  return parsed.embeddings.map((arr) => new Float32Array(arr));
 }
 
+/**
+ * Retry transient failures with exponential backoff. `makeInit` is called
+ * fresh per attempt so that `AbortSignal.timeout(...)` produces a new
+ * signal each time — a shared `signal` would abort all retries the
+ * instant the first timeout fires. We retry on network errors, 5xx, and
+ * 429 (rate limit). Other 4xx are passed through to the caller untouched
+ * because they're not transient.
+ */
 async function fetchWithRetry(
   url: string,
-  init: RequestInit,
+  makeInit: () => RequestInit,
   retries: number,
 ): Promise<Response> {
   let lastErr: unknown;
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
-      const r = await fetch(url, init);
-      if (r.ok || r.status < 500) return r;
+      const r = await fetch(url, makeInit());
+      if (r.ok) return r;
+      if (r.status < 500 && r.status !== 429) return r;
       lastErr = new Error(`HTTP ${r.status}`);
     } catch (e) {
       lastErr = e;
@@ -130,9 +139,7 @@ async function fetchWithRetry(
  * Check that Ollama is reachable and the requested model is pulled. Returns
  * `null` on success; otherwise an actionable diagnostic string.
  */
-export async function checkOllama(
-  opts: EmbedOptions = {},
-): Promise<string | null> {
+export async function checkOllama(opts: EmbedOptions = {}): Promise<string | null> {
   const host = opts.host ?? DEFAULTS.ollamaHost;
   const model = opts.model ?? DEFAULTS.embedModel;
   let r: Response;
@@ -148,8 +155,7 @@ export async function checkOllama(
     const name = m.name ?? m.model ?? "";
     return name === model || name.startsWith(`${model}:`);
   });
-  if (!have)
-    return `embed model "${model}" not pulled. Run: ollama pull ${model}`;
+  if (!have) return `embed model "${model}" not pulled. Run: ollama pull ${model}`;
   return null;
 }
 

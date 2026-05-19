@@ -1,5 +1,5 @@
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import {
   PathOverridesSchema,
   ResolvedPathsSchema,
@@ -19,21 +19,10 @@ export const DEFAULTS = {
     "database",
     "superwhisper.sqlite",
   ),
-  archive: join(
-    HOME,
-    "Library",
-    "Application Support",
-    "superwhisper-rag",
-    "swrag.sqlite",
-  ),
+  archive: join(HOME, "Library", "Application Support", "superwhisper-rag", "swrag.sqlite"),
   logFile: join(HOME, "Library", "Logs", "superwhisper-rag.log"),
   launchAgentsDir: join(HOME, "Library", "LaunchAgents"),
-  launchPlist: join(
-    HOME,
-    "Library",
-    "LaunchAgents",
-    "com.superwhisper-rag.sync.plist",
-  ),
+  launchPlist: join(HOME, "Library", "LaunchAgents", "com.superwhisper-rag.sync.plist"),
   cursorSkillDir: join(HOME, ".cursor", "skills", "superwhisper-rag"),
   claudeSkillDir: join(HOME, ".claude", "skills", "superwhisper-rag"),
   ollamaHost: "http://127.0.0.1:11434",
@@ -62,17 +51,15 @@ export type { ResolvedPaths };
 /**
  * Build a fully populated `ResolvedPaths` from optional overrides. Both the
  * input and the output are validated, so we never carry around partially
- * filled paths or stringy URLs. `archiveDir` is always derived from
- * `archive` — they are never independently overridable.
+ * filled paths or stringy URLs. The archive's parent directory is derived
+ * at use-site via `dirname()` — it's never an independent override.
  */
 export function resolvePaths(overrides: unknown = {}): ResolvedPaths {
   const o: PathOverrides = PathOverridesSchema.parse(overrides);
-  const archive = o.archive ?? DEFAULTS.archive;
   return ResolvedPathsSchema.parse({
     sourceDir: o.sourceDir ?? DEFAULTS.sourceDir,
     sourceDb: o.sourceDb ?? DEFAULTS.sourceDb,
-    archive,
-    archiveDir: dirname(archive),
+    archive: o.archive ?? DEFAULTS.archive,
     ollamaHost: o.ollamaHost ?? DEFAULTS.ollamaHost,
     embedModel: o.embedModel ?? DEFAULTS.embedModel,
   });

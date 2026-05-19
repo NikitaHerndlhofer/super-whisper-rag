@@ -4,10 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
 import { openArchive } from "../src/archive/open.ts";
-import {
-  markSourceDeletions,
-  refreshAudioLiveness,
-} from "../src/ingest/deletions.ts";
+import { markSourceDeletions, refreshAudioLiveness } from "../src/ingest/deletions.ts";
 import { queryOne } from "./helpers.ts";
 
 const SourceDeletedRowSchema = z.object({
@@ -42,11 +39,7 @@ describe("deletions", () => {
                 ('gone-but-meta-here', 'b', '2026-01-01T00:00:00', 1000, 'Universal', '2026-01-01T00:00:00', '${goneMeta}'),
                 ('really-gone', 'c', '2026-01-01T00:00:00', 1000, 'Universal', '2026-01-01T00:00:00', '${missingMeta}')`,
     );
-    const n = markSourceDeletions(
-      db,
-      new Set(["alive"]),
-      "2026-05-18T20:00:00",
-    );
+    const n = markSourceDeletions(db, new Set(["alive"]), "2026-05-18T20:00:00");
     expect(n).toBe(1);
 
     const reallyGone = queryOne(

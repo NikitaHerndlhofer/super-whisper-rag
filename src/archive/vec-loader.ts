@@ -14,14 +14,7 @@
  * cache directory so a launchd-spawned process and a TTY-spawned process
  * share the same copy.
  */
-import {
-  existsSync,
-  mkdirSync,
-  readFileSync,
-  renameSync,
-  statSync,
-  writeFileSync,
-} from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 import dylibArm64 from "../../vendor/vec0-darwin-arm64.dylib" with { type: "file" };
@@ -65,7 +58,8 @@ function materialiseDylib(embeddedPath: string): string {
   try {
     renameSync(tmp, target);
   } catch {
-    if (!existsSync(target) || statSync(target).size !== size) throw new Error("dylib install failed");
+    if (!existsSync(target) || statSync(target).size !== size)
+      throw new Error("dylib install failed");
   }
   return target;
 }

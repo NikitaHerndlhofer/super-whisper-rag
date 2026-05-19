@@ -70,13 +70,11 @@ describe("openArchive", () => {
         "INSERT INTO recording (folder_name, recording_id_hex, datetime, duration_ms, mode_name, indexed_at, meta_path) " +
           "VALUES ('f1', 'aa', '2026-01-01T00:00:00', 1000, 'Universal', '2026-01-01T00:00:00', '/tmp/m.json')",
       );
+      expect(() => db.exec("DELETE FROM recording WHERE folder_name = 'f1'")).toThrow(
+        /append-only/,
+      );
       expect(() =>
-        db.exec("DELETE FROM recording WHERE folder_name = 'f1'"),
-      ).toThrow(/append-only/);
-      expect(() =>
-        db.exec(
-          "UPDATE recording SET source_deleted_at = '2026-01-02' WHERE folder_name = 'f1'",
-        ),
+        db.exec("UPDATE recording SET source_deleted_at = '2026-01-02' WHERE folder_name = 'f1'"),
       ).not.toThrow();
     } finally {
       db.close();
@@ -112,9 +110,10 @@ describe("openArchive", () => {
       expect(ext.dylib).not.toBeNull();
       const v = new Float32Array(1024);
       v[0] = 1;
-      db.prepare(
-        "INSERT INTO recording_vec (folder_name, embedding) VALUES (?, ?)",
-      ).run("vec-test", v);
+      db.prepare("INSERT INTO recording_vec (folder_name, embedding) VALUES (?, ?)").run(
+        "vec-test",
+        v,
+      );
       const r = queryOne(
         db,
         VecResultSchema,
@@ -129,8 +128,8 @@ describe("openArchive", () => {
   });
 
   test("readonly open of nonexistent archive throws", () => {
-    expect(() =>
-      openArchive("/nonexistent/swrag.sqlite", { readonly: true }),
-    ).toThrow(/does not exist/);
+    expect(() => openArchive("/nonexistent/swrag.sqlite", { readonly: true })).toThrow(
+      /does not exist/,
+    );
   });
 });

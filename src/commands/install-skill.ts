@@ -1,6 +1,6 @@
 import { existsSync } from "node:fs";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { info } from "../log.ts";
 import { DEFAULTS } from "../paths.ts";
 import { SKILL_MD } from "../skill.ts";
@@ -34,7 +34,7 @@ export async function installSkill(): Promise<SkillInstallOutcome[]> {
 }
 
 async function writeSkill(path: string): Promise<SkillInstallOutcome> {
-  await mkdir(join(path, ".."), { recursive: true });
+  await mkdir(dirname(path), { recursive: true });
   if (existsSync(path)) {
     const existing = await readFile(path, "utf8");
     if (existing === SKILL_MD) {
@@ -60,9 +60,7 @@ async function writeSkill(path: string): Promise<SkillInstallOutcome> {
  * Only touches files that already exist — users who never ran
  * `swrag install-skill` are not opted in, and stay that way.
  */
-export async function refreshInstalledSkills(): Promise<
-  { path: string; refreshed: boolean }[]
-> {
+export async function refreshInstalledSkills(): Promise<{ path: string; refreshed: boolean }[]> {
   const targets = [
     join(DEFAULTS.cursorSkillDir, "SKILL.md"),
     join(DEFAULTS.claudeSkillDir, "SKILL.md"),

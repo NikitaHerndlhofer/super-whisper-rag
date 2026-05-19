@@ -88,11 +88,7 @@ describe("swrag sql (pure sqlite3 passthrough)", () => {
     const r = await runSql({
       ...baseSqlOpts(),
       sql: null,
-      extraArgs: [
-        "-cmd",
-        ".mode markdown",
-        "SELECT 'a' AS x, 'b' AS y",
-      ],
+      extraArgs: ["-cmd", ".mode markdown", "SELECT 'a' AS x, 'b' AS y"],
     });
     expect(r.exitCode).toBe(0);
     // markdown mode emits a `| col | col |` table header
@@ -103,11 +99,7 @@ describe("swrag sql (pure sqlite3 passthrough)", () => {
     const r = await runSql({
       ...baseSqlOpts(),
       sql: null,
-      extraArgs: [
-        "-cmd",
-        ".parameter set :app 'Cursor'",
-        "SELECT :app AS app",
-      ],
+      extraArgs: ["-cmd", ".parameter set :app 'Cursor'", "SELECT :app AS app"],
     });
     expect(r.exitCode).toBe(0);
     expect(r.stdout.trim()).toBe("Cursor");

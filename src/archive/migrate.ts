@@ -33,9 +33,7 @@ export interface MigrationOutcome {
 
 export function runMigrations(db: Database): MigrationOutcome {
   const from = readUserVersion(db);
-  const pending = MIGRATIONS.filter((m) => m.version > from).sort(
-    (a, b) => a.version - b.version,
-  );
+  const pending = MIGRATIONS.filter((m) => m.version > from).sort((a, b) => a.version - b.version);
   const applied: number[] = [];
   for (const m of pending) {
     applyMigration(db, m);
@@ -82,37 +80,48 @@ function readUserVersion(db: Database): number {
 /**
  * Split a SQL script into individual statements on top-level `;`
  * boundaries. Respects `BEGIN`…`END` trigger bodies (the semicolons
- * inside don't terminate the outer statement). Inline `--` line comments
- * are stripped before tokenisation; C-style block comments are not used
- * in our migrations so are not handled.
+ * inside don't terminate the outer statement) and SQL's doubled-quote
+ * escape inside string literals (`'it''s'`, `"col""umn"`). Inline `--`
+ * line comments are stripped before tokenisation; C-style block
+ * comments are not used in our migrations so are not handled.
  */
 export function splitSqlStatements(sql: string): string[] {
   const out: string[] = [];
-  let current = "";
+  const stripped = stripLineComments(sql);
   let inString: '"' | "'" | null = null;
   let beginDepth = 0;
-  const stripped = stripLineComments(sql);
+  let start = 0;
   for (let i = 0; i < stripped.length; i++) {
     const ch = stripped[i];
     if (ch == null) continue;
-    current += ch;
     if (inString) {
-      if (ch === inString) inString = null;
+      // SQL escapes a quote inside a quoted string by doubling it:
+      // `'it''s'` is one literal containing `it's`. Skip the pair so
+      // we don't prematurely close the string.
+      if (ch === inString) {
+        if (stripped[i + 1] === inString) {
+          i++;
+          continue;
+        }
+        inString = null;
+      }
       continue;
     }
     if (ch === "'" || ch === '"') {
       inString = ch;
       continue;
     }
-    if (matchesKeyword(stripped, i, "BEGIN")) beginDepth++;
-    else if (matchesKeyword(stripped, i, "END")) {
+    if (matchesKeyword(stripped, i, "BEGIN")) {
+      beginDepth++;
+    } else if (matchesKeyword(stripped, i, "END")) {
       if (beginDepth > 0) beginDepth--;
     } else if (ch === ";" && beginDepth === 0) {
-      out.push(current);
-      current = "";
+      out.push(stripped.slice(start, i + 1));
+      start = i + 1;
     }
   }
-  if (current.trim().length > 0) out.push(current);
+  const tail = stripped.slice(start);
+  if (tail.trim().length > 0) out.push(tail);
   return out;
 }
 

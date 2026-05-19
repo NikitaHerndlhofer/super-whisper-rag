@@ -39,11 +39,7 @@ describe("ensureFresh", () => {
 
     const db = new Database(env.archive, { readonly: true });
     try {
-      const total = queryOne(
-        db,
-        CountRowSchema,
-        "SELECT COUNT(*) AS n FROM recording",
-      );
+      const total = queryOne(db, CountRowSchema, "SELECT COUNT(*) AS n FROM recording");
       // 5 rows in source DB + 1 source row with no meta is still ingested.
       expect(total.n).toBe(6);
     } finally {
@@ -122,11 +118,7 @@ describe("ensureFresh", () => {
     expect(calls).toBe(0);
     const db = new Database(env.archive, { readonly: true });
     try {
-      const n = queryOne(
-        db,
-        CountRowSchema,
-        "SELECT COUNT(*) AS n FROM recording",
-      );
+      const n = queryOne(db, CountRowSchema, "SELECT COUNT(*) AS n FROM recording");
       expect(n.n).toBeGreaterThanOrEqual(5);
     } finally {
       db.close();

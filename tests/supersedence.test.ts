@@ -2,6 +2,8 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { rmSync, utimesSync, writeFileSync } from "node:fs";
 import { z } from "zod";
+import { ensureExtensionCapableSqlite } from "../src/archive/open.ts";
+import { vecDylibPath } from "../src/archive/vec-loader.ts";
 import { ensureFresh } from "../src/ingest/ingester.ts";
 import { makeEnv, queryAll, stubEmbed, type TestEnv } from "./helpers.ts";
 
@@ -83,6 +85,40 @@ describe("Super Whisper reprocessing → supersedence", () => {
     // 6 fixture rows total; 2 of them collapse to 1 canonical → 5 embeds.
     // (One fixture has no audio, so it's not in any supersedence group.)
     expect(embedCount).toBeLessThan(6);
+  });
+
+  test("superseded rows have no entry in recording_vec", async () => {
+    const sharedPayload = Buffer.from("shared-audio-2");
+    writeFileSync(`${env.sourceDir}/recordings/1779000000/output.wav`, sharedPayload);
+    writeFileSync(`${env.sourceDir}/recordings/1779000200/output.wav`, sharedPayload);
+
+    await ensureFresh(defaultOpts());
+
+    ensureExtensionCapableSqlite();
+    const db = new Database(env.archive, { readonly: true });
+    db.loadExtension(vecDylibPath(), "sqlite3_vec_init");
+    try {
+      const vecRowsSchema = z.object({ n: z.number() });
+      // Superseded row (1779000200) should be absent from recording_vec
+      // entirely — otherwise the join `recording_vec → recording WHERE
+      // superseded_by IS NULL` silently hides it, but the vector slot
+      // wastes space and risks confusing readers who assume vec rows
+      // are canonical.
+      const supersededVec = queryAll(
+        db,
+        vecRowsSchema,
+        "SELECT COUNT(*) AS n FROM recording_vec WHERE folder_name = '1779000200'",
+      );
+      expect(supersededVec[0]?.n).toBe(0);
+      const canonicalVec = queryAll(
+        db,
+        vecRowsSchema,
+        "SELECT COUNT(*) AS n FROM recording_vec WHERE folder_name = '1779000000'",
+      );
+      expect(canonicalVec[0]?.n).toBe(1);
+    } finally {
+      db.close();
+    }
   });
 
   test("clearing the duplicate restores the other row to canonical", async () => {

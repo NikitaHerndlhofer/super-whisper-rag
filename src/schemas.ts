@@ -36,6 +36,12 @@ export const EnvSchema = z.object({
   SWRAG_SQLITE_DYLIB: z.string().optional(),
   SWRAG_VERBOSE: BoolFlag,
   SWRAG_SKIP_EMBED: BoolFlag,
+  // Suppresses info/warn (but not error) stderr output. Used by the
+  // test suite to keep `bun test` output readable; intentionally not
+  // advertised in the README's configuration table.
+  SWRAG_QUIET: BoolFlag,
+  // Ollama `keep_alive` value; see `src/embed/ollama.ts`.
+  SWRAG_KEEP_ALIVE: z.string().optional(),
 });
 export type Env = z.infer<typeof EnvSchema>;
 
@@ -52,7 +58,6 @@ export const ResolvedPathsSchema = z.object({
   sourceDir: z.string(),
   sourceDb: z.string(),
   archive: z.string(),
-  archiveDir: z.string(),
   ollamaHost: z.url(),
   embedModel: z.string().min(1),
 });

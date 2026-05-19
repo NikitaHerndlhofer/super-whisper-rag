@@ -1,7 +1,7 @@
 {
   "$schema": "./node_modules/@biomejs/biome/configuration_schema.json",
   "files": {
-    "includes": ["src/**", "tests/**", "scripts/**"]
+    "includes": ["src/**", "tests/**", "scripts/**", "!tests/fixtures/recordings"]
   },
   "formatter": {
     "enabled": true,
@@ -24,7 +24,7 @@
         "noStaticOnlyClass": "off"
       },
       "correctness": {
-        "noUnusedVariables": "warn"
+        "noUnusedVariables": "error"
       }
     }
   },

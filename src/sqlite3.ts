@@ -17,6 +17,7 @@
 import { existsSync } from "node:fs";
 import { vecDylibPath } from "./archive/vec-loader.ts";
 import { BREW_SQLITE_BIN_PATHS } from "./paths.ts";
+import { run } from "./spawn.ts";
 
 export interface Sqlite3Options {
   archive: string;
@@ -58,18 +59,7 @@ export function findSqlite3Binary(): string {
  * `execSqlite3Interactive`.
  */
 export function runSqlite3(opts: Sqlite3Options): Sqlite3Result {
-  const args = buildArgs(opts);
-  const r = Bun.spawnSync({
-    cmd: [findSqlite3Binary(), ...args],
-    stdin: "ignore",
-    stdout: "pipe",
-    stderr: "pipe",
-  });
-  return {
-    exitCode: r.exitCode ?? 1,
-    stdout: r.stdout ? new TextDecoder().decode(r.stdout) : "",
-    stderr: r.stderr ? new TextDecoder().decode(r.stderr) : "",
-  };
+  return run([findSqlite3Binary(), ...buildArgs(opts)]);
 }
 
 /**

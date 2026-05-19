@@ -2,6 +2,7 @@ import { unlinkSync, existsSync, copyFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { verbose, warn } from "../log.ts";
+import { run } from "../spawn.ts";
 import { findSqlite3Binary } from "../sqlite3.ts";
 
 /**
@@ -37,9 +38,7 @@ export function snapshotSourceDb(sourcePath: string): Snapshot {
         if (existsSync(wal)) unlinkSync(wal);
         if (existsSync(shm)) unlinkSync(shm);
       } catch (e) {
-        warn(
-          `failed to dispose snapshot ${dest}: ${e instanceof Error ? e.message : String(e)}`,
-        );
+        warn(`failed to dispose snapshot ${dest}: ${e instanceof Error ? e.message : String(e)}`);
       }
     },
   };
@@ -56,13 +55,9 @@ function trySqlite3Backup(source: string, dest: string): boolean {
   } catch {
     return false;
   }
-  const r = Bun.spawnSync({
-    cmd: [bin, source, `.backup '${dest}'`],
-    timeout: 30_000,
-  });
+  const r = run([bin, source, `.backup '${dest}'`], { timeoutMs: 30_000 });
   if (r.exitCode !== 0) {
-    const stderr = r.stderr ? new TextDecoder().decode(r.stderr) : "";
-    verbose(`sqlite3 .backup failed (${r.exitCode}): ${stderr}`);
+    verbose(`sqlite3 .backup failed (${r.exitCode}): ${r.stderr}`);
     return false;
   }
   return existsSync(dest);
