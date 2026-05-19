@@ -46,6 +46,6 @@ jobs:
   #       with:
   #         formula-name: superwhisper-rag
   #         homebrew-tap: NikitaHerndlhofer/homebrew-tap
-  #         download-url: https://github.com/NikitaHerndlhofer/super-whisper-rag/releases/download/${{ github.ref_name }}/swrag-darwin-arm64.tar.gz
+  #         download-url: https://github.com/NikitaHerndlhofer/superwhisper-rag/releases/download/${{ github.ref_name }}/swrag-darwin-arm64.tar.gz
   #       env:
   #         COMMITTER_TOKEN: ${{ secrets.TAP_GH_TOKEN }}
