@@ -49,10 +49,42 @@ function ctx(): Context {
  * preserve the `--` boundary for us. Capturing it once at entry keeps
  * the handler code from reaching back into `process.argv`.
  */
-const PASSTHROUGH_ARGS: readonly string[] = (() => {
-  const idx = process.argv.indexOf("--");
-  return idx < 0 ? [] : process.argv.slice(idx + 1);
-})();
+const DASHDASH_INDEX = process.argv.indexOf("--");
+const PASSTHROUGH_ARGS: readonly string[] =
+  DASHDASH_INDEX < 0 ? [] : process.argv.slice(DASHDASH_INDEX + 1);
+
+/**
+ * True iff the user typed a positional argument BEFORE the `--`
+ * separator. Citty's parser doesn't respect `--`, so its `args.query`
+ * value will include positionals that appear after `--` as well — we
+ * can't use it to tell "the user supplied inline SQL alongside
+ * passthrough" from "the user supplied SQL inside the passthrough".
+ * For the conflict-detection in `sqlCmd`, we have to scan argv
+ * ourselves and check whether anything non-flag lives between the
+ * subcommand and the `--`.
+ *
+ * `subcommand` is the literal we expect at `process.argv[2]`, e.g.
+ * `"sql"`. The function returns true if there's a positional in
+ * `process.argv[3..DASHDASH_INDEX)` — strict bounds, because argv[2]
+ * is the subcommand name itself and DASHDASH_INDEX is the `--`.
+ */
+function hasInlinePositionalBeforeDashDash(subcommand: string): boolean {
+  if (DASHDASH_INDEX < 0) return false;
+  // process.argv layout under bun-compiled CLI: [bun_exec, subcommand, ...]
+  // and DASHDASH_INDEX is the index of `--`. We look at the args
+  // strictly between (subcommand_idx + 1) and DASHDASH_INDEX.
+  const subIdx = process.argv.indexOf(subcommand);
+  if (subIdx < 0 || subIdx >= DASHDASH_INDEX - 1) return false;
+  for (let i = subIdx + 1; i < DASHDASH_INDEX; i++) {
+    const a = process.argv[i];
+    if (a == null) continue;
+    // Treat anything that doesn't start with `-` as a positional. (The
+    // sql subcommand exposes zero flags of its own, so any `-…` token
+    // before `--` is the user's mistake — but it's not "inline SQL".)
+    if (!a.startsWith("-")) return true;
+  }
+  return false;
+}
 
 function asString(v: unknown): string | undefined {
   return typeof v === "string" ? v : undefined;
@@ -83,8 +115,13 @@ const sqlCmd = defineCommand({
     // — inline SQL, or SQL forwarded inside the `--` tail — but combining
     // them used to silently drop the inline SQL. Surface the conflict
     // rather than guess which one the user wanted.
-    const hasInline = inline != null && inline.trim().length > 0;
-    if (PASSTHROUGH_ARGS.length > 0 && (hasInline || fromStdin)) {
+    //
+    // Note: we cannot rely on citty's `args.query` to tell us whether
+    // the user supplied an inline positional, because citty doesn't
+    // respect `--` and will happily pull a string out of the
+    // passthrough tail and into `query`. We scan argv directly instead
+    // — see `hasInlinePositionalBeforeDashDash`.
+    if (PASSTHROUGH_ARGS.length > 0 && hasInlinePositionalBeforeDashDash("sql")) {
       error(
         "cannot combine inline SQL (or stdin) with `--` passthrough. " +
           "Put your SQL either before `--`, or inside the tail after `--` — not both.",

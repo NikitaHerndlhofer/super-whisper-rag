@@ -1,8 +1,11 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
+import { join } from "node:path";
 import { runSql } from "../src/commands/sql.ts";
 import { ensureFresh } from "../src/ingest/ingester.ts";
 import { makeEnv, stubEmbed, type TestEnv } from "./helpers.ts";
+
+const CLI_ENTRY = join(import.meta.dir, "..", "src", "cli.ts");
 
 let env: TestEnv;
 
@@ -108,4 +111,54 @@ describe("swrag sql (pure sqlite3 passthrough)", () => {
   // Note: REPL behaviour (`sql == null`, no passthrough) is exercised
   // manually — the interactive sqlite3 inherits stdin/stdout, which
   // hangs in a non-TTY test runner.
+});
+
+/**
+ * These tests drive the full citty entry point as a child process,
+ * because the conflict-detection that lives in `cli.ts` (inline-SQL +
+ * `--` passthrough) is not exercised by calling `runSql` directly —
+ * it depends on `process.argv` shape. Subprocess overhead is fine for
+ * a handful of cases.
+ */
+describe("swrag sql -- conflict detection (subprocess)", () => {
+  function runCli(args: string[]): { exitCode: number; stdout: string; stderr: string } {
+    const r = Bun.spawnSync({
+      cmd: ["bun", "run", CLI_ENTRY, ...args],
+      env: {
+        ...process.env,
+        SWRAG_SOURCE_DB: env.sourceDb,
+        SWRAG_SOURCE_DIR: env.sourceDir,
+        SWRAG_ARCHIVE: env.archive,
+        SWRAG_SKIP_EMBED: "1",
+        SWRAG_QUIET: "0",
+      },
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    return {
+      exitCode: r.exitCode ?? 1,
+      stdout: r.stdout ? new TextDecoder().decode(r.stdout) : "",
+      stderr: r.stderr ? new TextDecoder().decode(r.stderr) : "",
+    };
+  }
+
+  test("sql after `--` alone is fine — citty's positional capture must not falsely trigger the conflict", () => {
+    const r = runCli(["sql", "--", "-json", "SELECT 'ok' AS x"]);
+    expect(r.exitCode).toBe(0);
+    const parsed: unknown = JSON.parse(r.stdout);
+    expect((parsed as { x: string }[])[0]).toEqual({ x: "ok" });
+  });
+
+  test("inline sql alone is fine", () => {
+    const r = runCli(["sql", "SELECT 'inline' AS x"]);
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout.trim()).toBe("inline");
+  });
+
+  test("inline SQL combined with `--` passthrough errors out", () => {
+    const r = runCli(["sql", "SELECT 1", "--", "-json", "SELECT 'tail' AS x"]);
+    expect(r.exitCode).toBe(2);
+    expect(r.stderr).toMatch(/cannot combine inline SQL.*--.*passthrough/);
+  });
 });
