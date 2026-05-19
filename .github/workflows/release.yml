@@ -1,0 +1,49 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: install brew sqlite
+        run: brew install sqlite
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck
+      - name: regenerate fixtures
+        run: bun run tests/fixtures/make-fixtures.ts
+      - name: fetch vendor dylibs
+        run: bun run scripts/fetch-vec-dylibs.ts
+      - run: bun test
+      - run: bun run build
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/swrag-darwin-arm64.tar.gz
+            dist/swrag-darwin-x64.tar.gz
+            dist/sha256sums.txt
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+
+  # Optional: uncomment to auto-bump a downstream homebrew tap.
+  # Requires a TAP_GH_TOKEN secret with `contents:write` on the tap repo.
+  #
+  # bump-tap:
+  #   needs: build
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: mislav/bump-homebrew-formula-action@v3
+  #       with:
+  #         formula-name: superwhisper-rag
+  #         homebrew-tap: <user>/homebrew-tap
+  #         download-url: https://github.com/<user>/superwhisper-rag/releases/download/${{ github.ref_name }}/swrag-darwin-arm64.tar.gz
+  #       env:
+  #         COMMITTER_TOKEN: ${{ secrets.TAP_GH_TOKEN }}

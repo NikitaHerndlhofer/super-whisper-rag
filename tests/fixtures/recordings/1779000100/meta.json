@@ -1,0 +1,34 @@
+{
+  "version": 2,
+  "recordingIdHex": "abc222",
+  "datetime": "2026-05-17T15:12:33",
+  "durationMs": 184000,
+  "modeName": "Meeting",
+  "modelKey": "whisper-large-v3",
+  "modelName": "Whisper Large v3",
+  "languageModelKey": null,
+  "languageModelName": null,
+  "recordingDevice": "AirPods Pro",
+  "result": "We agreed to move the corporate group migration to next sprint. Adam will own the BullMQ queue work.",
+  "llmResult": "We agreed to move the corporate group migration to next sprint. Adam will own the BullMQ queue work.",
+  "rawResult": "we agreed to move the corporate group migration to next sprint adam will own the bull MQ queue work",
+  "rawWordCount": 412,
+  "llmWordCount": 388,
+  "segments": [
+    {
+      "start": 0,
+      "end": 184,
+      "text": "We agreed to move the corporate group migration to next sprint. Adam will own th"
+    }
+  ],
+  "promptContext": {
+    "modeContext": {
+      "language": "en"
+    },
+    "applicationContext": {
+      "name": "Zoom",
+      "category": "communication",
+      "bundleIdentifier": "us.zoom.xos"
+    }
+  }
+}

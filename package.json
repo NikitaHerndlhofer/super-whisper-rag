@@ -1,0 +1,32 @@
+{
+  "name": "superwhisper-rag",
+  "version": "0.1.0",
+  "description": "Local SQL archive for Super Whisper dictation history with full-text + semantic search.",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "swrag": "./dist/swrag"
+  },
+  "scripts": {
+    "dev": "bun run src/cli.ts",
+    "build": "bun run scripts/build.ts",
+    "test": "bun test",
+    "lint": "biome lint .",
+    "format": "biome format --write .",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "citty": "^0.2.2",
+    "sqlite-vec": "^0.1.9",
+    "sqlite-vec-darwin-arm64": "^0.1.9",
+    "sqlite-vec-darwin-x64": "^0.1.9",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.4.15",
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  }
+}

@@ -1,0 +1,24 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: install brew sqlite (for loadable extensions)
+        run: brew install sqlite
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck
+      - run: bun run lint
+      - name: regenerate fixtures
+        run: bun run tests/fixtures/make-fixtures.ts
+      - name: fetch sqlite-vec vendor dylibs
+        run: bun run scripts/fetch-vec-dylibs.ts
+      - run: bun test

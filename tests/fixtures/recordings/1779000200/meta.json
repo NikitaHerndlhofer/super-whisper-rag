@@ -1,0 +1,34 @@
+{
+  "version": 2,
+  "recordingIdHex": "abc333",
+  "datetime": "2026-05-16T09:00:00",
+  "durationMs": 8300,
+  "modeName": "Code",
+  "modelKey": "parakeet",
+  "modelName": "Parakeet 0.6B",
+  "languageModelKey": "ggml-llama-3-8b",
+  "languageModelName": "Llama 3 8B",
+  "recordingDevice": "MacBook Pro Microphone",
+  "result": "function debounce(fn, ms) { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; }",
+  "llmResult": "function debounce(fn, ms) {\n  let t;\n  return (...a) => {\n    clearTimeout(t);\n    t = setTimeout(() => fn(...a), ms);\n  };\n}",
+  "rawResult": "function debounce fn ms let t return dot dot dot a clear timeout t t equals set timeout arrow fn dot dot dot a comma ms",
+  "rawWordCount": 14,
+  "llmWordCount": 13,
+  "segments": [
+    {
+      "start": 0,
+      "end": 8.3,
+      "text": "function debounce(fn, ms) { let t; return (...a) => { clearTimeout(t); t = setTi"
+    }
+  ],
+  "promptContext": {
+    "modeContext": {
+      "language": "en"
+    },
+    "applicationContext": {
+      "name": "Cursor",
+      "category": "developer-tools",
+      "bundleIdentifier": "com.todesktop.230313mzl4w4u92"
+    }
+  }
+}

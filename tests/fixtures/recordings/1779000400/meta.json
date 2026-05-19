@@ -1,0 +1,34 @@
+{
+  "version": 2,
+  "recordingIdHex": "abc555",
+  "datetime": "2026-05-14T11:22:00",
+  "durationMs": 17900,
+  "modeName": "Speech To Text",
+  "modelKey": "whisper-large-v3",
+  "modelName": "Whisper Large v3",
+  "languageModelKey": null,
+  "languageModelName": null,
+  "recordingDevice": "AirPods Pro",
+  "result": "Recordatorio: revisar el deployment del jueves antes de la standup.",
+  "llmResult": "Recordatorio: revisar el deployment del jueves antes de la standup.",
+  "rawResult": "recordatorio revisar el deployment del jueves antes de la standup",
+  "rawWordCount": 28,
+  "llmWordCount": 28,
+  "segments": [
+    {
+      "start": 0,
+      "end": 17.9,
+      "text": "Recordatorio: revisar el deployment del jueves antes de la standup."
+    }
+  ],
+  "promptContext": {
+    "modeContext": {
+      "language": "es"
+    },
+    "applicationContext": {
+      "name": "",
+      "category": "",
+      "bundleIdentifier": ""
+    }
+  }
+}
