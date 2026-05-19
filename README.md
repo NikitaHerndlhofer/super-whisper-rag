@@ -29,6 +29,16 @@ swrag sql "SELECT folder_name, datetime, mode_name, llm_result
              AND superseded_by IS NULL
            ORDER BY datetime DESC"
 
+# Filter by Super Whisper mode — Meetings from the last 7 days.
+# (`mode_name_lower` is an indexed generated column; case-insensitive matches
+#  are cheap. Other modes you might see: Universal, Code, SQL, Speech To Text…)
+swrag sql "SELECT folder_name, datetime, duration_sec, llm_result
+           FROM recording
+           WHERE mode_name_lower = 'meeting'
+             AND datetime >= datetime('now','-7 days')
+             AND superseded_by IS NULL
+           ORDER BY datetime DESC"
+
 # Keyword search with snippets
 swrag sql "SELECT r.folder_name, snippet(recording_fts, 1, '«', '»', '…', 5)
            FROM recording_fts JOIN recording r ON r.rowid = recording_fts.rowid
@@ -89,8 +99,7 @@ swrag install-skill
 
 This writes `SKILL.md` to both `~/.cursor/skills/superwhisper-rag/` and
 `~/.claude/skills/superwhisper-rag/`. The skill is **manual-invocation
-only** — the agent can never reach for it autonomously. To use it, type
-`@superwhisper-rag` in Cursor or `/superwhisper-rag` in Claude Code. See
+only** — the agent can never reach for it autonomously. To use it, type `/superwhisper-rag`. See
 [`docs/agent-integration.md`](docs/agent-integration.md) for the
 guarantee.
 
@@ -107,29 +116,29 @@ archive).
 
 All have sensible defaults; you shouldn't need to set any of them.
 
-| Variable | Purpose |
-| --- | --- |
-| `SWRAG_SOURCE_DIR` | Super Whisper recordings dir (default `~/Documents/superwhisper`) |
-| `SWRAG_SOURCE_DB` | Super Whisper SQLite path |
-| `SWRAG_ARCHIVE` | Our archive's path |
-| `SWRAG_OLLAMA_HOST` | Ollama URL (or `OLLAMA_HOST`; default `http://127.0.0.1:11434`) |
-| `SWRAG_EMBED_MODEL` | Embedding model (default `bge-m3`) |
-| `SWRAG_KEEP_ALIVE` | Ollama `keep_alive` value (default `"0"` — unload immediately after each call). Set to e.g. `"5m"` for bulk re-embeds. |
-| `SWRAG_VERBOSE` | Truthy → verbose stderr logs |
-| `SWRAG_SKIP_EMBED` | Truthy → text-only ingest, skip the embed pass |
-| `SWRAG_SQLITE_DYLIB` | Custom path to `libsqlite3.dylib` |
+| Variable             | Purpose                                                                                                                |
+| -------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `SWRAG_SOURCE_DIR`   | Super Whisper recordings dir (default `~/Documents/superwhisper`)                                                      |
+| `SWRAG_SOURCE_DB`    | Super Whisper SQLite path                                                                                              |
+| `SWRAG_ARCHIVE`      | Our archive's path                                                                                                     |
+| `SWRAG_OLLAMA_HOST`  | Ollama URL (or `OLLAMA_HOST`; default `http://127.0.0.1:11434`)                                                        |
+| `SWRAG_EMBED_MODEL`  | Embedding model (default `bge-m3`)                                                                                     |
+| `SWRAG_KEEP_ALIVE`   | Ollama `keep_alive` value (default `"0"` — unload immediately after each call). Set to e.g. `"5m"` for bulk re-embeds. |
+| `SWRAG_VERBOSE`      | Truthy → verbose stderr logs                                                                                           |
+| `SWRAG_SKIP_EMBED`   | Truthy → text-only ingest, skip the embed pass                                                                         |
+| `SWRAG_SQLITE_DYLIB` | Custom path to `libsqlite3.dylib`                                                                                      |
 
 ## Commands
 
-| Command | What it does |
-| --- | --- |
-| `swrag sql [SQL]` | Run SQL via sqlite3 (default: list mode). Omit SQL to open the REPL. Pass `-` to read from stdin. |
-| `swrag index` | Ingest changes from Super Whisper now. |
-| `swrag doctor` | Verify the environment. |
-| `swrag path [archive\|sqlite3\|vec0]` | Print a filesystem path. Default: `archive`. |
-| `swrag embed "TEXT"` | Print the embedding of `TEXT` as a SQLite blob literal (`x'…'`), for shell composition. |
-| `swrag install-skill` | Install the manual-invocation `SKILL.md` to Cursor and Claude Code. |
-| `swrag enable-sync` / `disable-sync` | Manage the hourly launchd background sync agent. |
+| Command                               | What it does                                                                                      |
+| ------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| `swrag sql [SQL]`                     | Run SQL via sqlite3 (default: list mode). Omit SQL to open the REPL. Pass `-` to read from stdin. |
+| `swrag index`                         | Ingest changes from Super Whisper now.                                                            |
+| `swrag doctor`                        | Verify the environment.                                                                           |
+| `swrag path [archive\|sqlite3\|vec0]` | Print a filesystem path. Default: `archive`.                                                      |
+| `swrag embed "TEXT"`                  | Print the embedding of `TEXT` as a SQLite blob literal (`x'…'`), for shell composition.           |
+| `swrag install-skill`                 | Install the manual-invocation `SKILL.md` to Cursor and Claude Code.                               |
+| `swrag enable-sync` / `disable-sync`  | Manage the hourly launchd background sync agent.                                                  |
 
 ## Going underneath swrag
 
