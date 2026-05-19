@@ -4,22 +4,59 @@ import { join } from "node:path";
 import { Database } from "bun:sqlite";
 import { z } from "zod";
 import { verbose, warn } from "../log.ts";
-import { MetaJsonSchema, SourceRecordingSchema, type SourceRecording } from "../schemas.ts";
+import {
+  MetaJsonSchema,
+  SourceRecordingSchema,
+  type SourceRecording,
+} from "../schemas.ts";
 
 export type { SourceRecording };
 
 const FolderNameRowSchema = z.object({ folderName: z.string() });
 
 /**
- * Real Super Whisper schema (observed as of v3.x):
- *   recording(id BLOB(16) PK, datetime, duration ms DOUBLE, modeName,
- *             modelKey, modelName, languageModelKey, languageModelName,
- *             recordingDevice, rawWordCount, llmWordCount, folderName UNIQUE, …)
- *   recording_fts(recordingId BLOB, llmResult, rawResult, result)
+ * Real Super Whisper schema (verified against v3.x DB on disk).
+ *
+ *   recording(
+ *     id TEXT PK,                 -- uuid-style; NOT a blob, despite older notes
+ *     datetime DATETIME,          -- recording (or reprocess) timestamp
+ *     duration DOUBLE,            -- ms; PRESERVED across reprocessings
+ *     appVersion TEXT,
+ *     modelKey TEXT,
+ *     modelName TEXT,
+ *     languageModelName TEXT,
+ *     recordingDevice TEXT,
+ *     rawWordCount INTEGER,
+ *     llmWordCount INTEGER,
+ *     prompt TEXT,                -- the LLM system prompt; large
+ *     processingTime INTEGER,
+ *     languageModelProcessingTime INTEGER,
+ *     modeName TEXT,
+ *     promptContext TEXT,         -- JSON; overlaps with meta.json
+ *     folderName TEXT,
+ *     fromFile BOOLEAN,
+ *     createdAt DATETIME,         -- row insertion time
+ *     languageModelKey TEXT
+ *   )
+ *   recording_fts(recordingId, llmResult, rawResult, result)
  *
  * The transcripts live in the FTS virtual table — we LEFT JOIN to bring
- * them onto the row. We hex-encode the binary `id` blob so the rest of
- * the pipeline can treat the row's PK as a string.
+ * them onto the row. `hex(r.id)` produces a stable string regardless of
+ * whether `id` is stored as TEXT or BLOB (SQLite duck-typing), so the
+ * rest of the pipeline can treat the row's PK as a hex string.
+ *
+ * Columns we deliberately don't read: `appVersion`, `prompt`,
+ * `promptContext`, `processingTime`, `languageModelProcessingTime`,
+ * `fromFile`, `createdAt`. None of them surfaces in the cookbook today
+ * and `prompt` in particular is large. Add them only when a concrete
+ * query needs them — same rule as everywhere else in this project.
+ *
+ * Note on reprocessings: Super Whisper does NOT provide any
+ * back-reference (no parentId, no audioHash, no recordingGroupId)
+ * linking a reprocess to its original. `datetime`, `folderName`, and
+ * `id` are all reset; `duration` is the only field that survives. We
+ * recover the linkage by SHA-1 hashing `output.wav` ourselves — see
+ * `hashNewAudioFiles` in `ingester.ts` and migration 002.
  */
 const SELECT_ROWS = `
 SELECT
@@ -60,7 +97,8 @@ export function readSourceRecordings(
         ? `${SELECT_ROWS} WHERE r.datetime > ? ORDER BY r.datetime ASC`
         : `${SELECT_ROWS} ORDER BY r.datetime ASC`;
     const stmt = db.prepare(sql);
-    const raw: unknown[] = sinceDatetime != null ? stmt.all(sinceDatetime) : stmt.all();
+    const raw: unknown[] =
+      sinceDatetime != null ? stmt.all(sinceDatetime) : stmt.all();
     return raw.map((r) => SourceRecordingSchema.parse(r));
   } finally {
     db.close();
@@ -72,7 +110,9 @@ export function readSourceFolderNames(path: string): Set<string> {
   if (!existsSync(path)) return new Set();
   const db = new Database(path, { readonly: true });
   try {
-    const rows: unknown[] = db.prepare("SELECT folderName FROM recording").all();
+    const rows: unknown[] = db
+      .prepare("SELECT folderName FROM recording")
+      .all();
     const out = new Set<string>();
     for (const r of rows) {
       const parsed = FolderNameRowSchema.safeParse(r);

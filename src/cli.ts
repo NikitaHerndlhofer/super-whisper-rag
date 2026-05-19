@@ -3,7 +3,8 @@ import { existsSync, realpathSync } from "node:fs";
 import { VERSION } from "./config.ts";
 import { getEnv } from "./env.ts";
 import { error } from "./log.ts";
-import { resolvePaths } from "./paths.ts";
+import { resolvePaths, type ResolvedPaths } from "./paths.ts";
+import type { Env } from "./schemas.ts";
 import { runDoctor } from "./commands/doctor.ts";
 import { runEmbed } from "./commands/embed.ts";
 import { disableSync, enableSync } from "./commands/enable-sync.ts";
@@ -16,15 +17,31 @@ import { runSql, readSqlInput } from "./commands/sql.ts";
 // to be a flag is an env var, parsed and validated through `getEnv()`.
 // See `src/schemas.ts` for the full list of `SWRAG_*` vars, and the
 // README's "Configuration" table for the user-facing summary.
-const env = getEnv();
+//
+// We defer the actual `getEnv()` / `resolvePaths()` call until a handler
+// runs (rather than evaluating at module top level) so that
+// `swrag --help` and `swrag --version` work even when the user has a
+// malformed env var set — citty handles help-only invocations without
+// dispatching to a subcommand handler.
+interface Context {
+  env: Env;
+  paths: ResolvedPaths;
+}
 
-const paths = resolvePaths({
-  sourceDir: env.SWRAG_SOURCE_DIR,
-  sourceDb: env.SWRAG_SOURCE_DB,
-  archive: env.SWRAG_ARCHIVE,
-  ollamaHost: env.SWRAG_OLLAMA_HOST ?? env.OLLAMA_HOST,
-  embedModel: env.SWRAG_EMBED_MODEL,
-});
+let _ctx: Context | null = null;
+function ctx(): Context {
+  if (_ctx) return _ctx;
+  const env = getEnv();
+  const paths = resolvePaths({
+    sourceDir: env.SWRAG_SOURCE_DIR,
+    sourceDb: env.SWRAG_SOURCE_DB,
+    archive: env.SWRAG_ARCHIVE,
+    ollamaHost: env.SWRAG_OLLAMA_HOST ?? env.OLLAMA_HOST,
+    embedModel: env.SWRAG_EMBED_MODEL,
+  });
+  _ctx = { env, paths };
+  return _ctx;
+}
 
 /**
  * Everything after a literal `--` on the command line. We detect this
@@ -62,7 +79,20 @@ const sqlCmd = defineCommand({
     const queryArg = asString(args.query);
     const fromStdin = queryArg === "-";
     const inline = fromStdin ? null : (queryArg ?? null);
+    // Reject `swrag sql "SQL" -- <args>`. Either form is fine on its own
+    // — inline SQL, or SQL forwarded inside the `--` tail — but combining
+    // them used to silently drop the inline SQL. Surface the conflict
+    // rather than guess which one the user wanted.
+    const hasInline = inline != null && inline.trim().length > 0;
+    if (PASSTHROUGH_ARGS.length > 0 && (hasInline || fromStdin)) {
+      error(
+        "cannot combine inline SQL (or stdin) with `--` passthrough. " +
+          "Put your SQL either before `--`, or inside the tail after `--` — not both.",
+      );
+      process.exit(2);
+    }
     const sql = PASSTHROUGH_ARGS.length > 0 ? null : await readSqlInput(inline, fromStdin);
+    const { paths } = ctx();
     const r = await runSql({
       sql,
       archive: paths.archive,
@@ -89,10 +119,9 @@ const indexCmd = defineCommand({
   },
   args: {},
   async run() {
+    const { env, paths } = ctx();
     await runIndex({
       ...paths,
-      full: false,
-      dryRun: false,
       skipEmbeddings: env.SWRAG_SKIP_EMBED,
     });
   },
@@ -106,7 +135,7 @@ const doctorCmd = defineCommand({
   meta: { name: "doctor", description: "Verify your setup" },
   args: {},
   async run() {
-    const r = await runDoctor(paths);
+    const r = await runDoctor(ctx().paths);
     process.stdout.write(r.output);
     process.exit(r.exitCode);
   },
@@ -130,7 +159,7 @@ const pathCmd = defineCommand({
   },
   run({ args }) {
     const target = PathTargetSchema.parse(asString(args.target) ?? "archive");
-    process.stdout.write(`${getPath({ target, archive: paths.archive })}\n`);
+    process.stdout.write(`${getPath({ target, archive: ctx().paths.archive })}\n`);
   },
 });
 
@@ -146,11 +175,12 @@ const embedCmd = defineCommand({
   args: {
     text: { type: "positional", required: true, description: "Text to embed" },
   },
-  run({ args }) {
+  async run({ args }) {
     const text = asString(args.text);
     if (!text) throw new Error("missing required positional: text");
+    const { paths } = ctx();
     process.stdout.write(
-      runEmbed({
+      await runEmbed({
         text,
         embedModel: paths.embedModel,
         ollamaHost: paths.ollamaHost,
@@ -170,7 +200,7 @@ const installSkillCmd = defineCommand({
   },
   args: {},
   async run() {
-    const results = await installSkill();
+    const results = await installSkill(ctx().paths.archive);
     for (const r of results) {
       process.stdout.write(`${r.action}: ${r.path}\n`);
     }

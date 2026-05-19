@@ -1,7 +1,7 @@
-import { describe, expect, test } from "bun:test";
-import { mkdtempSync, mkdirSync } from "node:fs";
+import { afterEach, describe, expect, test } from "bun:test";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { z } from "zod";
 import { openArchive } from "../src/archive/open.ts";
 import { markSourceDeletions, refreshAudioLiveness } from "../src/ingest/deletions.ts";
@@ -16,22 +16,46 @@ const AudioStateRowSchema = z.object({
   source_audio_lost_at: z.string().nullable(),
 });
 
+// Track every temp dir we create so afterEach can tear them down. The
+// previous version of this file leaked mkdtempSync dirs under
+// /var/folders/.../T on every run.
+const createdDirs: string[] = [];
+
 function tempArchive(): string {
   const dir = mkdtempSync(join(tmpdir(), "swrag-del-"));
+  createdDirs.push(dir);
   return join(dir, "swrag.sqlite");
 }
+
+function tempDir(prefix: string): string {
+  const dir = mkdtempSync(join(tmpdir(), prefix));
+  createdDirs.push(dir);
+  return dir;
+}
+
+afterEach(() => {
+  while (createdDirs.length > 0) {
+    const dir = createdDirs.pop();
+    if (dir) rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 describe("deletions", () => {
   test("markSourceDeletions only marks rows missing both source row and meta.json", () => {
     const path = tempArchive();
-    const fakeMeta = mkdtempSync(join(tmpdir(), "swrag-meta-"));
+    const fakeMeta = tempDir("swrag-meta-");
     mkdirSync(fakeMeta, { recursive: true });
     const aliveMeta = join(fakeMeta, "alive.json");
-    Bun.write(aliveMeta, "{}");
+    writeFileSync(aliveMeta, "{}");
     const goneMeta = join(fakeMeta, "gone-but-meta-here.json");
-    Bun.write(goneMeta, "{}");
+    writeFileSync(goneMeta, "{}");
     const missingMeta = join(fakeMeta, "really-gone.json");
 
+    // openArchive doesn't create the parent dir of the archive path
+    // unless it exists; tempArchive returns <tmpdir>/<random>/swrag.sqlite
+    // so we need to ensure <random>/ exists. (It does — mkdtempSync
+    // already created it — but stay defensive.)
+    mkdirSync(dirname(path), { recursive: true });
     const db = openArchive(path);
     db.exec(
       "INSERT INTO recording (folder_name, recording_id_hex, datetime, duration_ms, mode_name, indexed_at, meta_path) " +
@@ -70,9 +94,9 @@ describe("deletions", () => {
 
   test("refreshAudioLiveness flips has_audio when files vanish", () => {
     const path = tempArchive();
-    const audioDir = mkdtempSync(join(tmpdir(), "swrag-audio-"));
+    const audioDir = tempDir("swrag-audio-");
     const alivePath = join(audioDir, "alive.wav");
-    Bun.write(alivePath, Buffer.alloc(4));
+    writeFileSync(alivePath, Buffer.alloc(4));
     const gonePath = join(audioDir, "gone.wav");
 
     const db = openArchive(path);

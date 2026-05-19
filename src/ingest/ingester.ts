@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import type { Database } from "bun:sqlite";
 import { z } from "zod";
@@ -23,6 +23,11 @@ const DirtyRowSchema = z.object({
   raw_result: z.string().nullable(),
   embed_text_hash: z.string().nullable(),
   embed_model: z.string().nullable(),
+  // 0/1 from `recording_vec.folder_name IS NULL` in the LEFT JOIN below.
+  // A canonical row that's missing its vec is treated as dirty
+  // unconditionally — see refreshSupersedence for the failure mode this
+  // closes off.
+  has_vec: z.union([z.literal(0), z.literal(1)]),
 });
 type DirtyRow = z.infer<typeof DirtyRowSchema>;
 
@@ -45,10 +50,6 @@ export interface IngestOptions {
   archive: string;
   embedModel: string;
   ollamaHost: string;
-  /** When true, force a full re-embed even if the model hasn't changed. */
-  full?: boolean;
-  /** When true, do everything except writes / embeddings; print the plan. */
-  dryRun?: boolean;
   /** When true, skip the embedding pass entirely (text-only ingestion). */
   skipEmbeddings?: boolean;
   /** When set, use this function instead of calling Ollama. For tests. */
@@ -91,7 +92,7 @@ export async function ensureFresh(opts: IngestOptions): Promise<IngestResult> {
       const sourceMtimeStr = sourceMtime.toString();
       const modelSwitched = !!storedModel && storedModel !== opts.embedModel;
 
-      if (!opts.full && storedMtime === sourceMtimeStr && !modelSwitched && !opts.dryRun) {
+      if (storedMtime === sourceMtimeStr && !modelSwitched) {
         return {
           fastPath: true,
           newRows: 0,
@@ -108,12 +109,8 @@ export async function ensureFresh(opts: IngestOptions): Promise<IngestResult> {
       setConfig(archive, "super_whisper_db_path", opts.sourceDb);
       setConfig(archive, "super_whisper_recordings_dir", recordingsDir(opts.sourceDir));
 
-      if (modelSwitched || opts.full) {
-        info(
-          modelSwitched
-            ? `embed model changed (${storedModel} -> ${opts.embedModel}); re-embedding all rows`
-            : `--full: re-embedding all rows`,
-        );
+      if (modelSwitched) {
+        info(`embed model changed (${storedModel} -> ${opts.embedModel}); re-embedding all rows`);
         archive.exec("DELETE FROM recording_vec");
         archive.exec(
           "UPDATE recording SET embed_text_hash = NULL, embed_model = NULL, embed_dim = NULL",
@@ -122,7 +119,7 @@ export async function ensureFresh(opts: IngestOptions): Promise<IngestResult> {
 
       const snap = snapshotSourceDb(opts.sourceDb);
       try {
-        const since = opts.full ? null : (getConfig(archive, "last_indexed_datetime") ?? null);
+        const since = getConfig(archive, "last_indexed_datetime") ?? null;
         const newRows = readSourceRecordings(snap.path, since);
         const sourceFolders = readSourceFolderNames(snap.path);
         verbose(
@@ -132,7 +129,10 @@ export async function ensureFresh(opts: IngestOptions): Promise<IngestResult> {
         const rdir = recordingsDir(opts.sourceDir);
         const upserts = await Promise.all(
           newRows.map((row) =>
-            readMetaContext(rdir, row.folderName).then((meta) => ({ row, meta })),
+            readMetaContext(rdir, row.folderName).then((meta) => ({
+              row,
+              meta,
+            })),
           ),
         );
 
@@ -223,7 +223,7 @@ export async function ensureFresh(opts: IngestOptions): Promise<IngestResult> {
         // Same-audio reprocessings produce multiple rows in Super Whisper; we
         // keep them all (the archive is append-only) but mark all but the
         // newest as superseded so default queries can ignore the older ones.
-        hashNewAudioFiles(archive);
+        await hashNewAudioFiles(archive);
         const superseded = refreshSupersedence(archive, nowIso);
 
         let embedded = 0;
@@ -276,11 +276,19 @@ interface EmbedDirtyOpts {
 async function embedDirtyRows(archive: Database, opts: EmbedDirtyOpts): Promise<number> {
   // Only embed canonical rows. Superseded rows are duplicates of a later
   // reprocess of the same audio; embedding them wastes Ollama calls.
+  //
+  // We also LEFT JOIN recording_vec so a canonical row missing its vec
+  // entry is picked up regardless of hash/model match. This is a
+  // defence-in-depth against any future code path that nukes a vec row
+  // without also clearing embed_text_hash on the recording row.
   const raw: unknown[] = archive
     .prepare(
-      `SELECT folder_name, mode_name, llm_result, raw_result, embed_text_hash, embed_model
-       FROM recording
-       WHERE superseded_by IS NULL`,
+      `SELECT r.folder_name, r.mode_name, r.llm_result, r.raw_result,
+              r.embed_text_hash, r.embed_model,
+              CASE WHEN v.folder_name IS NULL THEN 0 ELSE 1 END AS has_vec
+       FROM recording r
+       LEFT JOIN recording_vec v ON v.folder_name = r.folder_name
+       WHERE r.superseded_by IS NULL`,
     )
     .all();
   const candidates: DirtyRow[] = raw.map((r) => DirtyRowSchema.parse(r));
@@ -290,7 +298,8 @@ async function embedDirtyRows(archive: Database, opts: EmbedDirtyOpts): Promise<
     const text = embedText(r);
     if (!text) continue;
     const hash = sha256(text);
-    if (r.embed_text_hash === hash && r.embed_model === opts.model) continue;
+    const hashMatches = r.embed_text_hash === hash && r.embed_model === opts.model;
+    if (hashMatches && r.has_vec === 1) continue;
     dirty.push({ folder_name: r.folder_name, text, hash });
   }
 
@@ -351,8 +360,12 @@ function sha256(s: string): string {
  * exists on disk but whose audio_hash is still NULL in the archive. We
  * only hash files we haven't seen before; existing hashes are stable
  * because Super Whisper never rewrites an audio file in place.
+ *
+ * Hashing happens outside the transaction (it's streamed I/O — we
+ * shouldn't hold a write lock for it). We collect (folder_name, hash)
+ * tuples first, then apply them in a single short transaction.
  */
-function hashNewAudioFiles(archive: Database): void {
+async function hashNewAudioFiles(archive: Database): Promise<void> {
   const raw: unknown[] = archive
     .prepare(
       `SELECT folder_name, audio_path
@@ -362,24 +375,25 @@ function hashNewAudioFiles(archive: Database): void {
     .all();
   const candidates = raw.map((r) => AudioHashRowSchema.parse(r));
   if (candidates.length === 0) return;
+  const computed: { folder_name: string; hash: string }[] = [];
+  for (const row of candidates) {
+    if (!row.audio_path || !existsSync(row.audio_path)) continue;
+    try {
+      const hash = await sha1File(row.audio_path);
+      computed.push({ folder_name: row.folder_name, hash });
+    } catch (e) {
+      verbose(
+        `audio hash failed for ${row.folder_name}: ${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
+  }
+  if (computed.length === 0) return;
   const update = archive.prepare("UPDATE recording SET audio_hash = ? WHERE folder_name = ?");
   const tx = archive.transaction(() => {
-    let hashed = 0;
-    for (const row of candidates) {
-      if (!row.audio_path || !existsSync(row.audio_path)) continue;
-      try {
-        const hash = sha1File(row.audio_path);
-        update.run(hash, row.folder_name);
-        hashed++;
-      } catch (e) {
-        verbose(
-          `audio hash failed for ${row.folder_name}: ${e instanceof Error ? e.message : String(e)}`,
-        );
-      }
-    }
-    if (hashed > 0) verbose(`hashed ${hashed} new audio files`);
+    for (const c of computed) update.run(c.hash, c.folder_name);
   });
   tx();
+  verbose(`hashed ${computed.length} new audio files`);
 }
 
 /**
@@ -419,6 +433,14 @@ function refreshSupersedence(archive: Database, nowIso: string): number {
   // is silent but it wastes space and risks confusing future readers
   // who assume vec rows are canonical.
   const deleteVec = archive.prepare("DELETE FROM recording_vec WHERE folder_name = ?");
+  // Alongside the vec drop: clear embed_text_hash/model so that if this
+  // row ever gets promoted back to canonical (e.g. the duplicate's
+  // audio_hash changes), `embedDirtyRows` re-embeds it. Without this
+  // the row would land in the canonical set with no vec entry at all,
+  // silently absent from semantic search.
+  const clearEmbed = archive.prepare(
+    "UPDATE recording SET embed_text_hash = NULL, embed_model = NULL, embed_dim = NULL WHERE folder_name = ?",
+  );
   let changed = 0;
   const tx = archive.transaction(() => {
     for (const [, bucket] of groups) {
@@ -439,6 +461,7 @@ function refreshSupersedence(archive: Database, nowIso: string): number {
         if (!r) continue;
         setSuperseded.run(canonical.folder_name, nowIso, r.folder_name);
         deleteVec.run(r.folder_name);
+        clearEmbed.run(r.folder_name);
         changed++;
       }
     }
@@ -447,7 +470,15 @@ function refreshSupersedence(archive: Database, nowIso: string): number {
   return changed;
 }
 
-function sha1File(path: string): string {
-  const data = readFileSync(path);
-  return createHash("sha1").update(data).digest("hex");
+/**
+ * Stream the file through SHA-1 so we don't allocate the whole audio
+ * payload up front. Long-form dictations can be 100+ MB; the previous
+ * `readFileSync` would keep that entire buffer resident until the hash
+ * finished.
+ */
+async function sha1File(path: string): Promise<string> {
+  const h = createHash("sha1");
+  const stream = Bun.file(path).stream();
+  for await (const chunk of stream) h.update(chunk);
+  return h.digest("hex");
 }

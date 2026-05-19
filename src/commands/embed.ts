@@ -1,4 +1,4 @@
-import { embedSync } from "../embed/ollama.ts";
+import { embedOne } from "../embed/ollama.ts";
 
 export interface EmbedOptions {
   text: string;
@@ -21,8 +21,8 @@ export interface EmbedOptions {
  *     -cmd ".load $(swrag path vec0) sqlite3_vec_init" \
  *     "SELECT ... vec_distance_cosine(embedding, $(swrag embed 'hello')) ..."
  */
-export function runEmbed(opts: EmbedOptions): string {
-  const vec = embedSync(opts.text, {
+export async function runEmbed(opts: EmbedOptions): Promise<string> {
+  const vec = await embedOne(opts.text, {
     host: opts.ollamaHost,
     model: opts.embedModel,
   });

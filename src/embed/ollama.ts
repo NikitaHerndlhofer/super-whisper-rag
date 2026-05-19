@@ -2,7 +2,6 @@ import { EMBED_TIMEOUT_MS } from "../config.ts";
 import { getEnv } from "../env.ts";
 import { DEFAULTS } from "../paths.ts";
 import { OllamaEmbedResponseSchema, OllamaTagsResponseSchema } from "../schemas.ts";
-import { run } from "../spawn.ts";
 
 export interface EmbedOptions {
   host?: string;
@@ -21,48 +20,22 @@ export interface EmbedOptions {
   keepAlive?: string;
 }
 
-const DEFAULT_KEEP_ALIVE = getEnv().SWRAG_KEEP_ALIVE ?? "15m";
+function defaultKeepAlive(): string {
+  return getEnv().SWRAG_KEEP_ALIVE ?? "15m";
+}
 
 /**
- * Synchronous single-text embedding via curl.
- *
- * Used by the `swrag embed "text"` CLI command, which prints the resulting
- * vector as a SQLite blob literal (`x'…'`) on stdout. That output is meant
- * to be `$(swrag embed …)`-expanded into a SQL string at the shell layer
- * — `swrag embed` is part of a synchronous shell pipeline and has nowhere
- * to await a Promise. For bulk ingestion (`swrag index`) we use the async
- * `embedBatch` instead because it pipelines through fetch.
+ * Embed a single piece of text. Used by the `swrag embed "text"` CLI
+ * command, which prints the resulting vector as a SQLite blob literal
+ * (`x'…'`) for shell composition (`$(swrag embed 'q')`). Shells that
+ * use command substitution wait for the child process to exit, so
+ * there's no need to be synchronous internally; this is just a thin
+ * wrapper around `embedBatch`.
  */
-export function embedSync(text: string, opts: EmbedOptions = {}): Float32Array {
-  const host = opts.host ?? DEFAULTS.ollamaHost;
-  const model = opts.model ?? DEFAULTS.embedModel;
-  const timeoutMs = opts.timeoutMs ?? EMBED_TIMEOUT_MS;
-  const keepAlive = opts.keepAlive ?? DEFAULT_KEEP_ALIVE;
-  const maxTime = Math.max(1, Math.ceil(timeoutMs / 1000));
-
-  const r = run(
-    [
-      "curl",
-      "-sS",
-      "--max-time",
-      String(maxTime),
-      "-X",
-      "POST",
-      `${host}/api/embed`,
-      "-H",
-      "Content-Type: application/json",
-      "-d",
-      JSON.stringify({ model, input: [text], keep_alive: keepAlive }),
-    ],
-    { timeoutMs: timeoutMs + 500 },
-  );
-  if (r.exitCode !== 0) {
-    throw new Error(`embed via curl failed (exit ${r.exitCode}): ${r.stderr || "no stderr"}`);
-  }
-  const body = OllamaEmbedResponseSchema.parse(JSON.parse(r.stdout));
-  const first = body.embeddings[0];
-  if (!first) throw new Error("ollama returned no embeddings");
-  return new Float32Array(first);
+export async function embedOne(text: string, opts: EmbedOptions = {}): Promise<Float32Array> {
+  const [v] = await embedBatch([text], opts);
+  if (!v) throw new Error("ollama returned no embeddings");
+  return v;
 }
 
 /** Batch embed via async fetch. Returns `texts.length` vectors in order. */
@@ -74,7 +47,7 @@ export async function embedBatch(
   const host = opts.host ?? DEFAULTS.ollamaHost;
   const model = opts.model ?? DEFAULTS.embedModel;
   const timeoutMs = opts.timeoutMs ?? EMBED_TIMEOUT_MS * 6;
-  const keepAlive = opts.keepAlive ?? DEFAULT_KEEP_ALIVE;
+  const keepAlive = opts.keepAlive ?? defaultKeepAlive();
 
   const body = JSON.stringify({ model, input: texts, keep_alive: keepAlive });
   const r = await fetchWithRetry(

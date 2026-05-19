@@ -1,9 +1,12 @@
-import { unlinkSync, existsSync, copyFileSync } from "node:fs";
+import { unlinkSync, existsSync, copyFileSync, readdirSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { verbose, warn } from "../log.ts";
 import { run } from "../spawn.ts";
 import { findSqlite3Binary } from "../sqlite3.ts";
+
+const SNAPSHOT_PREFIX = "swrag-snap-";
+const SNAPSHOT_STALE_MS = 60 * 60 * 1000;
 
 /**
  * Make a read-only point-in-time copy of the Super Whisper SQLite DB.
@@ -22,7 +25,8 @@ export function snapshotSourceDb(sourcePath: string): Snapshot {
   if (!existsSync(sourcePath)) {
     throw new Error(`source DB not found: ${sourcePath}`);
   }
-  const dest = join(tmpdir(), `swrag-snap-${process.pid}-${Date.now()}.sqlite`);
+  sweepStaleSnapshots();
+  const dest = join(tmpdir(), `${SNAPSHOT_PREFIX}${process.pid}-${Date.now()}.sqlite`);
   const ok = trySqlite3Backup(sourcePath, dest);
   if (!ok) {
     verbose("sqlite3 .backup unavailable; falling back to file copy");
@@ -61,6 +65,39 @@ function trySqlite3Backup(source: string, dest: string): boolean {
     return false;
   }
   return existsSync(dest);
+}
+
+/**
+ * Best-effort cleanup of snapshot files left behind by previous runs that
+ * crashed before `dispose()` could fire (e.g. SIGKILL, kernel panic).
+ * macOS doesn't aggressively sweep /var/folders/.../T on its own, so
+ * these would otherwise accumulate.
+ *
+ * Conservative: only delete entries that match our prefix AND haven't
+ * been touched in the last hour. Anything younger could belong to a
+ * concurrent `swrag` invocation.
+ */
+function sweepStaleSnapshots(): void {
+  const dir = tmpdir();
+  let entries: string[];
+  try {
+    entries = readdirSync(dir);
+  } catch {
+    return;
+  }
+  const cutoff = Date.now() - SNAPSHOT_STALE_MS;
+  for (const name of entries) {
+    if (!name.startsWith(SNAPSHOT_PREFIX)) continue;
+    const full = join(dir, name);
+    try {
+      const s = statSync(full);
+      if (s.mtimeMs >= cutoff) continue;
+      unlinkSync(full);
+      verbose(`swept stale snapshot ${full}`);
+    } catch {
+      // Permissions / race with another swrag — ignore.
+    }
+  }
 }
 
 function fileCopyWithRetry(source: string, dest: string, retries = 5): void {

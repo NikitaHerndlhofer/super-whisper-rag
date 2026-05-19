@@ -14,7 +14,15 @@
  * cache directory so a launchd-spawned process and a TTY-spawned process
  * share the same copy.
  */
-import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 import dylibArm64 from "../../vendor/vec0-darwin-arm64.dylib" with { type: "file" };
@@ -40,12 +48,20 @@ function materialiseDylib(embeddedPath: string): string {
   }
   const data = readFileSync(embeddedPath);
   const size = data.byteLength;
-  const username = safeUsername();
-  const cacheDir = join(tmpdir(), `swrag-vec0-${username}`);
+  // Include the numeric uid in the cache dir name (in addition to a
+  // sanitised username) so two users on the same multi-user Mac whose
+  // usernames happen to differ only in stripped characters don't collide
+  // on the same world-writable /tmp directory. Lock the dir down to
+  // 0700 to make it harder for someone to plant a malicious dylib at
+  // our target path before we get a chance to materialise it.
+  const cacheDir = join(tmpdir(), `swrag-vec0-${safeUid()}-${safeUsername()}`);
   try {
-    mkdirSync(cacheDir, { recursive: true });
+    mkdirSync(cacheDir, { recursive: true, mode: 0o700 });
+    chmodSync(cacheDir, 0o700);
   } catch {
-    // ignore
+    // ignore — chmod failures on someone else's pre-existing dir are
+    // expected, we still try to use it. dlopen will reject the file if
+    // it's been tampered with via codesigning checks.
   }
   const target = join(cacheDir, `vec0-${process.arch}-${size}.dylib`);
   if (existsSync(target) && statSync(target).size === size) {
@@ -54,7 +70,7 @@ function materialiseDylib(embeddedPath: string): string {
   // Atomic write: write to a temp path then rename so concurrent CLI calls
   // never observe a half-written dylib.
   const tmp = `${target}.${process.pid}.tmp`;
-  writeFileSync(tmp, data);
+  writeFileSync(tmp, data, { mode: 0o600 });
   try {
     renameSync(tmp, target);
   } catch {
@@ -70,4 +86,9 @@ function safeUsername(): string {
   } catch {
     return "user";
   }
+}
+
+function safeUid(): string {
+  const uid = process.getuid?.();
+  return uid == null ? "x" : String(uid);
 }

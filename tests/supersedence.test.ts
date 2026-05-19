@@ -153,4 +153,57 @@ describe("Super Whisper reprocessing → supersedence", () => {
       db2.close();
     }
   });
+
+  test("restored canonical row gets its vec entry re-created", async () => {
+    // Regression test: a row that was superseded (vec deleted) and later
+    // promoted back to canonical must end up with a vec entry. Previously
+    // the embed pass keyed only on embed_text_hash/model, which still
+    // matched the prior canonical embedding, so the row was skipped and
+    // left without a vec entry.
+    const sharedPayload = Buffer.from("regression-shared");
+    const distinctPayload = Buffer.from("regression-distinct");
+    writeFileSync(`${env.sourceDir}/recordings/1779000000/output.wav`, sharedPayload);
+    writeFileSync(`${env.sourceDir}/recordings/1779000200/output.wav`, sharedPayload);
+    await ensureFresh(defaultOpts());
+
+    // Sanity: 1779000200 is currently superseded → its vec entry was dropped.
+    ensureExtensionCapableSqlite();
+    {
+      const db = new Database(env.archive, { readonly: true });
+      db.loadExtension(vecDylibPath(), "sqlite3_vec_init");
+      try {
+        const supersededVec = queryAll(
+          db,
+          z.object({ n: z.number() }),
+          "SELECT COUNT(*) AS n FROM recording_vec WHERE folder_name = '1779000200'",
+        );
+        expect(supersededVec[0]?.n).toBe(0);
+      } finally {
+        db.close();
+      }
+    }
+
+    // Diverge the older row's audio so it's no longer a duplicate.
+    writeFileSync(`${env.sourceDir}/recordings/1779000200/output.wav`, distinctPayload);
+    const db = new Database(env.archive);
+    db.exec("UPDATE recording SET audio_hash = NULL WHERE folder_name = '1779000200'");
+    db.close();
+    const now = new Date();
+    utimesSync(env.sourceDb, now, now);
+
+    await ensureFresh(defaultOpts());
+
+    const db2 = new Database(env.archive, { readonly: true });
+    db2.loadExtension(vecDylibPath(), "sqlite3_vec_init");
+    try {
+      const restoredVec = queryAll(
+        db2,
+        z.object({ n: z.number() }),
+        "SELECT COUNT(*) AS n FROM recording_vec WHERE folder_name = '1779000200'",
+      );
+      expect(restoredVec[0]?.n).toBe(1);
+    } finally {
+      db2.close();
+    }
+  });
 });

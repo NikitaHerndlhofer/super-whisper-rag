@@ -97,17 +97,6 @@ describe("ensureFresh", () => {
     expect(r.embedded).toBeGreaterThanOrEqual(5);
   });
 
-  test("--full forces a re-embed even without model change", async () => {
-    await ensureFresh({ ...defaultOpts(), embedModel: "model-A" });
-    const r = await ensureFresh({
-      ...defaultOpts(),
-      embedModel: "model-A",
-      full: true,
-    });
-    expect(r.fastPath).toBe(false);
-    expect(r.embedded).toBeGreaterThanOrEqual(5);
-  });
-
   test("skipEmbeddings keeps text but does not call embed", async () => {
     let calls = 0;
     const fn = async (texts: string[]) => {

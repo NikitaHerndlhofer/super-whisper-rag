@@ -37,26 +37,34 @@ export async function installLaunchAgent(opts: InstallSyncOptions): Promise<stri
   return plistPath;
 }
 
+/**
+ * Returns true iff a plist was present on disk and got removed. Whether
+ * the launchd service itself was actually running before the bootout is
+ * deliberately not reported — `launchctl bootout`'s exit code isn't a
+ * reliable signal across macOS versions (sometimes 0 with "no such
+ * service", sometimes non-zero). The caller's UI message should
+ * therefore phrase the absence-case as "was not installed" only when the
+ * plist file was missing.
+ */
 export async function uninstallLaunchAgent(): Promise<boolean> {
   const plistPath = DEFAULTS.launchPlist;
-  let removedRunning = false;
-  if (existsSync(plistPath)) {
-    removedRunning = bootout();
-    await unlink(plistPath);
-  }
-  return removedRunning;
+  if (!existsSync(plistPath)) return false;
+  bootout();
+  await unlink(plistPath);
+  return true;
 }
 
 /**
  * `launchctl bootout` the running instance, if any. The plist on disk is
- * not consulted — `launchctl` looks the service up by label.
+ * not consulted — `launchctl` looks the service up by label. Exit code
+ * is ignored: across macOS versions it's not consistent whether
+ * "service wasn't loaded" is success or failure, and either way we
+ * don't care for our purposes.
  */
-function bootout(): boolean {
-  const r = run(["launchctl", "bootout", `gui/${currentUid()}/${PLIST_LABEL}`], {
+function bootout(): void {
+  run(["launchctl", "bootout", `gui/${currentUid()}/${PLIST_LABEL}`], {
     timeoutMs: 5_000,
   });
-  // Exit non-zero is fine — service may not have been loaded.
-  return r.exitCode === 0;
 }
 
 /**

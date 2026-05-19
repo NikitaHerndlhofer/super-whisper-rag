@@ -8,8 +8,6 @@ export interface IndexCommandOptions {
   archive: string;
   embedModel: string;
   ollamaHost: string;
-  full: boolean;
-  dryRun: boolean;
   skipEmbeddings?: boolean;
 }
 
@@ -20,8 +18,6 @@ export async function runIndex(opts: IndexCommandOptions): Promise<IngestResult>
     archive: opts.archive,
     embedModel: opts.embedModel,
     ollamaHost: opts.ollamaHost,
-    full: opts.full,
-    dryRun: opts.dryRun,
     skipEmbeddings: opts.skipEmbeddings,
   });
   if (result.fastPath) {
@@ -36,10 +32,12 @@ export async function runIndex(opts: IndexCommandOptions): Promise<IngestResult>
 
   // Auto-upgrade hook: if the user has installed skills and the bundled
   // SKILL.md has changed (e.g. because they just `brew upgrade`d), refresh
-  // the on-disk copies in place. Best-effort; failures are logged at
-  // verbose level only — never blocking ingest.
+  // the on-disk copies in place — but only when the user hasn't edited
+  // them since we last wrote (see install-skill.ts for the rules).
+  // Best-effort; failures are logged at verbose level only — never
+  // blocking ingest.
   try {
-    const refreshed = (await refreshInstalledSkills()).filter((r) => r.refreshed);
+    const refreshed = (await refreshInstalledSkills(opts.archive)).filter((r) => r.refreshed);
     if (refreshed.length > 0) {
       info(`refreshed ${refreshed.length} skill file(s) to match the new binary`);
       for (const r of refreshed) verbose(`  ${r.path}`);
