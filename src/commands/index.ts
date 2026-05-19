@@ -1,5 +1,6 @@
 import { ensureFresh, type IngestResult } from "../ingest/ingester.ts";
-import { info } from "../log.ts";
+import { info, verbose } from "../log.ts";
+import { refreshInstalledSkills } from "./install-skill.ts";
 
 export interface IndexCommandOptions {
   sourceDir: string;
@@ -32,5 +33,20 @@ export async function runIndex(opts: IndexCommandOptions): Promise<IngestResult>
         `(${result.durationMs} ms)`,
     );
   }
+
+  // Auto-upgrade hook: if the user has installed skills and the bundled
+  // SKILL.md has changed (e.g. because they just `brew upgrade`d), refresh
+  // the on-disk copies in place. Best-effort; failures are logged at
+  // verbose level only — never blocking ingest.
+  try {
+    const refreshed = (await refreshInstalledSkills()).filter((r) => r.refreshed);
+    if (refreshed.length > 0) {
+      info(`refreshed ${refreshed.length} skill file(s) to match the new binary`);
+      for (const r of refreshed) verbose(`  ${r.path}`);
+    }
+  } catch (e) {
+    verbose(`skill auto-refresh skipped: ${e instanceof Error ? e.message : String(e)}`);
+  }
+
   return result;
 }

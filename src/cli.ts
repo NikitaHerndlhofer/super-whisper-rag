@@ -1,5 +1,5 @@
 import { defineCommand, runMain } from "citty";
-import { realpathSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import { VERSION } from "./config.ts";
 import { error } from "./log.ts";
@@ -200,7 +200,27 @@ const disableSyncCmd = defineCommand({
   },
 });
 
+/**
+ * Resolve the binary path that the launchd plist should embed.
+ *
+ * We deliberately prefer Homebrew's stable symlink (`/opt/homebrew/bin/swrag`)
+ * over the version-specific Cellar realpath. On `brew upgrade superwhisper-rag`
+ * the new bottle lands at a fresh Cellar dir, the symlink is rewired
+ * atomically, and `brew cleanup` deletes the old Cellar — which would
+ * leave a launchd plist pointing at a deleted realpath. The symlink
+ * survives upgrades, so the plist captured by `swrag enable-sync` keeps
+ * working across versions without re-running the command.
+ *
+ * Fallbacks (in order):
+ *   1. /opt/homebrew/bin/swrag                    (Apple Silicon brew)
+ *   2. /usr/local/bin/swrag                       (Intel brew)
+ *   3. realpath(process.execPath)                 (running compiled binary outside brew)
+ *   4. process.execPath                           (last resort)
+ */
 function resolveBinPath(): string {
+  for (const p of ["/opt/homebrew/bin/swrag", "/usr/local/bin/swrag"]) {
+    if (existsSync(p)) return p;
+  }
   const execPath = process.execPath;
   if (execPath && !execPath.endsWith("/bun")) {
     try {

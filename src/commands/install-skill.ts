@@ -49,3 +49,46 @@ async function writeSkill(path: string): Promise<SkillInstallOutcome> {
   await writeFile(path, SKILL_MD, "utf8");
   return { path, action: "wrote" };
 }
+
+/**
+ * Silently refresh any already-installed skill file whose content has
+ * drifted from the bundled `SKILL_MD` (typically because the binary was
+ * upgraded via `brew upgrade superwhisper-rag` and the new release ships
+ * an updated cookbook). Called on every `swrag index` tick, so users get
+ * fresh skill content within one hourly cycle of any upgrade.
+ *
+ * Only touches files that already exist — users who never ran
+ * `swrag install-skill` are not opted in, and stay that way.
+ */
+export async function refreshInstalledSkills(): Promise<
+  { path: string; refreshed: boolean }[]
+> {
+  const targets = [
+    join(DEFAULTS.cursorSkillDir, "SKILL.md"),
+    join(DEFAULTS.claudeSkillDir, "SKILL.md"),
+  ];
+  const out: { path: string; refreshed: boolean }[] = [];
+  for (const path of targets) {
+    if (!existsSync(path)) {
+      out.push({ path, refreshed: false });
+      continue;
+    }
+    try {
+      const existing = await readFile(path, "utf8");
+      if (existing === SKILL_MD) {
+        out.push({ path, refreshed: false });
+        continue;
+      }
+      // Auto-refresh: skip the .bak.<ts> backup chain here. The user
+      // opted in to the skill once; we don't want to fill their disk
+      // with one backup per release. The user can recover content via
+      // `git log` on the source repo if they really care.
+      await writeFile(path, SKILL_MD, "utf8");
+      out.push({ path, refreshed: true });
+    } catch {
+      // best-effort — don't crash the ingest pipeline over a stale skill.
+      out.push({ path, refreshed: false });
+    }
+  }
+  return out;
+}

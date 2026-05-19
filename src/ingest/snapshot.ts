@@ -2,6 +2,7 @@ import { unlinkSync, existsSync, copyFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { verbose, warn } from "../log.ts";
+import { findSqlite3Binary } from "../sqlite3.ts";
 
 /**
  * Make a read-only point-in-time copy of the Super Whisper SQLite DB.
@@ -45,8 +46,18 @@ export function snapshotSourceDb(sourcePath: string): Snapshot {
 }
 
 function trySqlite3Backup(source: string, dest: string): boolean {
+  let bin: string;
+  try {
+    // Use the same Homebrew sqlite3 the rest of the codebase relies on,
+    // not whatever happens to be on PATH. `.backup` works in any build
+    // (loadable extensions are not required for this dot-command), but
+    // we want a single, predictable binary.
+    bin = findSqlite3Binary();
+  } catch {
+    return false;
+  }
   const r = Bun.spawnSync({
-    cmd: ["sqlite3", source, `.backup '${dest}'`],
+    cmd: [bin, source, `.backup '${dest}'`],
     timeout: 30_000,
   });
   if (r.exitCode !== 0) {
