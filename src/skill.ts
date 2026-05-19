@@ -157,8 +157,22 @@ sqlite3 "$(swrag path)" \\
 > Every recipe filters \`superseded_by IS NULL\` so reprocessed duplicates
 > don't pollute the result set. Drop that clause only if you specifically
 > want to inspect the reprocessing history.
+>
+> **Modes (\`mode_name\`) are user-configurable in Super Whisper** — don't
+> hard-code mode names without first checking which ones this user has.
+> Recipe 0 below shows how. Once you know the modes, recipes 2, 5, etc.
+> demonstrate filtering with \`mode_name_lower\` (an indexed generated
+> column for case-insensitive lookup).
 
 \`\`\`sql
+-- 0. Discover the user's modes (run this first if you don't already know
+--    what to filter on).
+SELECT mode_name, COUNT(*) AS n
+FROM recording
+WHERE superseded_by IS NULL
+GROUP BY mode_name
+ORDER BY n DESC;
+
 -- 1. Today's recordings, newest first
 SELECT folder_name, datetime, mode_name, llm_result
 FROM recording
@@ -167,6 +181,7 @@ WHERE superseded_by IS NULL
 ORDER BY datetime DESC;
 
 -- 2. Meeting recordings from the last 7 days
+--    (replace 'meeting' with whatever recipe 0 surfaced for this user)
 SELECT folder_name, datetime, duration_sec, llm_result
 FROM recording
 WHERE superseded_by IS NULL

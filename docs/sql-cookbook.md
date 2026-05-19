@@ -14,8 +14,20 @@ The same cookbook is embedded verbatim in the bundled `SKILL.md` via
 >   `x'…'` blob literal before SQL is parsed.
 > - **Always filter `WHERE superseded_by IS NULL`** unless you
 >   specifically want to see Super Whisper's reprocessing history.
+> - **Modes (`mode_name`) are user-configurable in Super Whisper** — don't
+>   hard-code mode names without first checking which ones this user has
+>   (recipe 0 below). Filter with `mode_name_lower` (case-insensitive,
+>   indexed) once you know the names.
 
 ```sql
+-- 0. Discover the user's modes (run this first if you don't already
+--    know what to filter on).
+SELECT mode_name, COUNT(*) AS n
+FROM recording
+WHERE superseded_by IS NULL
+GROUP BY mode_name
+ORDER BY n DESC;
+
 -- 1. Today's recordings, newest first
 SELECT folder_name, datetime, mode_name, llm_result
 FROM recording
@@ -24,6 +36,7 @@ WHERE superseded_by IS NULL
 ORDER BY datetime DESC;
 
 -- 2. Meeting recordings from the last 7 days
+--    (replace 'meeting' with whatever recipe 0 surfaced for this user)
 SELECT folder_name, datetime, duration_sec, llm_result
 FROM recording
 WHERE superseded_by IS NULL

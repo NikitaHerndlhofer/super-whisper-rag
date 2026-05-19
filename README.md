@@ -29,9 +29,17 @@ swrag sql "SELECT folder_name, datetime, mode_name, llm_result
              AND superseded_by IS NULL
            ORDER BY datetime DESC"
 
-# Filter by Super Whisper mode — Meetings from the last 7 days.
-# (`mode_name_lower` is an indexed generated column; case-insensitive matches
-#  are cheap. Other modes you might see: Universal, Code, SQL, Speech To Text…)
+# Discover the modes you've actually used — modes are user-configurable in
+# Super Whisper, so don't assume any particular name exists.
+swrag sql "SELECT mode_name, COUNT(*) AS n
+           FROM recording
+           WHERE superseded_by IS NULL
+           GROUP BY mode_name
+           ORDER BY n DESC"
+
+# Filter by Super Whisper mode — replace 'meeting' with one of the names
+# the previous query showed. `mode_name_lower` is an indexed generated
+# column, so case-insensitive matches are cheap.
 swrag sql "SELECT folder_name, datetime, duration_sec, llm_result
            FROM recording
            WHERE mode_name_lower = 'meeting'
@@ -116,17 +124,17 @@ archive).
 
 All have sensible defaults; you shouldn't need to set any of them.
 
-| Variable             | Purpose                                                                                                                |
-| -------------------- | ---------------------------------------------------------------------------------------------------------------------- |
-| `SWRAG_SOURCE_DIR`   | Super Whisper recordings dir (default `~/Documents/superwhisper`)                                                      |
-| `SWRAG_SOURCE_DB`    | Super Whisper SQLite path                                                                                              |
-| `SWRAG_ARCHIVE`      | Our archive's path                                                                                                     |
-| `SWRAG_OLLAMA_HOST`  | Ollama URL (or `OLLAMA_HOST`; default `http://127.0.0.1:11434`)                                                        |
-| `SWRAG_EMBED_MODEL`  | Embedding model (default `bge-m3`)                                                                                     |
-| `SWRAG_KEEP_ALIVE`   | Ollama `keep_alive` value (default `"0"` — unload immediately after each call). Set to e.g. `"5m"` for bulk re-embeds. |
-| `SWRAG_VERBOSE`      | Truthy → verbose stderr logs                                                                                           |
-| `SWRAG_SKIP_EMBED`   | Truthy → text-only ingest, skip the embed pass                                                                         |
-| `SWRAG_SQLITE_DYLIB` | Custom path to `libsqlite3.dylib`                                                                                      |
+| Variable             | Purpose                                                                                                                  |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `SWRAG_SOURCE_DIR`   | Super Whisper recordings dir (default `~/Documents/superwhisper`)                                                        |
+| `SWRAG_SOURCE_DB`    | Super Whisper SQLite path                                                                                                |
+| `SWRAG_ARCHIVE`      | Our archive's path                                                                                                       |
+| `SWRAG_OLLAMA_HOST`  | Ollama URL (or `OLLAMA_HOST`; default `http://127.0.0.1:11434`)                                                          |
+| `SWRAG_EMBED_MODEL`  | Embedding model (default `bge-m3`)                                                                                       |
+| `SWRAG_KEEP_ALIVE`   | Ollama `keep_alive` value (default `"15m"` — unload immediately after each call). Set to e.g. `"5m"` for bulk re-embeds. |
+| `SWRAG_VERBOSE`      | Truthy → verbose stderr logs                                                                                             |
+| `SWRAG_SKIP_EMBED`   | Truthy → text-only ingest, skip the embed pass                                                                           |
+| `SWRAG_SQLITE_DYLIB` | Custom path to `libsqlite3.dylib`                                                                                        |
 
 ## Commands
 
