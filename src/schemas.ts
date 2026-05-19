@@ -43,7 +43,6 @@ export const PathOverridesSchema = z.object({
   sourceDir: z.string().optional(),
   sourceDb: z.string().optional(),
   archive: z.string().optional(),
-  archiveDir: z.string().optional(),
   ollamaHost: z.url().optional(),
   embedModel: z.string().optional(),
 });

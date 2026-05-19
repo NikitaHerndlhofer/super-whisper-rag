@@ -3,6 +3,10 @@
  *   ~/.cursor/skills/superwhisper-rag/SKILL.md
  *   ~/.claude/skills/superwhisper-rag/SKILL.md
  *
+ * The SQL recipes are imported from `docs/sql-cookbook.md` (the single
+ * source of truth) and spliced in below. See `extractCookbook()` for the
+ * marker contract.
+ *
  * Frontmatter contract (per Anthropic Agent Skills spec — see
  * https://docs.anthropic.com/en/docs/claude-code/skills):
  *
@@ -28,6 +32,31 @@
  * behaviour, which is still strictly safer than the alternative because
  * the description doesn't beg the agent to use the skill.
  */
+import cookbookDoc from "../docs/sql-cookbook.md" with { type: "text" };
+
+const COOKBOOK_START = "<!-- swrag:cookbook:start -->";
+const COOKBOOK_END = "<!-- swrag:cookbook:end -->";
+
+/**
+ * Pull the SQL recipes block out of `docs/sql-cookbook.md`. The doc
+ * delimits it with `<!-- swrag:cookbook:start -->` / `<!-- swrag:cookbook:end -->`
+ * HTML comments (invisible when the doc is rendered). Throwing here at
+ * module load means a broken doc fails the build before we ship a
+ * SKILL.md with a missing cookbook.
+ */
+function extractCookbook(doc: string): string {
+  const start = doc.indexOf(COOKBOOK_START);
+  const end = doc.indexOf(COOKBOOK_END);
+  if (start < 0 || end < 0 || end <= start) {
+    throw new Error(
+      `docs/sql-cookbook.md is missing the ${COOKBOOK_START} / ${COOKBOOK_END} markers — cannot build SKILL.md`,
+    );
+  }
+  return doc.slice(start + COOKBOOK_START.length, end).trim();
+}
+
+const COOKBOOK = extractCookbook(cookbookDoc);
+
 export const SKILL_MD = `---
 name: superwhisper-rag
 description: Query the user's local Super Whisper dictation archive (SQLite + bge-m3 embeddings). Manual invocation only.
@@ -51,9 +80,18 @@ after Super Whisper itself has dropped them.
 
 \`swrag\` is a thin wrapper around \`sqlite3\`. Output is whatever sqlite3
 produces — no custom envelopes, no row counts, no truncation markers.
-**The CLI takes zero flags.** Output format is sqlite3's default (list
-mode, pipe-separated, no header). For anything else, call sqlite3
-directly via \`swrag path\`.
+**The CLI takes zero flags of its own.** Output is sqlite3's default
+list mode (pipe-separated, no header).
+
+To use any sqlite3 flag, put \`--\` after \`sql\` — everything that
+follows is forwarded to sqlite3 verbatim:
+
+\`\`\`bash
+swrag sql -- -json     "SELECT folder_name FROM recording LIMIT 5"
+swrag sql -- -cmd ".mode markdown" "<sql>"
+swrag sql -- -cmd ".parameter set :app 'Cursor'" \\
+             "SELECT folder_name FROM recording WHERE app_name = :app LIMIT 5"
+\`\`\`
 
 ## How to query
 
@@ -157,148 +195,8 @@ sqlite3 "$(swrag path)" \\
 > Every recipe filters \`superseded_by IS NULL\` so reprocessed duplicates
 > don't pollute the result set. Drop that clause only if you specifically
 > want to inspect the reprocessing history.
->
-> **Modes (\`mode_name\`) are user-configurable in Super Whisper** — don't
-> hard-code mode names without first checking which ones this user has.
-> Recipe 0 below shows how. Once you know the modes, recipes 2, 5, etc.
-> demonstrate filtering with \`mode_name_lower\` (an indexed generated
-> column for case-insensitive lookup).
 
-\`\`\`sql
--- 0. Discover the user's modes (run this first if you don't already know
---    what to filter on).
-SELECT mode_name, COUNT(*) AS n
-FROM recording
-WHERE superseded_by IS NULL
-GROUP BY mode_name
-ORDER BY n DESC;
-
--- 1. Today's recordings, newest first
-SELECT folder_name, datetime, mode_name, llm_result
-FROM recording
-WHERE superseded_by IS NULL
-  AND date(datetime) = date('now', 'localtime')
-ORDER BY datetime DESC;
-
--- 2. Meeting recordings from the last 7 days
---    (replace 'meeting' with whatever recipe 0 surfaced for this user)
-SELECT folder_name, datetime, duration_sec, llm_result
-FROM recording
-WHERE superseded_by IS NULL
-  AND mode_name_lower = 'meeting'
-  AND datetime >= datetime('now', '-7 days')
-ORDER BY datetime DESC;
-
--- 3. Keyword search with snippet (FTS5) — exclude superseded in the join
---    Inline the user's search term as a string literal:
-SELECT r.folder_name, r.datetime, r.mode_name,
-       snippet(recording_fts, 1, '«', '»', '…', 10) AS snip,
-       bm25(recording_fts) AS bm25
-FROM recording_fts
-JOIN recording r ON r.rowid = recording_fts.rowid
-WHERE recording_fts MATCH 'bullmq'    -- ← replace with user's term
-  AND r.superseded_by IS NULL
-ORDER BY bm25
-LIMIT 10;
--- MATCH syntax: 'bullmq', '"corporate group"', 'notif*', 'bull NEAR queue'
-
--- 4. Semantic search (any language). The shell substitutes $(swrag embed)
---    with x'aabbcc…' before SQL is parsed; the language model never sees
---    a :q placeholder.
-SELECT r.folder_name, r.datetime, r.mode_name, r.llm_result,
-       vec_distance_cosine(v.embedding,
-                           $(swrag embed 'how do notifications work')) AS dist
-FROM recording_vec v
-JOIN recording r USING (folder_name)
-WHERE r.superseded_by IS NULL
-ORDER BY dist
-LIMIT 10;
--- The embedded text can be in any language: $(swrag embed 'como funcionam as notificações')
-
--- 5. Semantic + structured filter
-SELECT r.folder_name, r.datetime, r.app_name,
-       vec_distance_cosine(v.embedding,
-                           $(swrag embed 'how do notifications work')) AS dist
-FROM recording_vec v
-JOIN recording r USING (folder_name)
-WHERE r.superseded_by IS NULL
-  AND r.app_name = 'Cursor'
-  AND r.mode_name_lower = 'universal'
-ORDER BY dist
-LIMIT 10;
-
--- 6. Hybrid retrieval with Reciprocal Rank Fusion (k=60).
---    Run this from a shell where you can set $Q once and reuse it.
---
---      Q="how do notifications work"
---      QV=$(swrag embed "$Q")
---      swrag sql "WITH kw AS (
---                   SELECT recording_fts.rowid AS rid,
---                          ROW_NUMBER() OVER (ORDER BY bm25(recording_fts)) AS r
---                   FROM recording_fts WHERE recording_fts MATCH '$Q' LIMIT 50
---                 ),
---                 vec AS (
---                   SELECT folder_name,
---                          ROW_NUMBER() OVER (ORDER BY vec_distance_cosine(embedding, $QV)) AS r
---                   FROM recording_vec LIMIT 50
---                 )
---                 SELECT r.folder_name, r.datetime, r.mode_name, r.llm_result,
---                        COALESCE(1.0/(60+kw.r), 0) + COALESCE(1.0/(60+vec.r), 0) AS rrf
---                 FROM recording r
---                 LEFT JOIN kw  ON kw.rid = r.rowid
---                 LEFT JOIN vec USING (folder_name)
---                 WHERE r.superseded_by IS NULL
---                   AND (kw.r IS NOT NULL OR vec.r IS NOT NULL)
---                 ORDER BY rrf DESC LIMIT 10"
-
--- 7. Daily dictation volume by mode
-SELECT date(datetime) AS day, mode_name, COUNT(*) AS n,
-       ROUND(SUM(duration_sec)/60.0, 1) AS minutes
-FROM recording
-WHERE superseded_by IS NULL
-GROUP BY day, mode_name
-ORDER BY day DESC, n DESC;
-
--- 8. Longest recordings
-SELECT folder_name, datetime, mode_name, ROUND(duration_sec/60.0, 1) AS min, llm_word_count
-FROM recording
-WHERE superseded_by IS NULL
-ORDER BY duration_sec DESC
-LIMIT 10;
-
--- 9. Per-app breakdown
-SELECT app_name, COUNT(*) AS n, AVG(duration_sec) AS avg_sec
-FROM recording
-WHERE superseded_by IS NULL
-  AND app_name IS NOT NULL
-GROUP BY app_name
-ORDER BY n DESC;
-
--- 10. Preservation stats: how much have we saved from Super Whisper retention?
-SELECT
-  COUNT(*) AS total_rows,
-  SUM(CASE WHEN superseded_by IS NULL THEN 1 ELSE 0 END) AS canonical,
-  SUM(CASE WHEN superseded_by IS NOT NULL THEN 1 ELSE 0 END) AS reprocessed_duplicates,
-  COUNT(source_deleted_at) AS preserved_after_deletion,
-  COUNT(source_audio_lost_at) AS preserved_audio_lost
-FROM recording;
-
--- 11. Recordings in a specific language
-SELECT folder_name, datetime, mode_name, substr(llm_result, 1, 80) AS preview
-FROM recording
-WHERE superseded_by IS NULL
-  AND language = 'pt'
-ORDER BY datetime DESC;
-
--- 12. Reprocessing history of a recording (rare; only when the user asks)
-SELECT folder_name, datetime, mode_name, model_name, language_model_name,
-       superseded_by, superseded_at
-FROM recording
-WHERE audio_hash = (
-  SELECT audio_hash FROM recording WHERE folder_name = :folder
-)
-ORDER BY datetime;
-\`\`\`
+${COOKBOOK}
 
 ## Notes
 

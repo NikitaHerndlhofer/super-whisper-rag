@@ -80,24 +80,17 @@ skill instead.
 
 ## Output contract
 
-`swrag sql` always produces sqlite3's default `list` mode output:
-pipe-separated, no header. For agent consumption you have two options:
+`swrag sql` defaults to sqlite3's `list` mode (pipe-separated, no
+header). For agent consumption you'll usually want JSON:
 
-1. **Use sqlite3's JSON via shell composition** — works in any agent:
+```bash
+swrag sql -- -json "<your sql>"
+```
 
-   ```bash
-   sqlite3 "$(swrag path)" \
-     -cmd ".load $(swrag path vec0) sqlite3_vec_init" \
-     -cmd ".mode json" \
-     "<your sql>"
-   ```
-
-2. **Parse list mode** — pipe-separated, lossy if your data contains
-   pipes. Fine for many cases.
-
-Any other sqlite3 output mode (csv, column, line, box, markdown, …) is
-available via the same `swrag path` + `sqlite3 -cmd ".mode <fmt>"`
-pattern.
+Anything after `--` is forwarded to sqlite3 verbatim, so any sqlite3
+output mode works the same way: `-csv`, `-line`, `-column`, `-box`,
+`-markdown`, `-html`, `-tabs`. You can also forward `-cmd "…"` for
+dot-commands (e.g. `.mode insert`, `.headers on`, `.parameter set …`).
 
 ## Ingestion is automatic
 
@@ -117,7 +110,7 @@ surface prompt or clipboard data unless the user explicitly asks.
 
 - "What did I dictate this morning?" → cookbook recipe 1.
 - "Find meetings about BullMQ from last week." → recipes 2 + 3.
-- "Where did I talk about notifications going to the right user?" → recipe 4 with `embed(:q)`.
+- "Where did I talk about notifications going to the right user?" → recipe 4, with `$(swrag embed 'notifications going to the right user')` composed into the SQL.
 - "Show me everything I dictated while in Cursor in Portuguese." → `WHERE app_name = 'Cursor' AND language = 'pt'`.
 - "How much have I talked this week?" → recipe 7.
 - "What's still in the archive that Super Whisper deleted?" → recipe 10.

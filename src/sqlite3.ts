@@ -24,6 +24,16 @@ export interface Sqlite3Options {
   sql: string | null;
   /** Open read-only (default true). */
   readonly: boolean;
+  /**
+   * Extra arguments forwarded to sqlite3 verbatim, slotted between our
+   * setup (`-bail`, `-cmd ".load …"`) and the archive URI. Used to
+   * implement `swrag sql -- <sqlite3 args>` passthrough. May contain
+   * sqlite3 flags (-json, -box, -cmd "…") and/or the user's SQL.
+   *
+   * When `extraArgs` is non-empty, `sql` should be `null` — the caller's
+   * SQL travels inside `extraArgs`.
+   */
+  extraArgs?: string[];
 }
 
 export interface Sqlite3Result {
@@ -78,12 +88,20 @@ export function execSqlite3Interactive(opts: Sqlite3Options): number {
 }
 
 function buildArgs(opts: Sqlite3Options): string[] {
+  // Order matters: sqlite3 consumes the first non-flag positional as
+  // DATABASE and the second as SQL. The archive URI MUST appear before
+  // the user's passthrough so it gets the DATABASE slot — otherwise a
+  // user passing `[..., -json, "SELECT 1"]` would have "SELECT 1"
+  // treated as DATABASE and the URI as SQL.
   const args: string[] = [
     "-bail",
     "-cmd",
     `.load ${quoteForDotCmd(vecDylibPath())} sqlite3_vec_init`,
     uriFor(opts.archive, opts.readonly),
   ];
+  if (opts.extraArgs && opts.extraArgs.length > 0) {
+    args.push(...opts.extraArgs);
+  }
   if (opts.sql && opts.sql.trim().length > 0) {
     args.push(opts.sql);
   }
@@ -95,7 +113,14 @@ function uriFor(path: string, readonly: boolean): string {
 }
 
 function quoteForDotCmd(path: string): string {
-  // sqlite3's `.load` parser is whitespace-delimited with quote handling.
-  // We single-quote the path and escape any embedded single quotes.
-  return `'${path.replace(/'/g, "'\\''")}'`;
+  // sqlite3's `.load` parser is whitespace-delimited with simple quote
+  // handling — no escape sequences inside quoted strings. The materialised
+  // vec0 dylib path is always `${tmpdir}/swrag-vec0-<sanitised-user>/…` and
+  // `safeUsername()` strips non-`[A-Za-z0-9_-]`, so a `'` cannot appear in
+  // the path we pass through here. Assert that loudly rather than pretend
+  // to handle a case sqlite3 can't represent.
+  if (path.includes("'")) {
+    throw new Error(`dylib path contains a single quote, cannot be loaded: ${path}`);
+  }
+  return `'${path}'`;
 }

@@ -124,17 +124,17 @@ archive).
 
 All have sensible defaults; you shouldn't need to set any of them.
 
-| Variable             | Purpose                                                                                                                  |
-| -------------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| `SWRAG_SOURCE_DIR`   | Super Whisper recordings dir (default `~/Documents/superwhisper`)                                                        |
-| `SWRAG_SOURCE_DB`    | Super Whisper SQLite path                                                                                                |
-| `SWRAG_ARCHIVE`      | Our archive's path                                                                                                       |
-| `SWRAG_OLLAMA_HOST`  | Ollama URL (or `OLLAMA_HOST`; default `http://127.0.0.1:11434`)                                                          |
-| `SWRAG_EMBED_MODEL`  | Embedding model (default `bge-m3`)                                                                                       |
-| `SWRAG_KEEP_ALIVE`   | Ollama `keep_alive` value (default `"15m"` — unload immediately after each call). Set to e.g. `"5m"` for bulk re-embeds. |
-| `SWRAG_VERBOSE`      | Truthy → verbose stderr logs                                                                                             |
-| `SWRAG_SKIP_EMBED`   | Truthy → text-only ingest, skip the embed pass                                                                           |
-| `SWRAG_SQLITE_DYLIB` | Custom path to `libsqlite3.dylib`                                                                                        |
+| Variable             | Purpose                                                                              |
+| -------------------- | ------------------------------------------------------------------------------------ |
+| `SWRAG_SOURCE_DIR`   | Super Whisper recordings dir (default `~/Documents/superwhisper`)                    |
+| `SWRAG_SOURCE_DB`    | Super Whisper SQLite path                                                            |
+| `SWRAG_ARCHIVE`      | Our archive's path                                                                   |
+| `SWRAG_OLLAMA_HOST`  | Ollama URL (or `OLLAMA_HOST`; default `http://127.0.0.1:11434`)                      |
+| `SWRAG_EMBED_MODEL`  | Embedding model (default `bge-m3`)                                                   |
+| `SWRAG_KEEP_ALIVE`   | Ollama `keep_alive` value (default `"15m"` - the model will unload after 15 minutes) |
+| `SWRAG_VERBOSE`      | Truthy → verbose stderr logs                                                         |
+| `SWRAG_SKIP_EMBED`   | Truthy → text-only ingest, skip the embed pass                                       |
+| `SWRAG_SQLITE_DYLIB` | Custom path to `libsqlite3.dylib`                                                    |
 
 ## Commands
 
@@ -148,31 +148,39 @@ All have sensible defaults; you shouldn't need to set any of them.
 | `swrag install-skill`                 | Install the manual-invocation `SKILL.md` to Cursor and Claude Code.                               |
 | `swrag enable-sync` / `disable-sync`  | Manage the hourly launchd background sync agent.                                                  |
 
-## Going underneath swrag
+## Forwarding flags to sqlite3
 
-`swrag sql` is a zero-flag passthrough. For sqlite3's other output modes
-(`csv`, `json`, `column`, `markdown`, …), named-parameter binding, or any
-other sqlite3 feature, call sqlite3 directly via `swrag path`:
+`swrag sql` itself takes zero flags. To use any sqlite3 flag —
+`-json`, `-csv`, `-line`, `-column`, `-box`, `-markdown`, `-cmd "…"`,
+`-header`, `-separator`, etc. — put `--` after `sql` and everything
+after the `--` is forwarded to sqlite3 verbatim:
 
 ```bash
 # JSON output
+swrag sql -- -json "SELECT folder_name FROM recording LIMIT 5"
+
+# Markdown table for human reading
+swrag sql -- -cmd ".mode markdown" "SELECT folder_name, datetime FROM recording LIMIT 5"
+
+# Named parameters (sqlite3's own .parameter set)
+swrag sql -- -cmd ".parameter set :app 'Cursor'" \
+             "SELECT folder_name FROM recording WHERE app_name = :app LIMIT 5"
+
+# Compose with semantic embeddings (the `swrag embed` trick still works)
+swrag sql -- -json "SELECT folder_name,
+                           vec_distance_cosine(embedding, $(swrag embed 'hello')) AS d
+                    FROM recording_vec ORDER BY d LIMIT 5"
+```
+
+If you'd rather bypass `swrag sql` entirely (e.g. to script around it),
+`swrag path` exposes the underlying file paths so you can drive sqlite3
+yourself:
+
+```bash
 sqlite3 "$(swrag path)" \
   -cmd ".load $(swrag path vec0) sqlite3_vec_init" \
-  -cmd ".mode json" \
+  -cmd ".mode csv" \
   "SELECT folder_name FROM recording LIMIT 5"
-
-# Named parameters
-sqlite3 "$(swrag path)" \
-  -cmd ".load $(swrag path vec0) sqlite3_vec_init" \
-  -cmd ".parameter set :app 'Cursor'" \
-  "SELECT folder_name FROM recording WHERE app_name = :app LIMIT 5"
-
-# Inline embeddings (same `swrag embed` trick)
-sqlite3 "$(swrag path)" \
-  -cmd ".load $(swrag path vec0) sqlite3_vec_init" \
-  "SELECT folder_name,
-          vec_distance_cosine(embedding, $(swrag embed 'hello world')) AS d
-   FROM recording_vec ORDER BY d LIMIT 5"
 ```
 
 ## Privacy

@@ -13,26 +13,10 @@ import { getPath, PathTargetSchema } from "./commands/path.ts";
 import { runSql, readSqlInput } from "./commands/sql.ts";
 import { EnvSchema } from "./schemas.ts";
 
-/* -------------------------------------------------------------------------- */
-/* Environment-driven configuration                                           */
-/* -------------------------------------------------------------------------- */
-/*                                                                            */
-/* The CLI surface is intentionally tiny — two flags total. Anything that     */
-/* used to be a flag is now an env var, parsed once via `EnvSchema`.          */
-/*                                                                            */
-/*   SWRAG_SOURCE_DIR     where Super Whisper's recordings live               */
-/*   SWRAG_SOURCE_DB      Super Whisper's SQLite path                         */
-/*   SWRAG_ARCHIVE        our archive's SQLite path                           */
-/*   SWRAG_OLLAMA_HOST    Ollama base URL (or OLLAMA_HOST)                    */
-/*   SWRAG_EMBED_MODEL    embedding model name                                */
-/*   SWRAG_KEEP_ALIVE     Ollama keep_alive value (e.g. "0", "30s", "5m")     */
-/*   SWRAG_SQLITE_DYLIB   custom path to libsqlite3.dylib                     */
-/*   SWRAG_VERBOSE        any truthy value enables stderr verbose logs        */
-/*   SWRAG_SKIP_EMBED     any truthy value skips the embed pass on ingest     */
-/*                                                                            */
-/* All have sensible defaults; you should never need to set any of them.      */
-/* -------------------------------------------------------------------------- */
-
+// The CLI surface is intentionally tiny — zero flags. Everything that used
+// to be a flag is an env var, parsed and validated here once via
+// `EnvSchema`. See `src/schemas.ts` for the full list of `SWRAG_*` vars,
+// and the README's "Configuration" table for the user-facing summary.
 const env = EnvSchema.parse(Bun.env);
 
 const paths = resolvePaths({
@@ -55,7 +39,7 @@ const sqlCmd = defineCommand({
   meta: {
     name: "sql",
     description:
-      "Run SQL through sqlite3 (vec preloaded, archive read-only, ingest first). Omit positional to enter REPL.",
+      "Run SQL through sqlite3 (vec preloaded, archive read-only, ingest first). Omit positional to enter REPL. Use `--` to forward sqlite3 flags.",
   },
   args: {
     query: {
@@ -65,10 +49,11 @@ const sqlCmd = defineCommand({
     },
   },
   async run({ args }) {
+    const passthrough = extractPassthroughArgs();
     const queryArg = asString(args.query);
     const fromStdin = queryArg === "-";
     const inline = fromStdin ? null : (queryArg ?? null);
-    const sql = await readSqlInput(inline, fromStdin);
+    const sql = passthrough.length > 0 ? null : await readSqlInput(inline, fromStdin);
     const r = await runSql({
       sql,
       archive: paths.archive,
@@ -76,12 +61,25 @@ const sqlCmd = defineCommand({
       sourceDir: paths.sourceDir,
       embedModel: paths.embedModel,
       ollamaHost: paths.ollamaHost,
+      extraArgs: passthrough,
     });
     if (r.stdout) process.stdout.write(r.stdout);
     if (r.stderr) process.stderr.write(r.stderr);
     process.exit(r.exitCode);
   },
 });
+
+/**
+ * Find a `--` in process.argv and return everything after it. Used by
+ * `swrag sql` for the passthrough-to-sqlite3 mode: `swrag sql -- -json
+ * "SELECT 1"` forwards `-json "SELECT 1"` to the underlying sqlite3 verbatim.
+ * Returns `[]` when there's no `--`, so the call site can branch cheaply.
+ */
+function extractPassthroughArgs(): string[] {
+  const idx = process.argv.indexOf("--");
+  if (idx < 0) return [];
+  return process.argv.slice(idx + 1);
+}
 
 /* -------------------------------------------------------------------------- */
 /* index — Super Whisper ingestion                                            */

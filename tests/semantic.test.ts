@@ -24,14 +24,15 @@ afterEach(() => {
 });
 
 /**
- * End-to-end tests of the agent-facing surface. We stub the query embedding by
- * shadowing `embedSync` via the env's host (we set it to an unreachable port
- * and our test calls instead a direct prepared statement using vec functions).
+ * End-to-end tests of the agent-facing surface.
  *
- * For semantic recipes (cookbook 4–6), runSql() calls embedSync which hits
- * curl — to keep tests offline we'd need a real fake Ollama. Instead, here we
- * exercise the same SQL surface using bound vectors directly. The full
- * embed(:q) substitution path is unit-tested in safety.test.ts.
+ * For semantic recipes (cookbook 4–6), the production path is shell
+ * composition: the user runs `$(swrag embed 'text')` and `swrag embed`
+ * shells out to Ollama via curl. To keep these tests offline we don't
+ * exercise that pipeline — we instead drive the same SQL surface
+ * (`vec_distance_cosine`, FTS5 `MATCH`) directly through `bun:sqlite`
+ * with vectors we already have in the archive (which were inserted by
+ * `ensureFresh`'s embed pass using `stubEmbed`).
  */
 const VecRowSchema = z.object({
   folder_name: z.string(),

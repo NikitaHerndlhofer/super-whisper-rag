@@ -1,8 +1,10 @@
 # SQL cookbook
 
 This document is the canonical set of patterns the agent has been taught.
-The same cookbook is embedded verbatim in the bundled `SKILL.md` via
-`src/skill.ts` — edit there to update both.
+The bundled `SKILL.md` imports the recipe block below verbatim via
+`src/skill.ts`, so this file is the single source of truth — edits here
+propagate to `SKILL.md` at build time. The slice is delimited by the
+`swrag:cookbook` HTML comments and must not be removed.
 
 > **Defaults.**
 >
@@ -18,6 +20,8 @@ The same cookbook is embedded verbatim in the bundled `SKILL.md` via
 >   hard-code mode names without first checking which ones this user has
 >   (recipe 0 below). Filter with `mode_name_lower` (case-insensitive,
 >   indexed) once you know the names.
+
+<!-- swrag:cookbook:start -->
 
 ```sql
 -- 0. Discover the user's modes (run this first if you don't already
@@ -159,6 +163,8 @@ WHERE audio_hash = (
 ORDER BY datetime;
 ```
 
+<!-- swrag:cookbook:end -->
+
 ## Semantic search via `swrag embed`
 
 `swrag embed 'text'` calls Ollama once and prints a SQLite blob literal
@@ -180,39 +186,32 @@ swrag sql "<...query using $QV in two places...>"
 There is no in-SQL `embed()` function. The composition happens entirely
 at the shell layer.
 
-## Other output modes
+## Other output modes (and any other sqlite3 flag)
 
-`swrag sql` always emits sqlite3's default list mode (pipe-separated, no
-header). For JSON, CSV, columns, markdown, etc., call `sqlite3`
-directly via `swrag path`:
+`swrag sql` defaults to sqlite3's `list` mode. For anything else
+(`-json`, `-csv`, `-line`, `-column`, `-box`, `-markdown`, `-html`,
+`-header`, `-separator`, `-cmd "…"`, etc.), put `--` after `sql` —
+everything past the `--` is forwarded to sqlite3 verbatim:
 
 ```bash
-# JSON
+swrag sql -- -json    "SELECT folder_name FROM recording LIMIT 5"
+swrag sql -- -csv     "<sql>"
+swrag sql -- -cmd ".mode markdown" "<sql>"
+swrag sql -- -box     "<sql>"
+
+# Named-parameter binding via sqlite3's .parameter set
+swrag sql -- -cmd ".parameter set :app 'Cursor'" \
+             "SELECT folder_name FROM recording WHERE app_name = :app LIMIT 5"
+```
+
+If you'd rather bypass `swrag sql` entirely (e.g. when scripting),
+`swrag path` exposes the file paths so you can call `sqlite3` yourself:
+
+```bash
 sqlite3 "$(swrag path)" \
   -cmd ".load $(swrag path vec0) sqlite3_vec_init" \
   -cmd ".mode json" \
-  "SELECT folder_name FROM recording LIMIT 5"
-
-# CSV
-sqlite3 "$(swrag path)" \
-  -cmd ".load $(swrag path vec0) sqlite3_vec_init" \
-  -cmd ".mode csv" \
   "<sql>"
-
-# Markdown table for human reading
-sqlite3 "$(swrag path)" \
-  -cmd ".load $(swrag path vec0) sqlite3_vec_init" \
-  -cmd ".mode markdown" \
-  "<sql>"
-```
-
-Named-parameter binding similarly uses sqlite3's own facility:
-
-```bash
-sqlite3 "$(swrag path)" \
-  -cmd ".load $(swrag path vec0) sqlite3_vec_init" \
-  -cmd ".parameter set :app 'Cursor'" \
-  "SELECT folder_name FROM recording WHERE app_name = :app LIMIT 5"
 ```
 
 ## Tips

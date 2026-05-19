@@ -72,7 +72,48 @@ describe("swrag sql (pure sqlite3 passthrough)", () => {
     expect(r.stderr).toMatch(/readonly|read-only|read only/i);
   });
 
-  // Note: REPL behaviour (`sql == null`) is exercised manually — the
-  // interactive sqlite3 inherits stdin/stdout, which hangs in a non-TTY
-  // test runner.
+  test("`-- -json …` passthrough switches sqlite3 to JSON output", async () => {
+    const r = await runSql({
+      ...baseSqlOpts(),
+      sql: null,
+      extraArgs: ["-json", "SELECT 'a' AS x, 'b' AS y"],
+    });
+    expect(r.exitCode).toBe(0);
+    const parsed: unknown = JSON.parse(r.stdout);
+    expect(Array.isArray(parsed)).toBe(true);
+    expect((parsed as { x: string; y: string }[])[0]).toEqual({ x: "a", y: "b" });
+  });
+
+  test("`-- -cmd '.mode markdown' …` passthrough switches to markdown", async () => {
+    const r = await runSql({
+      ...baseSqlOpts(),
+      sql: null,
+      extraArgs: [
+        "-cmd",
+        ".mode markdown",
+        "SELECT 'a' AS x, 'b' AS y",
+      ],
+    });
+    expect(r.exitCode).toBe(0);
+    // markdown mode emits a `| col | col |` table header
+    expect(r.stdout).toContain("| x | y |");
+  });
+
+  test("passthrough also works with a user `-cmd` that runs before the SQL", async () => {
+    const r = await runSql({
+      ...baseSqlOpts(),
+      sql: null,
+      extraArgs: [
+        "-cmd",
+        ".parameter set :app 'Cursor'",
+        "SELECT :app AS app",
+      ],
+    });
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout.trim()).toBe("Cursor");
+  });
+
+  // Note: REPL behaviour (`sql == null`, no passthrough) is exercised
+  // manually — the interactive sqlite3 inherits stdin/stdout, which
+  // hangs in a non-TTY test runner.
 });

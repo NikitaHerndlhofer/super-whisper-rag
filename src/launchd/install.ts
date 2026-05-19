@@ -25,7 +25,7 @@ export async function installLaunchAgent(opts: InstallSyncOptions): Promise<stri
   await writeFile(plistPath, xml, "utf8");
 
   // Make idempotent: bootout any existing instance first.
-  bootout(plistPath);
+  bootout();
 
   const uid = process.getuid?.() ?? 501;
   const r = Bun.spawnSync({
@@ -43,13 +43,17 @@ export async function uninstallLaunchAgent(): Promise<boolean> {
   const plistPath = DEFAULTS.launchPlist;
   let removedRunning = false;
   if (existsSync(plistPath)) {
-    removedRunning = bootout(plistPath);
+    removedRunning = bootout();
     await unlink(plistPath);
   }
   return removedRunning;
 }
 
-function bootout(_plistPath: string): boolean {
+/**
+ * `launchctl bootout` the running instance, if any. The plist on disk is
+ * not consulted — `launchctl` looks the service up by label.
+ */
+function bootout(): boolean {
   const uid = process.getuid?.() ?? 501;
   const r = Bun.spawnSync({
     cmd: ["launchctl", "bootout", `gui/${uid}/${PLIST_LABEL}`],

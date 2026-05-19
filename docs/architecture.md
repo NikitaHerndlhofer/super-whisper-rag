@@ -16,21 +16,21 @@ Super Whisper ──read-only──┐
   ~/.../*.sqlite            │       ┌── ~/Library/Application Support/
                             │       │   superwhisper-rag/swrag.sqlite
                             │       │   (canonical, append-only)
-                            ├─►   │
+                            ├─►───┤
                             │     swrag index (CLI / hourly launchd)
                             │       │
-  meta.json per recording   │       │
-                            │
+  meta.json per recording ──┘       │
+                                    │
                           swrag sql QUERY            sqlite3 "$(swrag path)" …
                             │                         │
-                            │ ← embed(:q) → x'…'      │ (no swrag in this path —
-                            │                         │  user does .load themselves)
+                            │ (no SQL preprocessing;  │ (no swrag in this path —
+                            │  shell handles          │  user does .load themselves)
+                            │  $(swrag embed …))      │
                             ▼                         ▼
                   /opt/homebrew/opt/sqlite/bin/sqlite3
                     -cmd ".load <vec0_path> sqlite3_vec_init"
-                    -cmd ".parameter set …"
                     file:<archive>?mode=ro
-                    "<substituted SQL>"
+                    "<user's SQL, verbatim>"
                             │
                             ▼
                      stdout → user's terminal
@@ -50,7 +50,9 @@ src/
 ├── log.ts                  # stderr logger.
 │
 ├── archive/
-│   ├── schema.ts           # The DDL (applied by `swrag index`).
+│   ├── migrations/         # *.sql files imported as text assets.
+│   ├── migrations.ts       # MIGRATIONS array (version + name + sql).
+│   ├── migrate.ts          # Runner. Tracks PRAGMA user_version.
 │   ├── open.ts             # bun:sqlite open + setCustomSQLite + config helpers.
 │   └── vec-loader.ts       # Materialise vec0.dylib to tmpdir (dlopen can't read bunfs).
 │
@@ -61,9 +63,7 @@ src/
 │   └── deletions.ts        # markSourceDeletions, refreshAudioLiveness.
 │
 ├── embed/
-│   ├── ollama.ts           # embedSync (curl) + embedBatch (fetch). Zod-validated responses.
-│   └── cache.ts            # Tiny LRU.
-│
+│   └── ollama.ts           # embedSync (curl) + embedBatch (fetch). Zod-validated responses.
 │
 ├── commands/
 │   ├── sql.ts              # The thin sqlite3 proxy.
@@ -86,22 +86,20 @@ src/
 
 ## Lifecycle of `swrag sql`
 
-1. `cli.ts` parses args via zod schemas, resolves paths.
+1. `cli.ts` parses env vars via `EnvSchema`, resolves paths via `resolvePaths`.
 2. `commands/sql.ts::runSql`:
-   1. Calls `ensureFresh()` (sub-ms fast-path in the common case).
-   2. Tokenises the SQL, finds every `embed(:q)` / `embed('text')`.
-   3. For each, calls `embedSync` (curl → Ollama → `Float32Array`) and turns the vector into a `x'<hex>'` literal. LRU-cached per process.
-   4. Substitutes each call site with the literal.
-   5. Builds sqlite3 args:
+   1. Calls `ensureFresh()` (sub-ms fast-path in the common case; a hard failure here is downgraded to a `warn()` so the query still runs against whatever the archive already has).
+   2. Reads the SQL string (positional arg, or stdin when `-` was passed). **No tokenisation, no substitution.** The SQL is opaque to `swrag` from here on.
+   3. Builds sqlite3 args:
       - `-bail` to stop on error.
-      - (no output-mode flags; sqlite3's default list mode is used)
-      - `-cmd ".load <vec0_path> sqlite3_vec_init"`.
-      - (no `-cmd ".parameter set"` injections; we do no SQL preprocessing).
-      - URI: `file:<archive>?mode=ro`.
-      - The substituted SQL.
-   6. Spawns `/opt/homebrew/opt/sqlite/bin/sqlite3` and forwards stdout/stderr/exitCode.
+      - `-cmd ".load <vec0_path> sqlite3_vec_init"` so vector functions work.
+      - URI: `file:<archive>?mode=ro` — the archive is opened read-only.
+      - The user's SQL, verbatim — OR, when the user typed `swrag sql -- …`, the args after `--` are forwarded to sqlite3 verbatim (which is how you ask for JSON/CSV/markdown output, dot-commands, named-parameter binding, etc.).
+   4. Spawns `/opt/homebrew/opt/sqlite/bin/sqlite3` and forwards stdout, stderr, and exit code.
 
-If `sql` is empty, we exec sqlite3 with inherited stdio for the REPL.
+If `sql` is empty (or the user typed `swrag sql` with no positional and no `--`), we exec sqlite3 with inherited stdio so the REPL has direct access to the terminal.
+
+Semantic search composes through the shell — see "Why semantic search is shell-composed, not SQL-substituted" below.
 
 ## Lifecycle of `swrag index`
 
@@ -258,29 +256,30 @@ the thinnest possible wrapper around `sqlite3`.
 
 ## Ollama model lifecycle
 
-Every embed request we send to Ollama includes `keep_alive: 0` by default.
-Ollama interprets this as "unload the model immediately after serving the
-request" — so a single `swrag embed "…"` call:
+Every embed request we send to Ollama includes `keep_alive: "15m"` by
+default. Ollama interprets that as "keep the model resident in GPU/RAM
+for 15 minutes after this call" — which means:
 
-1. Cold-loads bge-m3 into memory (~5–15 s the first time it's been idle).
-2. Computes the embedding (~100 ms).
-3. Unloads the model and frees the GPU/RAM (~immediately).
+1. The first call after an idle period cold-loads bge-m3 (~5–15 s).
+2. Every call inside the next 15 minutes returns in ~100 ms.
+3. After 15 minutes of inactivity Ollama unloads the model on its own.
 
-The trade-off is straightforward: minimal idle memory at the cost of
-cold-load latency on the next call. For a one-shot semantic query this is
-the right default — the user runs a search every few minutes, not every
-few seconds.
+This is a deliberate compromise between snappy interactive search (you
+want a hot model when you fire off two or three queries in a row) and
+not pinning ~2 GB of GPU/RAM forever just because you used `swrag` once.
 
-For bulk operations (`swrag index` against a fresh archive with hundreds
-of recordings) you almost certainly want the model to stay loaded across
-the batches. Set `SWRAG_KEEP_ALIVE` for that single command:
+Override via `SWRAG_KEEP_ALIVE` when the defaults don't fit:
 
 ```bash
-SWRAG_KEEP_ALIVE="5m" swrag index
+# Bulk re-embed, keep the model warm for an hour
+SWRAG_KEEP_ALIVE="1h" swrag index
+
+# Privacy-conscious one-shot: unload immediately after each call
+SWRAG_KEEP_ALIVE="0" swrag embed "hello"
 ```
 
 The env var accepts anything Ollama's API does: `"0"`, `"30s"`, `"5m"`,
-`"1h"`, or `"-1"` to keep loaded indefinitely. See
+`"1h"`, `"-1"` for indefinite. See
 [Ollama's FAQ](https://github.com/ollama/ollama/blob/main/docs/faq.md#how-do-i-keep-a-model-loaded-in-memory-or-make-it-unload-immediately).
 
 ## Super Whisper reprocessing → supersedence

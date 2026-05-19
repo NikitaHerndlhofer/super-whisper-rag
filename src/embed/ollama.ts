@@ -11,10 +11,13 @@ export interface EmbedOptions {
   timeoutMs?: number;
   /**
    * How long Ollama should keep the model loaded after the request.
-   * - `"0"` (default for us): unload immediately. Each call cold-loads (~5–15s).
-   * - `"30s"`, `"5m"`: keep loaded for that long.
-   * - `"-1"` or `-1`: keep loaded indefinitely (Ollama's default).
-   * Override via `SWRAG_KEEP_ALIVE`. See https://github.com/ollama/ollama/blob/main/docs/faq.md#how-do-i-keep-a-model-loaded-in-memory-or-make-it-unload-immediately
+   * - `"15m"` (our default): keep loaded for 15 minutes, so follow-up calls
+   *   in a session skip the cold-load.
+   * - `"0"`: unload immediately. Each call cold-loads (~5–15s).
+   * - `"30s"`, `"5m"`, `"1h"`: keep loaded for that long.
+   * - `"-1"`: keep loaded indefinitely (Ollama's default).
+   * Override via `SWRAG_KEEP_ALIVE`. See
+   * https://github.com/ollama/ollama/blob/main/docs/faq.md#how-do-i-keep-a-model-loaded-in-memory-or-make-it-unload-immediately
    */
   keepAlive?: string;
 }
@@ -24,9 +27,12 @@ const DEFAULT_KEEP_ALIVE = Bun.env.SWRAG_KEEP_ALIVE ?? "15m";
 /**
  * Synchronous single-text embedding via curl.
  *
- * Used by the SQL preprocessor when it expands `embed(:q)` — that path runs
- * inside `swrag sql` and can't be async. The async `embedBatch` is preferred
- * for bulk ingestion because it pipelines via fetch.
+ * Used by the `swrag embed "text"` CLI command, which prints the resulting
+ * vector as a SQLite blob literal (`x'…'`) on stdout. That output is meant
+ * to be `$(swrag embed …)`-expanded into a SQL string at the shell layer
+ * — `swrag embed` is part of a synchronous shell pipeline and has nowhere
+ * to await a Promise. For bulk ingestion (`swrag index`) we use the async
+ * `embedBatch` instead because it pipelines through fetch.
  */
 export function embedSync(text: string, opts: EmbedOptions = {}): Float32Array {
   const host = opts.host ?? DEFAULTS.ollamaHost;

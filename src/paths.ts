@@ -1,5 +1,5 @@
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
   PathOverridesSchema,
   ResolvedPathsSchema,
@@ -26,7 +26,6 @@ export const DEFAULTS = {
     "superwhisper-rag",
     "swrag.sqlite",
   ),
-  archiveDir: join(HOME, "Library", "Application Support", "superwhisper-rag"),
   logFile: join(HOME, "Library", "Logs", "superwhisper-rag.log"),
   launchAgentsDir: join(HOME, "Library", "LaunchAgents"),
   launchPlist: join(
@@ -63,15 +62,17 @@ export type { ResolvedPaths };
 /**
  * Build a fully populated `ResolvedPaths` from optional overrides. Both the
  * input and the output are validated, so we never carry around partially
- * filled paths or stringy URLs.
+ * filled paths or stringy URLs. `archiveDir` is always derived from
+ * `archive` — they are never independently overridable.
  */
 export function resolvePaths(overrides: unknown = {}): ResolvedPaths {
   const o: PathOverrides = PathOverridesSchema.parse(overrides);
+  const archive = o.archive ?? DEFAULTS.archive;
   return ResolvedPathsSchema.parse({
     sourceDir: o.sourceDir ?? DEFAULTS.sourceDir,
     sourceDb: o.sourceDb ?? DEFAULTS.sourceDb,
-    archive: o.archive ?? DEFAULTS.archive,
-    archiveDir: o.archiveDir ?? DEFAULTS.archiveDir,
+    archive,
+    archiveDir: dirname(archive),
     ollamaHost: o.ollamaHost ?? DEFAULTS.ollamaHost,
     embedModel: o.embedModel ?? DEFAULTS.embedModel,
   });
