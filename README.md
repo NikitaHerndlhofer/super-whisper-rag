@@ -1,23 +1,55 @@
 # superwhisper-rag
 
-A thin `sqlite3` wrapper for your Super Whisper dictation archive.
+A local-first, append-only archive of your [Super Whisper](https://superwhisper.com)
+dictation history with full-text and multilingual semantic search.
 
-`swrag` does three things and nothing more:
+`swrag` keeps a private SQLite database in sync with Super Whisper's
+recordings, embeds every transcript with `bge-m3` (1024-d, 100+ languages)
+via local [Ollama](https://ollama.com), and exposes the whole thing as a
+thin [`sqlite3`](https://sqlite.org) wrapper. Because the archive is
+append-only, your dictations stay searchable forever — even after Super
+Whisper's retention window deletes them.
 
-1. **Keeps a local SQLite archive in sync with Super Whisper.** Append-only,
-   so when Super Whisper's retention deletes a recording the archive keeps
-   the text, embedding, and metadata forever.
-2. **Loads sqlite-vec.** The archive ships with a `recording_vec` virtual
-   table holding multilingual `bge-m3` embeddings (1024-d, 100+ languages).
-3. **Substitutes `embed(:q)` calls in your SQL.** You write
-   `vec_distance_cosine(embedding, embed(:q))`; `swrag` rewrites that to
-   `vec_distance_cosine(embedding, x'…')` after calling Ollama once.
+It's useful if you:
 
-That's the entire value-add. Everything else — output formatting, parameter
-binding, dot-commands, the REPL — is just `sqlite3`. You can bypass `swrag
-sql` entirely and use `sqlite3 "$(swrag path)"` directly.
+- Want to search what you said weeks or months ago — semantically (in any
+  language) or by keyword — without scrolling Super Whisper's UI.
+- Want an AI agent (Cursor, Claude Code) to be able to look things up in
+  your dictation history on demand.
+- Want a local, private, queryable history of your voice. No cloud, no
+  telemetry, no account.
+
+## Quick taste
+
+```bash
+# Today's dictations
+swrag sql "SELECT folder_name, datetime, mode_name, llm_result
+           FROM recording
+           WHERE date(datetime) = date('now','localtime')
+             AND superseded_by IS NULL
+           ORDER BY datetime DESC"
+
+# Keyword search with snippets
+swrag sql "SELECT r.folder_name, snippet(recording_fts, 1, '«', '»', '…', 5)
+           FROM recording_fts JOIN recording r ON r.rowid = recording_fts.rowid
+           WHERE recording_fts MATCH 'bullmq' AND r.superseded_by IS NULL
+           ORDER BY bm25(recording_fts) LIMIT 10"
+
+# Semantic search — works in any language; the shell composes the embedding
+swrag sql "SELECT r.folder_name, r.llm_result,
+                  vec_distance_cosine(v.embedding,
+                                      $(swrag embed 'how do notifications work')) AS dist
+           FROM recording_vec v JOIN recording r USING (folder_name)
+           WHERE r.superseded_by IS NULL
+           ORDER BY dist LIMIT 10"
+```
+
+See [`docs/sql-cookbook.md`](docs/sql-cookbook.md) for the full set of
+recipes.
 
 ## Install
+
+macOS + [Homebrew](https://brew.sh).
 
 ```bash
 brew install ollama && brew services start ollama
@@ -25,106 +57,100 @@ ollama pull bge-m3
 brew install NikitaHerndlhofer/tap/superwhisper-rag
 ```
 
-The archive is created on first use; there is no `setup` step.
+The archive is auto-created on first use at
+`~/Library/Application Support/superwhisper-rag/swrag.sqlite`. Run any
+query to populate it:
 
 ```bash
 swrag sql "SELECT mode_name, COUNT(*) FROM recording GROUP BY mode_name"
 ```
 
-If you want the hourly background sync:
+That's the whole setup.
+
+### Optional — hourly background sync
+
+Without this, the archive updates only when you run a query. With it, a
+launchd agent runs `swrag index` every hour and on login:
 
 ```bash
-swrag enable-sync       # ~/Library/LaunchAgents/com.superwhisper-rag.sync.plist
+swrag enable-sync
 ```
 
-To teach Cursor or Claude Code about the archive, install the bundled
-machine-level **Skill** (writes to both `~/.cursor/skills/` and
-`~/.claude/skills/` unconditionally — a runtime that isn't installed
-simply never reads the file):
+To remove: `swrag disable-sync`.
+
+### Optional — install the agent skill
+
+If you use Cursor or Claude Code and want them to query the archive on
+demand:
 
 ```bash
 swrag install-skill
 ```
 
-The skill is **manual-invocation only**. Its YAML frontmatter carries
-[`disable-model-invocation: true`](https://docs.anthropic.com/en/docs/claude-code/skills#restrict-claudes-skill-access)
-— Anthropic's runtime-enforced opt-out that removes the skill (and even
-its description) from the agent's context. To use it you explicitly
-summon it: `@superwhisper-rag` in Cursor, `/superwhisper-rag` in Claude
-Code. The agent has no mechanism to reach for it on its own.
+This writes `SKILL.md` to both `~/.cursor/skills/superwhisper-rag/` and
+`~/.claude/skills/superwhisper-rag/`. The skill is **manual-invocation
+only** — the agent can never reach for it autonomously. To use it, type
+`@superwhisper-rag` in Cursor or `/superwhisper-rag` in Claude Code. See
+[`docs/agent-integration.md`](docs/agent-integration.md) for the
+guarantee.
 
-## Use
-
-`swrag sql` is a pure passthrough to `sqlite3`. **It takes zero flags.**
-SQL is the only argument:
+### Verify the setup
 
 ```bash
-# Plain query — sqlite3's default list mode (pipe-separated, no header)
-swrag sql "SELECT folder_name, datetime, mode_name FROM recording LIMIT 5"
-
-# Read from stdin
-swrag sql - << 'SQL'
-  SELECT mode_name, COUNT(*) FROM recording GROUP BY mode_name;
-SQL
-
-# Keyword search
-swrag sql "SELECT r.folder_name, snippet(recording_fts, 1, '<<', '>>', '...', 5)
-           FROM recording_fts JOIN recording r ON r.rowid = recording_fts.rowid
-           WHERE recording_fts MATCH 'bullmq'
-           ORDER BY bm25(recording_fts) LIMIT 10"
-
-# Semantic search — shell composes the embedding into the SQL via `swrag embed`
-swrag sql "SELECT r.folder_name, r.datetime, r.llm_result,
-                  vec_distance_cosine(v.embedding,
-                                      $(swrag embed 'how do notifications work')) AS dist
-           FROM recording_vec v JOIN recording r USING (folder_name)
-           ORDER BY dist LIMIT 10"
-
-# No query → drops into the sqlite3 REPL with sqlite-vec already loaded
-swrag sql
+swrag doctor
 ```
 
-Need a non-default output mode, named-parameter binding, or any other
-sqlite3 feature? Use `sqlite3` directly via `swrag path` — see
-"Going underneath swrag" below. We don't grow flags for things sqlite3
-already does.
+Should report 5/5 OK (sqlite3 + custom build + vec extension + Ollama +
+archive).
 
-See [`docs/sql-cookbook.md`](docs/sql-cookbook.md) for the full set of
-recipes.
+## Configuration
 
-## Configuration via environment
+All have sensible defaults; you shouldn't need to set any of them.
 
-Anything that used to be a global flag is an env var. All have sensible
-defaults; you should never need to set any of them.
+| Variable | Purpose |
+| --- | --- |
+| `SWRAG_SOURCE_DIR` | Super Whisper recordings dir (default `~/Documents/superwhisper`) |
+| `SWRAG_SOURCE_DB` | Super Whisper SQLite path |
+| `SWRAG_ARCHIVE` | Our archive's path |
+| `SWRAG_OLLAMA_HOST` | Ollama URL (or `OLLAMA_HOST`; default `http://127.0.0.1:11434`) |
+| `SWRAG_EMBED_MODEL` | Embedding model (default `bge-m3`) |
+| `SWRAG_KEEP_ALIVE` | Ollama `keep_alive` value (default `"0"` — unload immediately after each call). Set to e.g. `"5m"` for bulk re-embeds. |
+| `SWRAG_VERBOSE` | Truthy → verbose stderr logs |
+| `SWRAG_SKIP_EMBED` | Truthy → text-only ingest, skip the embed pass |
+| `SWRAG_SQLITE_DYLIB` | Custom path to `libsqlite3.dylib` |
 
-| Variable             | Purpose                                                                    |
-| -------------------- | -------------------------------------------------------------------------- |
-| `SWRAG_SOURCE_DIR`   | Override Super Whisper recordings dir (default `~/Documents/superwhisper`) |
-| `SWRAG_SOURCE_DB`    | Override Super Whisper SQLite path                                         |
-| `SWRAG_ARCHIVE`      | Override our archive's path                                                |
-| `SWRAG_OLLAMA_HOST`  | Override Ollama URL (or `OLLAMA_HOST`)                                     |
-| `SWRAG_EMBED_MODEL`  | Override embedding model (default `bge-m3`)                                |
-| `SWRAG_KEEP_ALIVE`   | Ollama `keep_alive` value (default `"0"` — unload after each call)         |
-| `SWRAG_VERBOSE`      | Truthy → enable verbose stderr logs                                        |
-| `SWRAG_SKIP_EMBED`   | Truthy → skip embed pass on ingest (text-only)                             |
-| `SWRAG_SQLITE_DYLIB` | Custom path to `libsqlite3.dylib`                                          |
+## Commands
+
+| Command | What it does |
+| --- | --- |
+| `swrag sql [SQL]` | Run SQL via sqlite3 (default: list mode). Omit SQL to open the REPL. Pass `-` to read from stdin. |
+| `swrag index` | Ingest changes from Super Whisper now. |
+| `swrag doctor` | Verify the environment. |
+| `swrag path [archive\|sqlite3\|vec0]` | Print a filesystem path. Default: `archive`. |
+| `swrag embed "TEXT"` | Print the embedding of `TEXT` as a SQLite blob literal (`x'…'`), for shell composition. |
+| `swrag install-skill` | Install the manual-invocation `SKILL.md` to Cursor and Claude Code. |
+| `swrag enable-sync` / `disable-sync` | Manage the hourly launchd background sync agent. |
 
 ## Going underneath swrag
 
+`swrag sql` is a zero-flag passthrough. For sqlite3's other output modes
+(`csv`, `json`, `column`, `markdown`, …), named-parameter binding, or any
+other sqlite3 feature, call sqlite3 directly via `swrag path`:
+
 ```bash
-# Drive sqlite3 directly — use any of its flags
+# JSON output
 sqlite3 "$(swrag path)" \
   -cmd ".load $(swrag path vec0) sqlite3_vec_init" \
   -cmd ".mode json" \
   "SELECT folder_name FROM recording LIMIT 5"
 
-# Named parameters work via sqlite3's own .parameter set
+# Named parameters
 sqlite3 "$(swrag path)" \
   -cmd ".load $(swrag path vec0) sqlite3_vec_init" \
   -cmd ".parameter set :app 'Cursor'" \
   "SELECT folder_name FROM recording WHERE app_name = :app LIMIT 5"
 
-# Compose embeddings inline (same `swrag embed` trick)
+# Inline embeddings (same `swrag embed` trick)
 sqlite3 "$(swrag path)" \
   -cmd ".load $(swrag path vec0) sqlite3_vec_init" \
   "SELECT folder_name,
@@ -132,55 +158,16 @@ sqlite3 "$(swrag path)" \
    FROM recording_vec ORDER BY d LIMIT 5"
 ```
 
-## Commands
-
-| Command                               | What it does                                                           |
-| ------------------------------------- | ---------------------------------------------------------------------- |
-| `swrag sql [SQL]`                     | Run SQL via sqlite3 (or open REPL when SQL omitted).                   |
-| `swrag index`                         | Ingest changes from Super Whisper. `SWRAG_SKIP_EMBED=1` skips Ollama.  |
-| `swrag doctor`                        | Verify setup (sqlite3 + vec extension + Ollama).                       |
-| `swrag path [archive\|sqlite3\|vec0]` | Print a path for shell composition. Default: `archive`.                |
-| `swrag embed "TEXT"`                  | Print the embedding as a SQL blob literal (`x'…'`).                    |
-| `swrag install-skill`                 | Install the manual-invocation `SKILL.md` to Cursor and/or Claude Code. |
-| `swrag enable-sync` / `disable-sync`  | Manage the hourly launchd agent.                                       |
-
-Eight commands. No `setup`, no `stats`, no `export`, no `show`, no
-`describe`, no `schema` — they're all expressible as plain SQL.
-
-## How it works
-
-- **Archive location:** `~/Library/Application Support/superwhisper-rag/swrag.sqlite`. Auto-created on first run.
-- **Ingestion** (`swrag index` or `swrag sql`'s gap-fill): mtime fast-path against Super Whisper's DB; on change we `sqlite3 .backup` it, read new rows, enrich each with its `meta.json`, upsert, embed any rows whose text hash changed.
-- **`embed()` shortcut:** the CLI parses your SQL, finds `embed(:q)` / `embed('text')` calls, computes the embedding once via Ollama, and inlines each call as `x'<hex>'` before handing the SQL to `sqlite3`.
-- **Read-only at query time:** `swrag sql` opens the archive as `file:…?mode=ro`. Any write SQL fails with sqlite3's own "attempt to write a readonly database".
-- **Append-only writes:** a `BEFORE DELETE` trigger on `recording` raises on any deletion. Super Whisper's retention can fire freely; we set `source_deleted_at` instead.
-- **Validation:** env vars, CLI args, `meta.json`, source-DB rows, and Ollama responses are all parsed through [zod](https://github.com/colinhacks/zod) schemas. Zero `as`-casts on `unknown`.
-
 ## Privacy
 
-- Embeddings go only to `http://127.0.0.1:11434` (or wherever `SWRAG_OLLAMA_HOST` points).
-- `meta.json` includes prompts and clipboard nouns; the opt-in skill instructs the agent not to surface those unless you ask.
-- The archive is plain SQLite. Back up with Time Machine, iCloud, or git-crypt.
-
-## Development
-
-```bash
-bun install
-bun run scripts/fetch-vec-dylibs.ts   # one-time per checkout
-bun run tests/fixtures/make-fixtures.ts
-bun test
-bun run dev sql "SELECT 1"
-bun run build                          # produces dist/swrag-darwin-{arm64,x64}.tar.gz
-```
-
-## Non-goals
-
-- Not a Super Whisper replacement.
-- Not an automation/trigger system (that's [Macrowhisper](https://github.com/ognistik/macrowhisper)).
-- No MCP server, no hosted service, no telemetry.
-- No custom output formatters — sqlite3 already has all of them.
-- No auto-LIMIT, no statement timeout, no setup wizard.
+- Embeddings go only to `http://127.0.0.1:11434` (or wherever
+  `SWRAG_OLLAMA_HOST` points). Verifiable via `swrag doctor`.
+- The archive is plain SQLite on your disk. Back up with Time Machine or
+  git-crypt; it never leaves your machine on its own.
+- Super Whisper's `meta.json` contains your prompts and clipboard nouns.
+  The bundled skill instructs the agent not to surface them unless you
+  explicitly ask.
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).
