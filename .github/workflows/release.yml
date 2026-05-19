@@ -33,8 +33,10 @@ jobs:
           generate_release_notes: true
           fail_on_unmatched_files: true
 
-  # Optional: uncomment to auto-bump a downstream homebrew tap.
-  # Requires a TAP_GH_TOKEN secret with `contents:write` on the tap repo.
+  # Optional: auto-bump the downstream tap on every tagged release.
+  # Requires repo secret `TAP_GH_TOKEN`: a personal-access token with
+  # `contents:write` on NikitaHerndlhofer/homebrew-tap. Until that secret
+  # is set up, the tap is bumped manually — see docs/architecture.md.
   #
   # bump-tap:
   #   needs: build
@@ -43,7 +45,7 @@ jobs:
   #     - uses: mislav/bump-homebrew-formula-action@v3
   #       with:
   #         formula-name: superwhisper-rag
-  #         homebrew-tap: <user>/homebrew-tap
-  #         download-url: https://github.com/<user>/superwhisper-rag/releases/download/${{ github.ref_name }}/swrag-darwin-arm64.tar.gz
+  #         homebrew-tap: NikitaHerndlhofer/homebrew-tap
+  #         download-url: https://github.com/NikitaHerndlhofer/super-whisper-rag/releases/download/${{ github.ref_name }}/swrag-darwin-arm64.tar.gz
   #       env:
   #         COMMITTER_TOKEN: ${{ secrets.TAP_GH_TOKEN }}

@@ -22,7 +22,7 @@ sql` entirely and use `sqlite3 "$(swrag path)"` directly.
 ```bash
 brew install ollama && brew services start ollama
 ollama pull bge-m3
-brew install <user>/tap/superwhisper-rag
+brew install NikitaHerndlhofer/tap/superwhisper-rag
 ```
 
 The archive is created on first use; there is no `setup` step.
