@@ -10,21 +10,48 @@ jobs:
   build:
     runs-on: macos-latest
     steps:
+      - name: skip if release already exists
+        # `bun build --compile` is not bit-reproducible: every build bakes
+        # its own timestamp + build-version into the binary, so re-running
+        # this workflow on the same tag (e.g. after a force-push of the
+        # tag) would produce different sha256s and break any downstream
+        # consumers (Homebrew tap, mirrors, etc.). Bail out if the release
+        # for this tag already has artifacts attached.
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" --json assets --jq '.assets[].name' | grep -q "swrag-darwin"; then
+            echo "Release ${GITHUB_REF_NAME} already has artifacts — refusing to rebuild and overwrite sha256s. Delete the release if you really want a rebuild."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
       - uses: actions/checkout@v4
+        if: steps.check.outputs.skip != 'true'
       - uses: oven-sh/setup-bun@v2
+        if: steps.check.outputs.skip != 'true'
         with:
           bun-version: latest
       - name: install brew sqlite
+        if: steps.check.outputs.skip != 'true'
         run: brew install sqlite
-      - run: bun install --frozen-lockfile
-      - run: bun run typecheck
+      - if: steps.check.outputs.skip != 'true'
+        run: bun install --frozen-lockfile
+      - if: steps.check.outputs.skip != 'true'
+        run: bun run typecheck
       - name: regenerate fixtures
+        if: steps.check.outputs.skip != 'true'
         run: bun run tests/fixtures/make-fixtures.ts
       - name: fetch vendor dylibs
+        if: steps.check.outputs.skip != 'true'
         run: bun run scripts/fetch-vec-dylibs.ts
-      - run: bun test
-      - run: bun run build
+      - if: steps.check.outputs.skip != 'true'
+        run: bun test
+      - if: steps.check.outputs.skip != 'true'
+        run: bun run build
       - uses: softprops/action-gh-release@v2
+        if: steps.check.outputs.skip != 'true'
         with:
           files: |
             dist/swrag-darwin-arm64.tar.gz
