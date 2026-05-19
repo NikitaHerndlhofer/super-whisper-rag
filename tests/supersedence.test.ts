@@ -154,6 +154,30 @@ describe("Super Whisper reprocessing → supersedence", () => {
     }
   });
 
+  test("re-running ensureFresh on an archive with vec entries does not collide on UNIQUE", async () => {
+    // Regression test for the v0.4.x vec UNIQUE-constraint crash:
+    // a LEFT JOIN against the vec0 virtual table reported missing
+    // vec entries that were actually present, so the embed pass
+    // tried to re-INSERT them, and `INSERT OR REPLACE` didn't fire
+    // vec0's conflict resolution. Symptom was a hard failure on a
+    // second `swrag index` against an already-populated archive.
+    await ensureFresh(defaultOpts());
+
+    // Force the mtime fast path off so the pipeline reaches embedDirtyRows
+    // again, and pretend the rows haven't been embedded yet — this is
+    // the same shape the bug took (rows that *think* they need a vec
+    // entry but actually have one).
+    const db = new Database(env.archive);
+    db.exec("UPDATE recording SET embed_text_hash = NULL");
+    db.close();
+    const now = new Date();
+    utimesSync(env.sourceDb, now, now);
+
+    const r = await ensureFresh(defaultOpts());
+    expect(r.fastPath).toBe(false);
+    expect(r.embedded).toBeGreaterThan(0);
+  });
+
   test("restored canonical row gets its vec entry re-created", async () => {
     // Regression test: a row that was superseded (vec deleted) and later
     // promoted back to canonical must end up with a vec entry. Previously

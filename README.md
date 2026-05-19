@@ -6,9 +6,15 @@ dictation history with full-text and multilingual semantic search.
 `swrag` keeps a private SQLite database in sync with Super Whisper's
 recordings, embeds every transcript with `bge-m3` (1024-d, 100+ languages)
 via local [Ollama](https://ollama.com), and exposes the whole thing as a
-thin [`sqlite3`](https://sqlite.org) wrapper. Because the archive is
-append-only, your dictations stay searchable forever — even after Super
-Whisper's retention window deletes them.
+thin [`sqlite3`](https://sqlite.org) wrapper.
+
+Super Whisper is great at capture but doesn't help you find what you've
+said later. You can keep the audio history forever — but it piles up on
+disk, and there's no semantic search across it. Or you let it
+auto-delete — and then it's just gone. Either way, the actual signal —
+the transcript, the decision, the moment — is hard to get back to.
+`swrag` extracts only the searchable substance into its own small
+archive and leaves the audio policy to Super Whisper.
 
 It's useful if you:
 
@@ -67,49 +73,51 @@ recipes.
 
 ## Install
 
-macOS + [Homebrew](https://brew.sh).
+macOS + [Homebrew](https://brew.sh). Two commands, end to end:
 
 ```bash
-brew install ollama && brew services start ollama
-ollama pull bge-m3
 brew install NikitaHerndlhofer/tap/superwhisper-rag
+swrag bootstrap
 ```
 
-The archive is auto-created on first use at
-`~/Library/Application Support/superwhisper-rag/swrag.sqlite`. Run any
-query to populate it:
+`brew install` handles the binary and dependencies (Ollama is pulled
+in for you). `swrag bootstrap` then does everything else:
 
-```bash
-swrag sql "SELECT mode_name, COUNT(*) FROM recording GROUP BY mode_name"
-```
+1. Starts the Ollama service if it isn't already running.
+2. Pulls `bge-m3` if it isn't already pulled (~2 GB, one-time).
+3. Indexes your Super Whisper archive.
+4. Installs the hourly background sync (launchd agent).
+5. Installs the manual-invocation agent skill for Cursor and Claude Code.
+6. Runs `swrag doctor` and prints a summary.
 
-That's the whole setup.
+Idempotent — re-run any time to restore the setup to known-good state.
+Each step is independently invokable too (`swrag index`,
+`swrag enable-sync`, `swrag install-skill`, `swrag doctor`) if you'd
+rather pick and choose.
 
-### Optional — hourly background sync
+### About the background sync
 
-Without this, the archive updates only when you run a query. With it, a
-launchd agent runs `swrag index` every hour and on login:
+`swrag bootstrap` installs a launchd agent that runs `swrag index`
+hourly and at login, so the archive stays fresh without you thinking
+about it. Even without the agent, every `swrag sql` runs a
+sub-millisecond mtime-fast-path ingest before the query, so on-demand
+freshness is automatic too.
 
-```bash
-swrag enable-sync
-```
+To remove the launchd agent: `swrag disable-sync`. To reinstall it:
+`swrag enable-sync` (or just `swrag bootstrap`).
 
-To remove: `swrag disable-sync`.
+### About the agent skill
 
-### Optional — install the agent skill
-
-If you use Cursor or Claude Code and want them to query the archive on
-demand:
-
-```bash
-swrag install-skill
-```
-
-This writes `SKILL.md` to both `~/.cursor/skills/superwhisper-rag/` and
+`swrag bootstrap` writes `SKILL.md` to both
+`~/.cursor/skills/superwhisper-rag/` and
 `~/.claude/skills/superwhisper-rag/`. The skill is **manual-invocation
-only** — the agent can never reach for it autonomously. To use it, type `/superwhisper-rag`. See
+only** — the agent can never reach for it autonomously. To use it, type
+`/superwhisper-rag` (Claude Code) or `@superwhisper-rag` (Cursor). See
 [`docs/agent-integration.md`](docs/agent-integration.md) for the
 guarantee.
+
+To re-install (e.g. after editing it locally): `swrag install-skill`.
+Your edits are backed up to `SKILL.md.bak.<timestamp>` first.
 
 ### Verify the setup
 
@@ -142,6 +150,7 @@ All have sensible defaults; you shouldn't need to set any of them.
 | ------------------------------------- | ------------------------------------------------------------------------------------------------- |
 | `swrag sql [SQL]`                     | Run SQL via sqlite3 (default: list mode). Omit SQL to open the REPL. Pass `-` to read from stdin. |
 | `swrag index`                         | Ingest changes from Super Whisper now.                                                            |
+| `swrag bootstrap`                     | One-shot post-install: start ollama, pull `bge-m3`, verify. Safe to re-run.                       |
 | `swrag doctor`                        | Verify the environment.                                                                           |
 | `swrag path [archive\|sqlite3\|vec0]` | Print a filesystem path. Default: `archive`.                                                      |
 | `swrag embed "TEXT"`                  | Print the embedding of `TEXT` as a SQLite blob literal (`x'…'`), for shell composition.           |

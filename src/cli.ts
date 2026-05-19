@@ -5,6 +5,7 @@ import { getEnv } from "./env.ts";
 import { error } from "./log.ts";
 import { resolvePaths, type ResolvedPaths } from "./paths.ts";
 import type { Env } from "./schemas.ts";
+import { runBootstrap } from "./commands/bootstrap.ts";
 import { runDoctor } from "./commands/doctor.ts";
 import { runEmbed } from "./commands/embed.ts";
 import { disableSync, enableSync } from "./commands/enable-sync.ts";
@@ -179,6 +180,23 @@ const doctorCmd = defineCommand({
 });
 
 /* -------------------------------------------------------------------------- */
+/* bootstrap — one-shot post-install finisher                                 */
+/* -------------------------------------------------------------------------- */
+
+const bootstrapCmd = defineCommand({
+  meta: {
+    name: "bootstrap",
+    description:
+      "One-shot post-install: start ollama, pull the embed model, index the archive, enable hourly sync, install the agent skill, and verify. Safe to re-run.",
+  },
+  args: {},
+  async run() {
+    const r = await runBootstrap(ctx().paths);
+    process.exit(r.exitCode);
+  },
+});
+
+/* -------------------------------------------------------------------------- */
 /* path — print a filesystem path                                             */
 /* -------------------------------------------------------------------------- */
 
@@ -318,6 +336,7 @@ const main = defineCommand({
     sql: sqlCmd,
     index: indexCmd,
     doctor: doctorCmd,
+    bootstrap: bootstrapCmd,
     path: pathCmd,
     embed: embedCmd,
     "install-skill": installSkillCmd,

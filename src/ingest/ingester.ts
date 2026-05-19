@@ -23,13 +23,10 @@ const DirtyRowSchema = z.object({
   raw_result: z.string().nullable(),
   embed_text_hash: z.string().nullable(),
   embed_model: z.string().nullable(),
-  // 0/1 from `recording_vec.folder_name IS NULL` in the LEFT JOIN below.
-  // A canonical row that's missing its vec is treated as dirty
-  // unconditionally — see refreshSupersedence for the failure mode this
-  // closes off.
-  has_vec: z.union([z.literal(0), z.literal(1)]),
 });
 type DirtyRow = z.infer<typeof DirtyRowSchema>;
+
+const VecFolderRowSchema = z.object({ folder_name: z.string() });
 
 const ExistsRowSchema = z.object({ folder_name: z.string() });
 
@@ -277,21 +274,28 @@ async function embedDirtyRows(archive: Database, opts: EmbedDirtyOpts): Promise<
   // Only embed canonical rows. Superseded rows are duplicates of a later
   // reprocess of the same audio; embedding them wastes Ollama calls.
   //
-  // We also LEFT JOIN recording_vec so a canonical row missing its vec
-  // entry is picked up regardless of hash/model match. This is a
-  // defence-in-depth against any future code path that nukes a vec row
-  // without also clearing embed_text_hash on the recording row.
+  // We treat a canonical row whose vec entry is missing as implicitly
+  // dirty, regardless of hash/model match. This is defence-in-depth
+  // against any code path that nukes a vec row without also clearing
+  // embed_text_hash on the recording row.
+  //
+  // Note: we intentionally do NOT LEFT JOIN against recording_vec to
+  // detect missing entries. `recording_vec` is a vec0 virtual table,
+  // and vec0 doesn't behave like a regular table in LEFT JOIN
+  // (returns no row instead of NULL-padding for non-matches in some
+  // sqlite-vec versions). Fetch the existing folder_names separately
+  // and check membership in JS — slower in theory, correct in practice.
   const raw: unknown[] = archive
     .prepare(
-      `SELECT r.folder_name, r.mode_name, r.llm_result, r.raw_result,
-              r.embed_text_hash, r.embed_model,
-              CASE WHEN v.folder_name IS NULL THEN 0 ELSE 1 END AS has_vec
-       FROM recording r
-       LEFT JOIN recording_vec v ON v.folder_name = r.folder_name
-       WHERE r.superseded_by IS NULL`,
+      `SELECT folder_name, mode_name, llm_result, raw_result, embed_text_hash, embed_model
+       FROM recording
+       WHERE superseded_by IS NULL`,
     )
     .all();
   const candidates: DirtyRow[] = raw.map((r) => DirtyRowSchema.parse(r));
+
+  const vecRaw: unknown[] = archive.prepare("SELECT folder_name FROM recording_vec").all();
+  const haveVec = new Set(vecRaw.map((r) => VecFolderRowSchema.parse(r).folder_name));
 
   const dirty: { folder_name: string; text: string; hash: string }[] = [];
   for (const r of candidates) {
@@ -299,15 +303,22 @@ async function embedDirtyRows(archive: Database, opts: EmbedDirtyOpts): Promise<
     if (!text) continue;
     const hash = sha256(text);
     const hashMatches = r.embed_text_hash === hash && r.embed_model === opts.model;
-    if (hashMatches && r.has_vec === 1) continue;
+    if (hashMatches && haveVec.has(r.folder_name)) continue;
     dirty.push({ folder_name: r.folder_name, text, hash });
   }
 
   if (dirty.length === 0) return 0;
   info(`embedding ${dirty.length} rows with ${opts.model}`);
 
-  const upsertVec = archive.prepare(
-    "INSERT OR REPLACE INTO recording_vec (folder_name, embedding) VALUES (?, ?)",
+  // We deliberately do not use `INSERT OR REPLACE` on `recording_vec`.
+  // The vec0 virtual table's xUpdate doesn't go through SQLite's
+  // standard conflict-resolution path for `OR REPLACE`, so colliding
+  // inserts surface as "UNIQUE constraint failed" instead of being
+  // silently replaced. Always DELETE first, then INSERT — safe for
+  // both the "fresh row" and "re-embed an existing row" cases.
+  const deleteVec = archive.prepare("DELETE FROM recording_vec WHERE folder_name = ?");
+  const insertVec = archive.prepare(
+    "INSERT INTO recording_vec (folder_name, embedding) VALUES (?, ?)",
   );
   const updateRow = archive.prepare(
     "UPDATE recording SET embed_model = ?, embed_dim = ?, embed_text_hash = ? WHERE folder_name = ?",
@@ -328,7 +339,8 @@ async function embedDirtyRows(archive: Database, opts: EmbedDirtyOpts): Promise<
         const item = batch[j];
         const v = vectors[j];
         if (!item || !v) continue;
-        upsertVec.run(item.folder_name, v);
+        deleteVec.run(item.folder_name);
+        insertVec.run(item.folder_name, v);
         updateRow.run(opts.model, v.length, item.hash, item.folder_name);
       }
     });
