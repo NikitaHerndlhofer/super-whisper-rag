@@ -66,10 +66,37 @@ swrag sql "SELECT r.folder_name, r.llm_result,
            FROM recording_vec v JOIN recording r USING (folder_name)
            WHERE r.superseded_by IS NULL
            ORDER BY dist LIMIT 10"
+
+# Find the precise moment in a long meeting — chunk-level semantic search
+# returns ~300-word windows instead of "this hour-long meeting probably
+# talked about it". Recipe 14 in the cookbook joins the full transcript
+# back in for context.
+swrag sql "SELECT r.folder_name, c.chunk_idx, c.text,
+                  vec_distance_cosine(v.embedding,
+                                      $(swrag embed 'how do we price the enterprise tier')) AS dist
+           FROM recording_chunk_vec v
+           JOIN recording_chunk c ON c.id = v.chunk_id
+           JOIN recording r ON r.folder_name = c.folder_name
+           WHERE r.superseded_by IS NULL
+           ORDER BY dist LIMIT 10"
 ```
 
 See [`docs/sql-cookbook.md`](docs/sql-cookbook.md) for the full set of
 recipes.
+
+## Long-form recordings
+
+Meetings are too long for a single embedding to be useful — `bge-m3`'s
+~8K-token window silently drops the back half of anything over ~5K
+words, and even within budget a single vector averages every topic
+into mush. So at ingest, recordings above ~500 words are also split
+into ~300-word overlapping windows (sentence- and speaker-boundary-
+aware, deterministic, no LLM call) and embedded individually into
+`recording_chunk_vec` and `recording_chunk_fts`. The row-level
+`recording_vec` still works for coarse filtering — it's now the
+L2-normalized centroid of the row's chunks. Once you've found the
+chunk, `recording.llm_result` is the full transcript right there for
+context. Recipes 13–17 in the cookbook cover the chunk-level patterns.
 
 ## Install
 
@@ -85,7 +112,8 @@ in for you). `swrag bootstrap` then does everything else:
 
 1. Starts the Ollama service if it isn't already running.
 2. Pulls `bge-m3` if it isn't already pulled (~2 GB, one-time).
-3. Indexes your Super Whisper archive.
+3. Indexes your Super Whisper archive (applies schema migrations 1–4,
+   chunks any long-form recordings; see above).
 4. Installs the hourly background sync (launchd agent).
 5. Installs the manual-invocation agent skill for Cursor and Claude Code.
 6. Runs `swrag doctor` and prints a summary.
@@ -99,9 +127,11 @@ rather pick and choose.
 
 `swrag bootstrap` installs a launchd agent that runs `swrag index`
 hourly and at login, so the archive stays fresh without you thinking
-about it. Even without the agent, every `swrag sql` runs a
-sub-millisecond mtime-fast-path ingest before the query, so on-demand
-freshness is automatic too.
+about it. Each run also applies any pending data updaters, so a
+`brew upgrade` that ships a new chunker or backfill catches your
+existing archive up automatically — no manual reindex. Even without
+the agent, every `swrag sql` runs a sub-millisecond mtime-fast-path
+ingest before the query, so on-demand freshness is automatic too.
 
 To remove the launchd agent: `swrag disable-sync`. To reinstall it:
 `swrag enable-sync` (or just `swrag bootstrap`).
@@ -125,8 +155,8 @@ Your edits are backed up to `SKILL.md.bak.<timestamp>` first.
 swrag doctor
 ```
 
-Should report 5/5 OK (sqlite3 + custom build + vec extension + Ollama +
-archive).
+Should report 7/7 OK (sqlite3 + custom build + vec extension + Ollama +
+archive + data version + chunk coverage).
 
 ## Configuration
 
