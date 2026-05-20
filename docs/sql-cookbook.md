@@ -273,6 +273,27 @@ ORDER BY bm25 LIMIT 20;
 --         ORDER BY rrf DESC LIMIT 10
 --       SQL
 --       )"
+
+-- 18. Filter-then-retrieve at chunk granularity. Common shape: "in
+--     <mode>/<app>/<date range>, find the moment where I said X."
+--     Narrow the chunk set on metadata first, then rank — the vector
+--     scan only computes distances for chunks that survive the filter.
+--     This is the right pattern any time the user couples a structured
+--     constraint with a semantic question.
+WITH eligible_chunks AS (
+  SELECT c.id AS chunk_id, c.folder_name, c.chunk_idx, c.text
+  FROM recording_chunk c
+  JOIN recording r ON r.folder_name = c.folder_name
+  WHERE r.superseded_by IS NULL
+    AND r.mode_name_lower = 'meeting'           -- replace with user's mode
+    AND r.datetime >= datetime('now', '-90 days')
+)
+SELECT e.folder_name, e.chunk_idx, e.text,
+       vec_distance_cosine(v.embedding,
+                           $(swrag embed 'pricing tier discussion')) AS dist
+FROM recording_chunk_vec v
+JOIN eligible_chunks e ON e.chunk_id = v.chunk_id
+ORDER BY dist LIMIT 10;
 ```
 
 <!-- swrag:cookbook:end -->

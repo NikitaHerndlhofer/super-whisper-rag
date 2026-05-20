@@ -172,14 +172,72 @@ embedding shape. Join on \`v.chunk_id = c.id\`.
 = recording_chunk.id\`). \`bm25\` over 300-word chunks ranks much sharper
 than over 5,000-word transcripts.
 
-> **When to use chunks vs whole-row:** for "find the moment where I said
-> X" semantic search or keyword search over long recordings, prefer the
-> chunk tables (recipes 13–17). Once a chunk hits, pull \`r.llm_result\`
-> for the full transcript — meetings fit comfortably in a single context
-> window. For mode/date/app filtering, stick with \`recording\` directly.
-
 \`v_search\` — pre-joined convenience view over the whole-row text +
 \`recording_fts\`. Does not include chunks.
+
+## Query playbook
+
+Pick your retrieval surface by what the user actually asked for, not by reflex. Cross-reference recipes below.
+
+| User asked for | Tables | Recipe |
+| --- | --- | --- |
+| "What's in today's / this week's / this mode's dictations?" | \`recording\` only | 1, 2, 7 |
+| "Find what I said about X" — keyword, across all recordings | \`recording_fts\` + \`recording\` | 3 |
+| "Find what I said about X" — semantic/paraphrase, across all recordings | \`recording_vec\` + \`recording\` | 4 |
+| "Find what I said about X" — semantic, want the precise moment in a long recording | \`recording_chunk_vec\` + \`recording_chunk\` + \`recording\` | **14** (or 15 for cheaper context) |
+| "Find what I said about X" — keyword, want precision in long recordings | \`recording_chunk_fts\` + \`recording_chunk\` + \`recording\` | 16 |
+| "Best results combining keyword + semantic" | \`_fts\` + \`_vec\` via RRF | 6 (whole-row) or **17** (chunk-level — usually wins for long-form) |
+| "Which long meetings touch topic X?" (coarse) | \`recording_vec\` (centroid for long rows) + \`recording\` | 4 |
+| "In \`<mode>\` / \`<app>\` / \`<date range>\`, find moments about X" | filter on \`recording\` first, then chunk vec | **18** (chunk-level), 5 (whole-row) |
+| "Reprocessing / supersedence history" | \`recording\` with \`audio_hash\` | 12 |
+
+**Rules of thumb:**
+
+- **For "find the moment" queries, default to chunk-level recipes (14 / 16 / 17 / 18).** Long recordings are the only place "the moment" matters, and chunk-level retrieval is sharper there. Short recordings still surface via the \`recording_vec\` row-level join when you go that route.
+- **For "show me the recording" queries, use whole-row recipes (3 / 4 / 5 / 6).** Short rows have no chunks, so chunk recipes simply skip them.
+- **Filter before ranking.** "In meetings from last quarter, find pricing" should narrow on \`recording.mode_name\` + \`datetime\` first, then rank. See recipe 18 for the pattern.
+- **Always \`r.superseded_by IS NULL\` on the recording side of any join — including chunk recipes.** Chunks of a superseded recording are also stale.
+- **Use \`LIMIT 5\` for full-transcript recipes (14); \`LIMIT 10–20\` for chunk-text-only recipes (15–18); \`LIMIT 50\` for ranking CTEs that feed RRF.** Meetings can be 10K+ words — context budget is your job.
+
+## Joins at a glance
+
+Every chunk shares one integer identity: \`recording_chunk.id\` (an INTEGER PRIMARY KEY → aliases rowid). The vec and FTS tables reuse it.
+
+| From | To | ON |
+| --- | --- | --- |
+| \`recording_fts\` | \`recording\` | \`r.rowid = recording_fts.rowid\` |
+| \`recording_vec\` | \`recording\` | \`r.folder_name = v.folder_name\` (or \`USING (folder_name)\`) |
+| \`recording_chunk\` | \`recording\` | \`r.folder_name = c.folder_name\` |
+| \`recording_chunk_vec\` | \`recording_chunk\` | \`c.id = v.chunk_id\` |
+| \`recording_chunk_fts\` | \`recording_chunk\` | \`c.id = recording_chunk_fts.rowid\` |
+| \`recording_chunk_vec\` ↔ \`recording_chunk_fts\` | (same integer space) | \`v.chunk_id = recording_chunk_fts.rowid\` |
+
+> **Gotcha**: \`recording_chunk_vec\`'s primary key column is named **\`chunk_id\`**, not \`rowid\`. \`SELECT rowid FROM recording_chunk_vec\` errors with "no such column" — vec0 only exposes the column name you declared. Same goes for filtering: use \`WHERE chunk_id IN (…)\`, not \`WHERE rowid IN (…)\`.
+
+## Reading distance numbers
+
+\`vec_distance_cosine(a, b)\` returns \`1 − cos(a, b)\` in \`[0, 2]\`. For bge-m3 specifically:
+
+| Distance | Cosine | What it means |
+| --- | --- | --- |
+| < 0.25 | > 0.75 | Tight match (paraphrase, near-duplicate). |
+| 0.25 – 0.45 | 0.55 – 0.75 | Strong topical match. Most "real" hits land here. |
+| 0.45 – 0.55 | 0.45 – 0.55 | Plausibly related. Verify with the snippet/text before trusting. |
+| > 0.55 | < 0.45 | Likely noise. |
+
+If your best hit is above ~0.55, **say so to the user** ("weak match — try different phrasing, or fall back to FTS keyword search"). Don't surface low-confidence results as if they were confident.
+
+**Multilingual tip:** bge-m3 handles cross-lingual queries, but same-language scoring is ~10–15% tighter. If the user asks in English about Russian content, expect distances roughly 0.05 higher than the equivalent same-language query. Consider also embedding a translated version of the query if recall is poor.
+
+## Anti-patterns to avoid
+
+- ❌ **\`JOIN recording_chunk_vec v ON v.rowid = c.id\`** — the PK column is **\`chunk_id\`**, not \`rowid\`. The join silently returns 0 rows in some sqlite-vec versions; in others it errors. Always \`v.chunk_id\`.
+- ❌ **\`WHERE recording_fts MATCH …\` without \`r.superseded_by IS NULL\`** — you'll surface old reprocessings as duplicates of the canonical row.
+- ❌ **\`vec_distance_cosine(embedding, 'how do notifications work')\`** — passing a text literal instead of a vector blob silently returns garbage distances. Always shell-compose with \`$(swrag embed '…')\`.
+- ❌ **\`LIMIT 50\` on a recipe that returns \`r.llm_result\`** — meetings can be 10K+ words; this blows the context window. Use \`LIMIT 5\` for full-transcript recipes, \`LIMIT 20\` for chunk-text-only recipes.
+- ❌ **Reaching for \`recording_chunk*\` when the user wants short recordings** — short rows have no chunks. They show up only via \`recording*\` queries or via the row-level \`recording_vec\` join.
+- ❌ **Filtering chunks by mode / date directly on \`recording_chunk_vec\`** — chunk_vec has no metadata columns. Join through \`recording_chunk → recording\` first, then filter, then rank. See recipe 18.
+- ❌ **Hard-coding mode names like \`'Meeting'\`** without first running recipe 0 — modes are user-configurable in Super Whisper. The user may have \`'Interview'\`, \`'Standup'\`, \`'Universal'\`, etc.
 
 ## The \`swrag embed\` helper
 

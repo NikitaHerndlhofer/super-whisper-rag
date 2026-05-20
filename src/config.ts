@@ -1,4 +1,4 @@
-export const VERSION = "0.6.0";
+export const VERSION = "0.6.1";
 
 /**
  * Per-call embed timeout. With `keep_alive: "15m"` (our default — see
