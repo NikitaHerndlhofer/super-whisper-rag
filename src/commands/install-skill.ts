@@ -43,11 +43,14 @@ function sha256(s: string): string {
  * <10 KB. There's no `--target` flag because there's nothing useful for
  * the user to choose between.
  */
-export async function installSkill(archivePath: string): Promise<SkillInstallOutcome[]> {
+export async function installSkill(
+  archivePath: string,
+  targets: readonly string[] = SKILL_TARGETS,
+): Promise<SkillInstallOutcome[]> {
   const out: SkillInstallOutcome[] = [];
   const bundledSha = sha256(SKILL_MD);
   await withArchive(archivePath, {}, async (archive) => {
-    for (const path of SKILL_TARGETS) {
+    for (const path of targets) {
       out.push(await writeSkill(path));
       setConfig(archive, trackedHashKey(path), bundledSha);
     }
@@ -95,24 +98,30 @@ async function uniqueBackupPath(path: string): Promise<string> {
  * upgraded via `brew upgrade superwhisper-rag` and the new release ships
  * an updated cookbook). Called on every `swrag index` tick.
  *
- * Refusal rules — keep these in mind before changing this function:
+ * Decision matrix for an existing on-disk SKILL.md:
  *
- *  1. We only touch files that already exist. Users who never ran
- *     `swrag install-skill` are not opted in, and stay that way.
- *  2. We only overwrite if the current on-disk content matches the
- *     hash of what we last wrote. The moment the user edits their
- *     SKILL.md, the hash mismatches and we stop touching the file —
- *     because we cannot tell whether they want our updates merged in
- *     or not. (Manual `swrag install-skill` is the escape hatch; it
- *     backs the current file up and resumes the auto-refresh cycle.)
+ *  | existing | tracked sha    | action                                |
+ *  | -------- | -------------- | ------------------------------------- |
+ *  | == SKILL_MD              | irrelevant     | mark tracked = bundled, no-op write |
+ *  | != SKILL_MD              | null (legacy)  | back up, overwrite, set tracked     |
+ *  | != SKILL_MD              | == existing    | overwrite, set tracked              |
+ *  | != SKILL_MD              | != existing    | refuse (user-edited)                |
+ *
+ * The legacy branch (null tracked sha) was previously bundled with the
+ * user-edited branch, which left users who upgraded from a pre-tracking
+ * version of swrag stuck on stale skills forever — auto-refresh would
+ * never fire because tracked stayed null. The fix is to back up the
+ * old content (preserving any genuine edits as a sibling file) and then
+ * write the new bundled content, restoring the normal refresh cycle.
  */
 export async function refreshInstalledSkills(
   archivePath: string,
+  targets: readonly string[] = SKILL_TARGETS,
 ): Promise<{ path: string; refreshed: boolean }[]> {
   const out: { path: string; refreshed: boolean }[] = [];
   await withArchive(archivePath, {}, async (archive) => {
     const bundledSha = sha256(SKILL_MD);
-    for (const path of SKILL_TARGETS) {
+    for (const path of targets) {
       if (!existsSync(path)) {
         out.push({ path, refreshed: false });
         continue;
@@ -129,12 +138,27 @@ export async function refreshInstalledSkills(
         }
         const tracked = getConfig(archive, trackedHashKey(path));
         const existingSha = sha256(existing);
-        if (tracked == null || tracked !== existingSha) {
-          // Either we've never recorded a hash (legacy install) or the
-          // user has edited their SKILL.md since we last wrote it.
-          // Either way, refuse to overwrite. If they want our updates
-          // they can re-run `swrag install-skill`, which backs up
-          // their version.
+        if (tracked == null) {
+          // Legacy install: file exists but pre-dates the tracking
+          // mechanism. We can't tell from sha alone whether it's
+          // stock content from an older release or has user edits, so
+          // be conservative — back it up first, then refresh. If the
+          // user had edits, the backup preserves them; if it was
+          // stock content, the backup is harmless extra disk.
+          const backup = await uniqueBackupPath(path);
+          await rename(path, backup);
+          await writeFile(path, SKILL_MD, "utf8");
+          setConfig(archive, trackedHashKey(path), bundledSha);
+          info(`refreshed legacy skill at ${path}; prior content backed up to ${backup}`);
+          out.push({ path, refreshed: true });
+          continue;
+        }
+        if (tracked !== existingSha) {
+          // We did record a hash previously, but the on-disk content
+          // has drifted from what we wrote. User edited it — refuse
+          // to overwrite. Manual `swrag install-skill` is the escape
+          // hatch; it backs up the current file and resumes the
+          // auto-refresh cycle.
           out.push({ path, refreshed: false });
           continue;
         }
