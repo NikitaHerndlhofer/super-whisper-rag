@@ -98,21 +98,41 @@ async function uniqueBackupPath(path: string): Promise<string> {
  * upgraded via `brew upgrade superwhisper-rag` and the new release ships
  * an updated cookbook). Called on every `swrag index` tick.
  *
- * Decision matrix for an existing on-disk SKILL.md:
+ * Decision matrix for an existing on-disk SKILL.md (`existing`, hashed
+ * to `existingSha`; archive-stored `tracked`; binary-bundled `bundled`):
  *
- *  | existing | tracked sha    | action                                |
- *  | -------- | -------------- | ------------------------------------- |
- *  | == SKILL_MD              | irrelevant     | mark tracked = bundled, no-op write |
- *  | != SKILL_MD              | null (legacy)  | back up, overwrite, set tracked     |
- *  | != SKILL_MD              | == existing    | overwrite, set tracked              |
- *  | != SKILL_MD              | != existing    | refuse (user-edited)                |
+ *  | existing       | tracked vs sha                     | action                            |
+ *  | -------------- | ---------------------------------- | --------------------------------- |
+ *  | == SKILL_MD    | irrelevant                         | heal tracked = bundled, no-op     |
+ *  | != SKILL_MD    | tracked == bundled                 | **refuse** (user edited after our last write) |
+ *  | != SKILL_MD    | tracked == existing                | refresh in place, set tracked     |
+ *  | != SKILL_MD    | tracked == null                    | back up, refresh, set tracked     |
+ *  | != SKILL_MD    | tracked != existing && != bundled  | back up, refresh, set tracked     |
  *
- * The legacy branch (null tracked sha) was previously bundled with the
- * user-edited branch, which left users who upgraded from a pre-tracking
- * version of swrag stuck on stale skills forever — auto-refresh would
- * never fire because tracked stayed null. The fix is to back up the
- * old content (preserving any genuine edits as a sibling file) and then
- * write the new bundled content, restoring the normal refresh cycle.
+ * History of this gating:
+ *
+ *  v0.6.0–v0.6.1: refused on anything that wasn't "tracked == existing",
+ *    which never fired auto-refresh on archives whose tracked sha was
+ *    null (legacy installs).
+ *  v0.6.2: split out `tracked == null` to backup-refresh, but missed
+ *    archives where tracked exists but is wholesale unrelated to
+ *    on-disk content (drift state — typically the symptom of a prior
+ *    install path that updated tracked without keeping the file in
+ *    sync, or vice versa).
+ *  v0.6.3 (this version): only one case still refuses — `tracked ==
+ *    bundled`, the unambiguous "we wrote SKILL_MD and the user edited
+ *    it since" signal. Every other shape of drift gets the back-up-
+ *    and-refresh treatment, trusting the timestamped .bak siblings as
+ *    the user's recovery surface.
+ *
+ * The trade-off: across multiple binary upgrades, a user who has
+ * genuinely edited their SKILL.md before the upgrade chain will hit the
+ * drift branch on the second upgrade (because tracked still reflects
+ * the version-before-their-edit, not the latest bundled). Their edit
+ * gets backed up and overwritten. Mitigated by the explicit `info(...)`
+ * log line and the discoverable `.bak.<timestamp>` filename — the user
+ * can always recover from there. We accept this in exchange for the
+ * upgrade path actually working for archives in drift states.
  */
 export async function refreshInstalledSkills(
   archivePath: string,
@@ -138,32 +158,34 @@ export async function refreshInstalledSkills(
         }
         const tracked = getConfig(archive, trackedHashKey(path));
         const existingSha = sha256(existing);
-        if (tracked == null) {
-          // Legacy install: file exists but pre-dates the tracking
-          // mechanism. We can't tell from sha alone whether it's
-          // stock content from an older release or has user edits, so
-          // be conservative — back it up first, then refresh. If the
-          // user had edits, the backup preserves them; if it was
-          // stock content, the backup is harmless extra disk.
-          const backup = await uniqueBackupPath(path);
-          await rename(path, backup);
-          await writeFile(path, SKILL_MD, "utf8");
-          setConfig(archive, trackedHashKey(path), bundledSha);
-          info(`refreshed legacy skill at ${path}; prior content backed up to ${backup}`);
-          out.push({ path, refreshed: true });
-          continue;
-        }
-        if (tracked !== existingSha) {
-          // We did record a hash previously, but the on-disk content
-          // has drifted from what we wrote. User edited it — refuse
-          // to overwrite. Manual `swrag install-skill` is the escape
-          // hatch; it backs up the current file and resumes the
-          // auto-refresh cycle.
+        if (tracked === bundledSha) {
+          // We previously wrote exactly this binary's SKILL_MD and the
+          // user has edited it since. Refuse — manual
+          // `swrag install-skill` is the escape hatch (it backs the
+          // current file up and resumes the auto-refresh cycle).
           out.push({ path, refreshed: false });
           continue;
         }
+        if (tracked === existingSha) {
+          // Plain binary upgrade: on-disk is byte-identical to what we
+          // last wrote. Refresh in place; no backup needed because we
+          // wrote it ourselves.
+          await writeFile(path, SKILL_MD, "utf8");
+          setConfig(archive, trackedHashKey(path), bundledSha);
+          out.push({ path, refreshed: true });
+          continue;
+        }
+        // Drift or legacy: tracked is null, or it points at content
+        // that's no longer on disk. Either way we can't tell whether
+        // the on-disk content is stock-from-an-older-release or
+        // user-edited, so be conservative — back it up first, then
+        // refresh. The .bak preserves any edits the user might have
+        // had.
+        const backup = await uniqueBackupPath(path);
+        await rename(path, backup);
         await writeFile(path, SKILL_MD, "utf8");
         setConfig(archive, trackedHashKey(path), bundledSha);
+        info(`refreshed drifted skill at ${path}; prior content backed up to ${backup}`);
         out.push({ path, refreshed: true });
       } catch {
         // best-effort — don't crash the ingest pipeline over a stale skill.

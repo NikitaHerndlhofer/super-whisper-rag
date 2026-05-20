@@ -154,9 +154,9 @@ describe("refreshInstalledSkills decision matrix", () => {
   });
 
   test("on-disk != SKILL_MD AND tracked == null (legacy) → back up + refresh", async () => {
-    // Simulate the v0.6.0-to-v0.6.1 upgrade state that blocked the
-    // user's local skill refresh: file exists, content drifts from
-    // current SKILL_MD, and the archive has NO tracked-sha row for it.
+    // Simulate the pre-tracking upgrade state: file exists, content
+    // drifts from current SKILL_MD, and the archive has NO tracked-sha
+    // row for it (legacy install pre-dating the tracking mechanism).
     const legacy = "## legacy bundled skill from an older version\n…";
     writeFileSync(env.skillA, legacy, "utf8");
     writeFileSync(env.skillB, legacy, "utf8");
@@ -196,21 +196,48 @@ describe("refreshInstalledSkills decision matrix", () => {
     expect(trackedShaFor(env.skillA)).toBe(sha256(SKILL_MD));
   });
 
-  test("on-disk != SKILL_MD AND tracked != sha(existing) → refuse (user edited)", async () => {
-    // User edited their SKILL.md after a previous install. We wrote A,
-    // tracked sha(A), then user changed it to B. tracked still
-    // says A, but on-disk is B. Refuse to overwrite.
-    const ourPrevious = "## skill content we previously wrote\n…";
-    const userEdited = "## skill the user customised\n…";
+  test("on-disk != SKILL_MD AND tracked != existing AND tracked != bundled (drift) → back up + refresh", async () => {
+    // This is the case that bit the maintainer's archive in v0.6.2:
+    // tracked points at some sha that matches neither the current
+    // on-disk content nor what we'd write. Typically the symptom of
+    // an earlier install path that updated tracked but left a stale
+    // file (or vice versa) — wholesale drift. v0.6.3 treats this like
+    // the legacy case: back up, refresh, recapture tracked.
+    const onDisk = "## stock skill content from some older release\n…";
+    const driftedTracked = "1111111111111111111111111111111111111111111111111111111111111111";
+    writeFileSync(env.skillA, onDisk, "utf8");
+    writeTracked(env.skillA, driftedTracked);
+
+    expect(driftedTracked).not.toBe(sha256(onDisk));
+    expect(driftedTracked).not.toBe(sha256(SKILL_MD));
+
+    const results = await refreshInstalledSkills(env.archive, [env.skillA]);
+    expect(results[0]?.refreshed).toBe(true);
+    expect(readFileSync(env.skillA, "utf8")).toBe(SKILL_MD);
+    // The prior on-disk content is preserved as a .bak — recoverable
+    // if it turned out to be user content rather than a stale stock
+    // skill.
+    const backups = listBackups(env.skillA);
+    expect(backups.length).toBeGreaterThanOrEqual(1);
+    expect(readFileSync(backups[0] ?? "", "utf8")).toBe(onDisk);
+    expect(trackedShaFor(env.skillA)).toBe(sha256(SKILL_MD));
+  });
+
+  test("on-disk != SKILL_MD AND tracked == bundledSha → refuse (user edited after our last write)", async () => {
+    // We previously wrote SKILL_MD and recorded its sha. The user
+    // then edited the file. tracked still equals sha(SKILL_MD) but
+    // on-disk no longer matches. This is the one unambiguous
+    // "user-edited" signal and the only refuse case left.
+    const userEdited = "## skill the user customised after our last write\n…";
     writeFileSync(env.skillA, userEdited, "utf8");
-    writeTracked(env.skillA, sha256(ourPrevious)); // tracking the old us-written sha
+    writeTracked(env.skillA, sha256(SKILL_MD));
 
     const results = await refreshInstalledSkills(env.archive, [env.skillA]);
     expect(results[0]?.refreshed).toBe(false);
     expect(readFileSync(env.skillA, "utf8")).toBe(userEdited);
     // Tracked sha unchanged — we don't claim credit for the user's
     // edits.
-    expect(trackedShaFor(env.skillA)).toBe(sha256(ourPrevious));
+    expect(trackedShaFor(env.skillA)).toBe(sha256(SKILL_MD));
     // No backup — we didn't touch the file.
     expect(listBackups(env.skillA)).toEqual([]);
   });
