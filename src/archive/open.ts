@@ -6,6 +6,7 @@ import { EMBED_DIM } from "../config.ts";
 import { getEnv } from "../env.ts";
 import { BREW_SQLITE_PATHS } from "../paths.ts";
 import { runMigrations } from "./migrate.ts";
+import { LATEST_DATA_VERSION } from "./updaters.ts";
 import { vecDylibPath } from "./vec-loader.ts";
 
 let appliedDylib: string | null = null;
@@ -113,7 +114,26 @@ function initialiseConfig(db: Database): void {
   for (const [key, value] of Object.entries(INITIAL_CONFIG)) {
     insert.run(key, value);
   }
+  // `data_version` is seeded at LATEST_DATA_VERSION only when the
+  // archive is *truly* fresh — i.e. has never ingested a recording.
+  // The signal is `recording` being empty: that's true on a brand-new
+  // archive (just-migrated, no ingest yet) and false on an archive
+  // produced by a pre-updater binary (which already has data but no
+  // `data_version` row).
+  //
+  // Why not just `INSERT OR IGNORE data_version` unconditionally? That
+  // would run on EVERY open. A pre-updater archive (missing
+  // `data_version`) would have it seeded to LATEST_DATA_VERSION before
+  // `runUpdaters` got a chance to see the missing row, and updaters
+  // would never run — defeating the entire upgrade path.
+  const rowsRaw: unknown = db.prepare("SELECT COUNT(*) AS n FROM recording").get();
+  const rows = RecordingCountSchema.parse(rowsRaw).n;
+  if (rows === 0) {
+    insert.run("data_version", String(LATEST_DATA_VERSION));
+  }
 }
+
+const RecordingCountSchema = z.object({ n: z.number().int() });
 
 const ConfigRowSchema = z.object({ value: z.string() });
 

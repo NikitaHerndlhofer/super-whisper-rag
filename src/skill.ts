@@ -152,9 +152,34 @@ literal (\`x'…'\`) on stdout. The shell pastes it directly into your SQL.
 \`MATCH\`, \`snippet()\`, \`bm25()\`.
 
 \`recording_vec\` — sqlite-vec virtual table, \`embedding FLOAT[1024]\` from
-bge-m3 (multilingual). Use \`vec_distance_cosine(...)\`.
+bge-m3 (multilingual). Use \`vec_distance_cosine(...)\`. **For long
+recordings, this row stores the L2-normalized centroid of the chunk
+vectors** — useful for coarse filtering ("which meetings touch topic X").
+For precise within-recording retrieval, query the chunk tables below.
 
-\`v_search\` — pre-joined convenience view.
+\`recording_chunk\` — one row per ~300-word chunk of a long recording
+(rows with word count above the configured threshold; default 500).
+Columns: \`id\` (INTEGER PK), \`folder_name\`, \`chunk_idx\` (0-based),
+\`text\`, \`start_word\`, \`end_word\`, \`word_count\`. Short rows have no
+entries here.
+
+\`recording_chunk_vec\` — sqlite-vec virtual table keyed by
+\`chunk_id INTEGER PK\` (= \`recording_chunk.id\`). Same 1024-d bge-m3
+embedding shape. Join on \`v.chunk_id = c.id\`.
+
+\`recording_chunk_fts\` — FTS5 over chunk text, external-content against
+\`recording_chunk\`. Join via the shared rowid (\`recording_chunk_fts.rowid
+= recording_chunk.id\`). \`bm25\` over 300-word chunks ranks much sharper
+than over 5,000-word transcripts.
+
+> **When to use chunks vs whole-row:** for "find the moment where I said
+> X" semantic search or keyword search over long recordings, prefer the
+> chunk tables (recipes 13–17). Once a chunk hits, pull \`r.llm_result\`
+> for the full transcript — meetings fit comfortably in a single context
+> window. For mode/date/app filtering, stick with \`recording\` directly.
+
+\`v_search\` — pre-joined convenience view over the whole-row text +
+\`recording_fts\`. Does not include chunks.
 
 ## The \`swrag embed\` helper
 

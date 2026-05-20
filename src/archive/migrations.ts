@@ -26,6 +26,7 @@ import audioHashSupersedence from "./migrations/002_audio_hash_supersedence.sql"
 import ftsTriggerPartialIndex from "./migrations/003_fts_trigger_partial_index.sql" with {
   type: "text",
 };
+import chunks from "./migrations/004_chunks.sql" with { type: "text" };
 
 export interface Migration {
   /** Strictly increasing integer; matches the file name prefix. */
@@ -40,6 +41,7 @@ export const MIGRATIONS: readonly Migration[] = [
   { version: 1, name: "init", sql: init },
   { version: 2, name: "audio_hash_supersedence", sql: audioHashSupersedence },
   { version: 3, name: "fts_trigger_partial_index", sql: ftsTriggerPartialIndex },
+  { version: 4, name: "chunks", sql: chunks },
 ];
 
 /** Latest version known to this binary. */

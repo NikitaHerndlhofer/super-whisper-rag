@@ -7,6 +7,15 @@ import { EMBED_BATCH_SIZE } from "../config.ts";
 import { embedBatch } from "../embed/ollama.ts";
 import { info, verbose } from "../log.ts";
 import { getConfig, setConfig, withArchive } from "../archive/open.ts";
+import { runUpdaters } from "../archive/update.ts";
+import {
+  chunkSourceBody,
+  chunkText,
+  DEFAULT_CHUNK_STRATEGY,
+  serializeChunkStrategy,
+  wordCountForChunking,
+  type Chunk,
+} from "./chunker.ts";
 import {
   readMetaContext,
   readSourceFolderNames,
@@ -21,12 +30,25 @@ const DirtyRowSchema = z.object({
   mode_name: z.string(),
   llm_result: z.string().nullable(),
   raw_result: z.string().nullable(),
+  llm_word_count: z.number().nullable(),
+  raw_word_count: z.number().nullable(),
   embed_text_hash: z.string().nullable(),
   embed_model: z.string().nullable(),
 });
 type DirtyRow = z.infer<typeof DirtyRowSchema>;
 
 const VecFolderRowSchema = z.object({ folder_name: z.string() });
+const ChunkFolderRowSchema = z.object({ folder_name: z.string() });
+
+const ExistingChunkRowSchema = z.object({
+  id: z.number().int(),
+  chunk_idx: z.number().int(),
+  text: z.string(),
+  start_word: z.number().int(),
+  end_word: z.number().int(),
+  word_count: z.number().int(),
+});
+type ExistingChunkRow = z.infer<typeof ExistingChunkRowSchema>;
 
 const ExistsRowSchema = z.object({ folder_name: z.string() });
 
@@ -84,12 +106,26 @@ export async function ensureFresh(opts: IngestOptions): Promise<IngestResult> {
   // Open archive (creates if missing) just to check the fast-path config.
   return withArchive(opts.archive, {}, async (archive) => {
     try {
+      // Apply pending data updaters before the fast-path check. An
+      // updater that ran here means the binary has new computed-state
+      // expectations the archive hasn't satisfied yet — we must take
+      // the slow path so `embedDirtyRows` (and friends) get a chance to
+      // reconcile, even if the source DB mtime is unchanged.
+      const updaterOutcome = await runUpdaters(archive, opts);
+      const updatersRan = updaterOutcome.applied.length > 0;
+      if (updatersRan) {
+        info(
+          `update: ${updaterOutcome.fromVersion} -> ${updaterOutcome.toVersion}` +
+            ` (applied ${updaterOutcome.applied.join(", ")})`,
+        );
+      }
+
       const storedMtime = getConfig(archive, "source_mtime_ns");
       const storedModel = getConfig(archive, "embed_model");
       const sourceMtimeStr = sourceMtime.toString();
       const modelSwitched = !!storedModel && storedModel !== opts.embedModel;
 
-      if (storedMtime === sourceMtimeStr && !modelSwitched) {
+      if (!updatersRan && storedMtime === sourceMtimeStr && !modelSwitched) {
         return {
           fastPath: true,
           newRows: 0,
@@ -109,6 +145,12 @@ export async function ensureFresh(opts: IngestOptions): Promise<IngestResult> {
       if (modelSwitched) {
         info(`embed model changed (${storedModel} -> ${opts.embedModel}); re-embedding all rows`);
         archive.exec("DELETE FROM recording_vec");
+        // Also wipe chunk vectors — they'll be re-embedded under the
+        // new model on the next embed pass. Chunk text rows + their
+        // FTS index stay (text is invariant under model change), which
+        // the long-path takes advantage of via the "reuse mode" branch
+        // in `embedLongRow`.
+        archive.exec("DELETE FROM recording_chunk_vec");
         archive.exec(
           "UPDATE recording SET embed_text_hash = NULL, embed_model = NULL, embed_dim = NULL",
         );
@@ -270,24 +312,72 @@ interface EmbedDirtyOpts {
   fn?: (texts: string[]) => Promise<Float32Array[]>;
 }
 
+interface ShortDirty {
+  folder_name: string;
+  text: string;
+  hash: string;
+}
+
+interface LongDirty {
+  folder_name: string;
+  body: string;
+  mode_name: string;
+  hash: string;
+}
+
+/**
+ * Detect "dirty" canonical rows and embed them.
+ *
+ * Three orthogonal dirty-detection rules, any of which marks a row:
+ *
+ *   1. `embed_text_hash` or `embed_model` mismatch (existing behavior —
+ *      catches text changes and post-model-switch re-embed).
+ *   2. Missing `recording_vec` entry (defence-in-depth against any code
+ *      path that nukes a vec row without also clearing the hash).
+ *   3. **Long row missing chunks** — catches the first-run backfill
+ *      case where existing long rows have a valid whole-doc hash but
+ *      no `recording_chunk` rows yet.
+ *
+ * A row is routed to one of two paths based on whether it exceeds the
+ * configured word-count threshold:
+ *
+ *   - **Short** (today's behavior): one `embedBatch` call per row,
+ *     single vector upserted to `recording_vec`. Also wipes any chunks
+ *     belonging to the row, in case a previously-long row dropped below
+ *     the threshold.
+ *   - **Long**: chunk the source body → embed each chunk → store chunks
+ *     + chunk_vec + L2-normalized centroid in `recording_vec` (all in
+ *     one transaction per row, see `embedLongRow`).
+ *
+ * A `chunk_strategy` config-key mismatch (orthogonal config-change rule)
+ * triggers an up-front bulk wipe of `recording_chunk*` so that rule (3)
+ * fires for every long row on this pass.
+ *
+ * Note: we intentionally do NOT LEFT JOIN against `recording_vec` /
+ * `recording_chunk_vec` to detect missing entries. The vec0 virtual
+ * table doesn't behave like a regular table in LEFT JOIN (returns no
+ * row instead of NULL-padding for non-matches in some sqlite-vec
+ * versions). Fetch existing folder_names separately and check
+ * membership in JS — slower in theory, correct in practice.
+ */
 async function embedDirtyRows(archive: Database, opts: EmbedDirtyOpts): Promise<number> {
-  // Only embed canonical rows. Superseded rows are duplicates of a later
-  // reprocess of the same audio; embedding them wastes Ollama calls.
-  //
-  // We treat a canonical row whose vec entry is missing as implicitly
-  // dirty, regardless of hash/model match. This is defence-in-depth
-  // against any code path that nukes a vec row without also clearing
-  // embed_text_hash on the recording row.
-  //
-  // Note: we intentionally do NOT LEFT JOIN against recording_vec to
-  // detect missing entries. `recording_vec` is a vec0 virtual table,
-  // and vec0 doesn't behave like a regular table in LEFT JOIN
-  // (returns no row instead of NULL-padding for non-matches in some
-  // sqlite-vec versions). Fetch the existing folder_names separately
-  // and check membership in JS — slower in theory, correct in practice.
+  const strategy = DEFAULT_CHUNK_STRATEGY;
+  const currentStrategyJson = serializeChunkStrategy(strategy);
+  const storedStrategy = getConfig(archive, "chunk_strategy");
+  const strategyChanged = !!storedStrategy && storedStrategy !== currentStrategyJson;
+  if (strategyChanged) {
+    info(`chunk_strategy changed (${storedStrategy} -> ${currentStrategyJson}); rechunking long rows`);
+    // Up-front wipe. The AFTER DELETE trigger on `recording_chunk`
+    // cleans up the FTS index. `recording_chunk_vec` has no FK and must
+    // be wiped explicitly first.
+    archive.exec("DELETE FROM recording_chunk_vec");
+    archive.exec("DELETE FROM recording_chunk");
+  }
+
   const raw: unknown[] = archive
     .prepare(
-      `SELECT folder_name, mode_name, llm_result, raw_result, embed_text_hash, embed_model
+      `SELECT folder_name, mode_name, llm_result, raw_result,
+              llm_word_count, raw_word_count, embed_text_hash, embed_model
        FROM recording
        WHERE superseded_by IS NULL`,
     )
@@ -297,25 +387,172 @@ async function embedDirtyRows(archive: Database, opts: EmbedDirtyOpts): Promise<
   const vecRaw: unknown[] = archive.prepare("SELECT folder_name FROM recording_vec").all();
   const haveVec = new Set(vecRaw.map((r) => VecFolderRowSchema.parse(r).folder_name));
 
-  const dirty: { folder_name: string; text: string; hash: string }[] = [];
+  const chunkRaw: unknown[] = archive
+    .prepare("SELECT DISTINCT folder_name FROM recording_chunk")
+    .all();
+  const haveChunks = new Set(chunkRaw.map((r) => ChunkFolderRowSchema.parse(r).folder_name));
+
+  const shortDirty: ShortDirty[] = [];
+  const longDirty: LongDirty[] = [];
+
   for (const r of candidates) {
-    const text = embedText(r);
-    if (!text) continue;
+    const body = chunkSourceBody(r);
+    if (!body) continue;
+    const text = `[${r.mode_name}] ${body}`;
     const hash = sha256(text);
+    const isLong = wordCountForChunking(r) > strategy.threshold;
     const hashMatches = r.embed_text_hash === hash && r.embed_model === opts.model;
-    if (hashMatches && haveVec.has(r.folder_name)) continue;
-    dirty.push({ folder_name: r.folder_name, text, hash });
+    const hasVec = haveVec.has(r.folder_name);
+    const hasChunksIfLong = !isLong || haveChunks.has(r.folder_name);
+    if (hashMatches && hasVec && hasChunksIfLong) continue;
+
+    if (isLong) {
+      longDirty.push({ folder_name: r.folder_name, body, mode_name: r.mode_name, hash });
+    } else {
+      shortDirty.push({ folder_name: r.folder_name, text, hash });
+    }
   }
 
-  if (dirty.length === 0) return 0;
-  info(`embedding ${dirty.length} rows with ${opts.model}`);
+  if (shortDirty.length === 0 && longDirty.length === 0) {
+    // No work to do, but still persist the strategy so future runs can
+    // detect changes against this baseline.
+    setConfig(archive, "chunk_strategy", currentStrategyJson);
+    return 0;
+  }
 
-  // We deliberately do not use `INSERT OR REPLACE` on `recording_vec`.
-  // The vec0 virtual table's xUpdate doesn't go through SQLite's
-  // standard conflict-resolution path for `OR REPLACE`, so colliding
-  // inserts surface as "UNIQUE constraint failed" instead of being
-  // silently replaced. Always DELETE first, then INSERT — safe for
-  // both the "fresh row" and "re-embed an existing row" cases.
+  info(
+    `embedding ${shortDirty.length + longDirty.length} rows with ${opts.model}` +
+      ` (${shortDirty.length} short, ${longDirty.length} long)`,
+  );
+
+  let embedded = 0;
+  if (shortDirty.length > 0) {
+    embedded += await embedShortRows(archive, opts, shortDirty);
+  }
+  for (const row of longDirty) {
+    await embedLongRow(archive, opts, row);
+    embedded++;
+  }
+
+  setConfig(archive, "chunk_strategy", currentStrategyJson);
+  return embedded;
+}
+
+/**
+ * Short-row path. Mirrors the original `embedDirtyRows` behavior with
+ * one addition: also wipe any chunk rows for this folder, in case a
+ * previously-long recording dropped below the threshold and now lives
+ * on the single-vector path.
+ *
+ * We deliberately do not use `INSERT OR REPLACE` on `recording_vec` —
+ * the vec0 virtual table's xUpdate doesn't go through SQLite's
+ * standard conflict-resolution path, so colliding inserts surface as
+ * "UNIQUE constraint failed" instead of being silently replaced.
+ * Always DELETE then INSERT.
+ */
+async function embedShortRows(
+  archive: Database,
+  opts: EmbedDirtyOpts,
+  rows: ShortDirty[],
+): Promise<number> {
+  const deleteVec = archive.prepare("DELETE FROM recording_vec WHERE folder_name = ?");
+  const insertVec = archive.prepare(
+    "INSERT INTO recording_vec (folder_name, embedding) VALUES (?, ?)",
+  );
+  // Cleanup for the long-to-short transition. No-op for rows that were
+  // always short (no chunks ever existed for them).
+  const deleteChunkVec = archive.prepare(
+    "DELETE FROM recording_chunk_vec WHERE chunk_id IN (SELECT id FROM recording_chunk WHERE folder_name = ?)",
+  );
+  const deleteChunks = archive.prepare("DELETE FROM recording_chunk WHERE folder_name = ?");
+  const updateRow = archive.prepare(
+    "UPDATE recording SET embed_model = ?, embed_dim = ?, embed_text_hash = ? WHERE folder_name = ?",
+  );
+
+  let embedded = 0;
+  for (let i = 0; i < rows.length; i += EMBED_BATCH_SIZE) {
+    const batch = rows.slice(i, i + EMBED_BATCH_SIZE);
+    const vectors = await embedTexts(
+      batch.map((b) => b.text),
+      opts,
+    );
+    const tx = archive.transaction(() => {
+      for (let j = 0; j < batch.length; j++) {
+        const item = batch[j];
+        const v = vectors[j];
+        if (!item || !v) continue;
+        deleteVec.run(item.folder_name);
+        insertVec.run(item.folder_name, v);
+        deleteChunkVec.run(item.folder_name);
+        deleteChunks.run(item.folder_name);
+        updateRow.run(opts.model, v.length, item.hash, item.folder_name);
+      }
+    });
+    tx();
+    embedded += batch.length;
+    verbose(`embedded ${embedded}/${rows.length} short`);
+  }
+  return embedded;
+}
+
+/**
+ * Long-row path. Chunks `row.body` (or reuses existing chunks if they
+ * survived a model-only change), embeds each chunk, then atomically
+ * writes chunks + chunk_vec + L2-normalized centroid in one transaction.
+ *
+ * Two modes:
+ *
+ *   - **reuse**: chunk text rows already exist (typical after an
+ *     `embed_model` switch — text is invariant under model change, so
+ *     we keep the rows and just re-embed). Cheaper than a rebuild.
+ *   - **create**: no chunk rows exist (typical on first backfill or
+ *     after a `chunk_strategy` change). Generate chunks via the chunker
+ *     and insert them.
+ *
+ * Embedding happens outside the transaction (network I/O — we must not
+ * hold a write lock during it). DB writes are all inside one short
+ * transaction so an interrupted run leaves the DB consistent.
+ */
+async function embedLongRow(
+  archive: Database,
+  opts: EmbedDirtyOpts,
+  row: LongDirty,
+): Promise<void> {
+  const existing = readExistingChunks(archive, row.folder_name);
+  let chunkIds: number[] | null = existing.length > 0 ? existing.map((c) => c.id) : null;
+  const chunkSpecs: Chunk[] =
+    existing.length > 0
+      ? existing.map((c) => ({
+          chunk_idx: c.chunk_idx,
+          text: c.text,
+          start_word: c.start_word,
+          end_word: c.end_word,
+          word_count: c.word_count,
+        }))
+      : chunkText(row.body);
+  if (chunkSpecs.length === 0) {
+    throw new Error(`chunker produced 0 chunks for long row ${row.folder_name}`);
+  }
+
+  const embedTextsForChunks = chunkSpecs.map((c) => `[${row.mode_name}] ${c.text}`);
+  const vectors = await embedTexts(embedTextsForChunks, opts);
+  if (vectors.length !== chunkSpecs.length) {
+    throw new Error(
+      `embed returned ${vectors.length} vectors for ${chunkSpecs.length} chunks of ${row.folder_name}`,
+    );
+  }
+  const centroid = l2NormalizedCentroid(vectors);
+
+  const deleteOldChunkVec = archive.prepare(
+    "DELETE FROM recording_chunk_vec WHERE chunk_id IN (SELECT id FROM recording_chunk WHERE folder_name = ?)",
+  );
+  const deleteOldChunks = archive.prepare("DELETE FROM recording_chunk WHERE folder_name = ?");
+  const insertChunk = archive.prepare(
+    "INSERT INTO recording_chunk (folder_name, chunk_idx, text, start_word, end_word, word_count) VALUES (?, ?, ?, ?, ?, ?)",
+  );
+  const insertChunkVec = archive.prepare(
+    "INSERT INTO recording_chunk_vec (chunk_id, embedding) VALUES (?, ?)",
+  );
   const deleteVec = archive.prepare("DELETE FROM recording_vec WHERE folder_name = ?");
   const insertVec = archive.prepare(
     "INSERT INTO recording_vec (folder_name, embedding) VALUES (?, ?)",
@@ -324,43 +561,126 @@ async function embedDirtyRows(archive: Database, opts: EmbedDirtyOpts): Promise<
     "UPDATE recording SET embed_model = ?, embed_dim = ?, embed_text_hash = ? WHERE folder_name = ?",
   );
 
-  let embedded = 0;
-  for (let i = 0; i < dirty.length; i += EMBED_BATCH_SIZE) {
-    const batch = dirty.slice(i, i + EMBED_BATCH_SIZE);
-    const texts = batch.map((b) => b.text);
-    const vectors = opts.fn
-      ? await opts.fn(texts)
-      : await embedBatch(texts, { model: opts.model, host: opts.host });
-    if (vectors.length !== batch.length) {
-      throw new Error(`embed returned ${vectors.length} vectors for batch of ${batch.length}`);
-    }
-    const tx = archive.transaction(() => {
-      for (let j = 0; j < batch.length; j++) {
-        const item = batch[j];
-        const v = vectors[j];
-        if (!item || !v) continue;
-        deleteVec.run(item.folder_name);
-        insertVec.run(item.folder_name, v);
-        updateRow.run(opts.model, v.length, item.hash, item.folder_name);
+  const tx = archive.transaction(() => {
+    if (chunkIds !== null) {
+      // Reuse mode: wipe vec entries, then re-insert under existing ids.
+      deleteOldChunkVec.run(row.folder_name);
+      for (let i = 0; i < chunkIds.length; i++) {
+        const id = chunkIds[i];
+        const v = vectors[i];
+        if (id == null || !v) continue;
+        insertChunkVec.run(id, v);
       }
-    });
-    tx();
-    embedded += batch.length;
-    verbose(`embedded ${embedded}/${dirty.length}`);
-  }
-  return embedded;
+    } else {
+      // Create mode: wipe vec (defence-in-depth — usually no-op since
+      // existing.length === 0 means no chunks → no vec entries either),
+      // wipe chunk text rows (no-op too), then insert fresh.
+      deleteOldChunkVec.run(row.folder_name);
+      deleteOldChunks.run(row.folder_name);
+      const freshIds: number[] = [];
+      for (const c of chunkSpecs) {
+        const result = insertChunk.run(
+          row.folder_name,
+          c.chunk_idx,
+          c.text,
+          c.start_word,
+          c.end_word,
+          c.word_count,
+        );
+        freshIds.push(Number(result.lastInsertRowid));
+      }
+      for (let i = 0; i < freshIds.length; i++) {
+        const id = freshIds[i];
+        const v = vectors[i];
+        if (id == null || !v) continue;
+        insertChunkVec.run(id, v);
+      }
+    }
+    deleteVec.run(row.folder_name);
+    insertVec.run(row.folder_name, centroid);
+    updateRow.run(opts.model, centroid.length, row.hash, row.folder_name);
+  });
+  tx();
+  verbose(`embedded long row ${row.folder_name}: ${chunkSpecs.length} chunks`);
+}
+
+function readExistingChunks(archive: Database, folder: string): ExistingChunkRow[] {
+  const raw: unknown[] = archive
+    .prepare(
+      "SELECT id, chunk_idx, text, start_word, end_word, word_count FROM recording_chunk WHERE folder_name = ? ORDER BY chunk_idx",
+    )
+    .all(folder);
+  return raw.map((r) => ExistingChunkRowSchema.parse(r));
 }
 
 /**
- * Prefer the LLM-processed transcript; fall back to the raw transcription
- * only when no LLM output exists. We deliberately do not consult Super
- * Whisper's `result` column — observation shows it's a lightly-trimmed copy
- * of `rawResult`, not a fresh signal.
+ * Batch-embed an array of strings via Ollama (or the test stub), preserving
+ * order. Splits into batches of `EMBED_BATCH_SIZE` under the hood.
  */
-function embedText(r: DirtyRow): string {
-  const body = r.llm_result || r.raw_result || "";
-  if (!body.trim()) return "";
-  return `[${r.mode_name}] ${body}`;
+async function embedTexts(texts: string[], opts: EmbedDirtyOpts): Promise<Float32Array[]> {
+  const out: Float32Array[] = [];
+  for (let i = 0; i < texts.length; i += EMBED_BATCH_SIZE) {
+    const batch = texts.slice(i, i + EMBED_BATCH_SIZE);
+    const vectors = opts.fn
+      ? await opts.fn(batch)
+      : await embedBatch(batch, { model: opts.model, host: opts.host });
+    if (vectors.length !== batch.length) {
+      throw new Error(`embed returned ${vectors.length} vectors for batch of ${batch.length}`);
+    }
+    for (const v of vectors) out.push(v);
+  }
+  return out;
+}
+
+/**
+ * Compute the L2-normalized centroid of a non-empty list of vectors.
+ *
+ * Every row in `recording_vec` written by `embedDirtyRows` is L2-normalized
+ * — bge-m3 returns unit vectors and Ollama passes them through untouched
+ * (verified empirically: `SELECT SQRT(SUM(value*value)) FROM
+ * json_each(vec_to_json(embedding))` returns 1.0 within float32 epsilon
+ * for every row written by today's short path). The arithmetic-mean
+ * centroid is sub-unit by construction (mean of unit vectors at non-zero
+ * angles to each other), so we renormalize to preserve the invariant.
+ *
+ * Ranking via `vec_distance_cosine` is identical with or without
+ * normalization, but keeping the invariant lets future code switch to
+ * cheaper inner-product distance without auditing every writer.
+ *
+ * Cost is one `Math.hypot`-equivalent (sum of squares, sqrt) plus 1024
+ * divides per long row — well under a microsecond, lost in the noise of
+ * the preceding network embed call.
+ */
+function l2NormalizedCentroid(vectors: Float32Array[]): Float32Array {
+  if (vectors.length === 0) throw new Error("centroid of empty vector list");
+  const head = vectors[0];
+  if (!head) throw new Error("centroid: first vector is missing");
+  const dim = head.length;
+  const sum = new Float32Array(dim);
+  for (const v of vectors) {
+    if (v.length !== dim) {
+      throw new Error(`centroid: mixed dimensions (${v.length} vs ${dim})`);
+    }
+    for (let i = 0; i < dim; i++) {
+      sum[i] = (sum[i] ?? 0) + (v[i] ?? 0);
+    }
+  }
+  let normSq = 0;
+  for (let i = 0; i < dim; i++) {
+    const x = sum[i] ?? 0;
+    normSq += x * x;
+  }
+  const norm = Math.sqrt(normSq);
+  if (norm === 0) {
+    // Pathological: vectors averaged to zero. Should never happen for
+    // bge-m3 output (which is L2-normalized non-zero), but if it does
+    // fall back to the first input rather than divide by zero.
+    return head;
+  }
+  for (let i = 0; i < dim; i++) {
+    sum[i] = (sum[i] ?? 0) / norm;
+  }
+  return sum;
 }
 
 function sha256(s: string): string {
@@ -445,6 +765,13 @@ function refreshSupersedence(archive: Database, nowIso: string): number {
   // is silent but it wastes space and risks confusing future readers
   // who assume vec rows are canonical.
   const deleteVec = archive.prepare("DELETE FROM recording_vec WHERE folder_name = ?");
+  // Same reasoning for chunk-level tables: drop chunks (FTS is cleaned
+  // by the AFTER DELETE trigger) and chunk_vec rows for superseded
+  // folders. vec0 has no FKs so chunk_vec must go first.
+  const deleteChunkVec = archive.prepare(
+    "DELETE FROM recording_chunk_vec WHERE chunk_id IN (SELECT id FROM recording_chunk WHERE folder_name = ?)",
+  );
+  const deleteChunks = archive.prepare("DELETE FROM recording_chunk WHERE folder_name = ?");
   // Alongside the vec drop: clear embed_text_hash/model so that if this
   // row ever gets promoted back to canonical (e.g. the duplicate's
   // audio_hash changes), `embedDirtyRows` re-embeds it. Without this
@@ -473,6 +800,8 @@ function refreshSupersedence(archive: Database, nowIso: string): number {
         if (!r) continue;
         setSuperseded.run(canonical.folder_name, nowIso, r.folder_name);
         deleteVec.run(r.folder_name);
+        deleteChunkVec.run(r.folder_name);
+        deleteChunks.run(r.folder_name);
         clearEmbed.run(r.folder_name);
         changed++;
       }

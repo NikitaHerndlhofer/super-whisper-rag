@@ -20,6 +20,14 @@ propagate to `SKILL.md` at build time. The slice is delimited by the
 >   hard-code mode names without first checking which ones this user has
 >   (recipe 0 below). Filter with `mode_name_lower` (case-insensitive,
 >   indexed) once you know the names.
+> - **Long recordings are chunked**. Rows with a word count above the
+>   configured threshold (default 500) are also split into ~300-word
+>   chunks in `recording_chunk` + `recording_chunk_vec` + `recording_chunk_fts`.
+>   For "find the moment where I said X", use the chunk tables (recipes
+>   13–17). For coarse filtering ("which meetings touch topic Y"), the
+>   row-level `recording_vec` is the L2-normalized centroid of its
+>   chunks. Short rows have a single vector and no chunks — query
+>   `recording*` as usual.
 
 <!-- swrag:cookbook:start -->
 
@@ -161,6 +169,110 @@ WHERE audio_hash = (
   SELECT audio_hash FROM recording WHERE folder_name = '1779143179'
 )
 ORDER BY datetime;
+
+-- 13. Which recordings have chunks? (i.e., which crossed the long-form
+--     threshold and got chunked at ingest.) Useful as a sanity check
+--     before reaching for chunk-level recipes.
+SELECT r.folder_name, r.datetime, r.mode_name, r.llm_word_count,
+       COUNT(c.id) AS n_chunks
+FROM recording r
+LEFT JOIN recording_chunk c ON c.folder_name = r.folder_name
+WHERE r.superseded_by IS NULL
+GROUP BY r.folder_name
+HAVING n_chunks > 0
+ORDER BY r.datetime DESC;
+
+-- 14. Best moment per long recording + the full transcript inline.
+--     This is the canonical RAG pattern for long-form retrieval:
+--     chunks for precise retrieval, full document for context.
+--     ~5K-word meetings fit comfortably in a Claude/GPT context window
+--     at LIMIT 5.
+WITH ranked AS (
+  SELECT chunk_id,
+         vec_distance_cosine(embedding,
+                             $(swrag embed 'how do notifications work')) AS dist
+  FROM recording_chunk_vec
+  ORDER BY dist LIMIT 50
+),
+best AS (
+  SELECT c.folder_name, c.id AS chunk_id, c.chunk_idx, c.text, ranked.dist,
+         ROW_NUMBER() OVER (PARTITION BY c.folder_name ORDER BY ranked.dist) AS rn
+  FROM ranked
+  JOIN recording_chunk c ON c.id = ranked.chunk_id
+)
+SELECT r.folder_name, r.datetime, r.mode_name,
+       best.chunk_idx AS hit_idx,
+       best.text      AS hit_chunk,
+       r.llm_result   AS full_transcript,
+       best.dist
+FROM best
+JOIN recording r USING (folder_name)
+WHERE best.rn = 1 AND r.superseded_by IS NULL
+ORDER BY best.dist LIMIT 5;
+
+-- 15. Chunk + immediate neighbors (lighter context — use when you don't
+--     need the full transcript). Returns the hit chunk plus chunk_idx ±1,
+--     in order, for the top semantic hit.
+WITH hit AS (
+  SELECT c.folder_name, c.chunk_idx,
+         vec_distance_cosine(v.embedding,
+                             $(swrag embed 'how do notifications work')) AS dist
+  FROM recording_chunk_vec v
+  JOIN recording_chunk c ON c.id = v.chunk_id
+  JOIN recording r ON r.folder_name = c.folder_name
+  WHERE r.superseded_by IS NULL
+  ORDER BY dist LIMIT 1
+)
+SELECT c.folder_name, c.chunk_idx, c.text
+FROM hit, recording_chunk c
+WHERE c.folder_name = hit.folder_name
+  AND c.chunk_idx BETWEEN hit.chunk_idx - 1 AND hit.chunk_idx + 1
+ORDER BY c.chunk_idx;
+
+-- 16. Chunk-level FTS5 keyword search. bm25() over 300-word chunks ranks
+--     much sharper than bm25() over 5,000-word transcripts. Returns one
+--     row per matching chunk (a meeting can hit multiple times).
+SELECT r.folder_name, r.datetime, r.mode_name,
+       c.chunk_idx,
+       snippet(recording_chunk_fts, 1, '«', '»', '…', 10) AS snip,
+       bm25(recording_chunk_fts) AS bm25
+FROM recording_chunk_fts
+JOIN recording_chunk c ON c.id = recording_chunk_fts.rowid
+JOIN recording r ON r.folder_name = c.folder_name
+WHERE recording_chunk_fts MATCH 'pricing'    -- ← user's term goes here
+  AND r.superseded_by IS NULL
+ORDER BY bm25 LIMIT 20;
+
+-- 17. Hybrid retrieval at chunk granularity (RRF, k=60). Combines
+--     chunk-level FTS with chunk-level semantic ranking — usually
+--     beats either alone on long-form recall.
+--
+--     Same shell pattern as recipe 6:
+--       Q="pricing"
+--       QV=$(swrag embed "$Q")
+--       swrag sql "$(cat <<SQL
+--         WITH kw AS (
+--           SELECT recording_chunk_fts.rowid AS chunk_id,
+--                  ROW_NUMBER() OVER (ORDER BY bm25(recording_chunk_fts)) AS r
+--           FROM recording_chunk_fts
+--           WHERE recording_chunk_fts MATCH '$Q' LIMIT 50
+--         ),
+--         vec AS (
+--           SELECT chunk_id,
+--                  ROW_NUMBER() OVER (ORDER BY vec_distance_cosine(embedding, $QV)) AS r
+--           FROM recording_chunk_vec LIMIT 50
+--         )
+--         SELECT r.folder_name, r.datetime, c.chunk_idx, c.text,
+--                COALESCE(1.0/(60+kw.r), 0) + COALESCE(1.0/(60+vec.r), 0) AS rrf
+--         FROM recording_chunk c
+--         JOIN recording r ON r.folder_name = c.folder_name
+--         LEFT JOIN kw  ON kw.chunk_id  = c.id
+--         LEFT JOIN vec ON vec.chunk_id = c.id
+--         WHERE r.superseded_by IS NULL
+--           AND (kw.r IS NOT NULL OR vec.r IS NOT NULL)
+--         ORDER BY rrf DESC LIMIT 10
+--       SQL
+--       )"
 ```
 
 <!-- swrag:cookbook:end -->
