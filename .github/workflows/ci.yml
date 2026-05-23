@@ -21,4 +21,10 @@ jobs:
         run: bun run tests/fixtures/make-fixtures.ts
       - name: fetch sqlite-vec vendor dylibs
         run: bun run scripts/fetch-vec-dylibs.ts
+      - name: build swift helper
+        # Same rationale as release.yml: src/mac/helper.ts imports the
+        # helper binary at module-load time, so any test that imports it
+        # (directly or via spawning the swrag CLI) needs the binary on
+        # disk before `bun test` runs.
+        run: bash scripts/build-swift-helper.sh
       - run: bun test

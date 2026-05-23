@@ -46,6 +46,16 @@ jobs:
       - name: fetch vendor dylibs
         if: steps.check.outputs.skip != 'true'
         run: bun run scripts/fetch-vec-dylibs.ts
+      - name: build swift helper
+        # The Swift helper binary is imported at module-load time via Bun's
+        # `with { type: "file" }` attribute (src/mac/helper.ts). Any test
+        # that spawns the swrag CLI as a subprocess (tests/cli.test.ts) or
+        # imports the helper module (tests/mac/*, tests/bootstrap.test.ts,
+        # tests/doctor.test.ts) fails with "Cannot find module" if the
+        # binary isn't on disk. Build it before the test phase rather
+        # than only inside `bun run build`.
+        if: steps.check.outputs.skip != 'true'
+        run: bash scripts/build-swift-helper.sh
       - if: steps.check.outputs.skip != 'true'
         run: bun test
       - if: steps.check.outputs.skip != 'true'
