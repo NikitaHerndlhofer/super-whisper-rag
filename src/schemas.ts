@@ -42,6 +42,10 @@ export const EnvSchema = z.object({
   SWRAG_QUIET: BoolFlag,
   // Ollama `keep_alive` value; see `src/embed/ollama.ts`.
   SWRAG_KEEP_ALIVE: z.string().optional(),
+  // When set, the meeting-queue processor does NOT delete the wav
+  // after a successful transcription. Useful for debugging or for
+  // users who want to keep the source audio.
+  SWRAG_KEEP_QUEUE_AUDIO: BoolFlag,
 });
 export type Env = z.infer<typeof EnvSchema>;
 

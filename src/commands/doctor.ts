@@ -5,6 +5,12 @@ import { ensureExtensionCapableSqlite } from "../archive/open.ts";
 import { LATEST_DATA_VERSION } from "../archive/updaters.ts";
 import { vecDylibPath } from "../archive/vec-loader.ts";
 import { checkOllama } from "../embed/ollama.ts";
+import {
+  MEETING_MENUBAR_PLIST_LABEL,
+  MEETING_WATCH_PLIST_LABEL,
+} from "../launchd/plist.ts";
+import { getPermissions, type Permissions } from "../mac/helper.ts";
+import { run } from "../spawn.ts";
 import { findSqlite3Binary } from "../sqlite3.ts";
 
 const VecVersionRowSchema = z.object({ v: z.string() });
@@ -14,6 +20,10 @@ export interface DoctorOptions {
   archive: string;
   embedModel: string;
   ollamaHost: string;
+  /** Override `launchctl list` for tests. */
+  listLaunchAgents?: () => Promise<{ watch: boolean; menubar: boolean }>;
+  /** Override the permissions probe for tests. */
+  checkPermissions?: () => Promise<Permissions | null>;
 }
 
 interface Check {
@@ -24,12 +34,12 @@ interface Check {
 }
 
 /**
- * Minimal environment check. Verifies the three pieces we actually depend
- * on at runtime: a sqlite3 binary that supports loadable extensions, the
- * sqlite-vec extension, and Ollama with the requested model.
+ * Environment health check. Verifies every piece swrag depends on at
+ * runtime, plus the meeting-watcher launch agents and macOS
+ * permissions the watcher needs.
  *
- * The source DB and archive are intentionally not checked here — `swrag
- * index` will surface a clear error if either is missing.
+ * The source DB and archive are intentionally not checked here —
+ * `swrag index` will surface a clear error if either is missing.
  */
 export async function runDoctor(opts: DoctorOptions): Promise<{
   exitCode: number;
@@ -37,21 +47,33 @@ export async function runDoctor(opts: DoctorOptions): Promise<{
 }> {
   const checks: Check[] = [];
 
-  const sqlite3 = safeCheck(
-    "sqlite3 binary (extension-capable)",
-    () => findSqlite3Binary(),
-    "brew install sqlite",
-  );
-  checks.push(sqlite3);
-
-  const dylib = ensureExtensionCapableSqlite();
+  // 1. Extension-capable SQLite (binary + bun:sqlite dylib swap).
+  //    macOS ships sqlite3 without loadable-extension support; we
+  //    require Homebrew's. Both the CLI shell-out and bun:sqlite need
+  //    the same dylib.
+  let sqliteOk = true;
+  let sqliteDetail: string;
+  try {
+    const cli = findSqlite3Binary();
+    const dylib = ensureExtensionCapableSqlite();
+    if (dylib.dylib == null) {
+      sqliteOk = false;
+      sqliteDetail = `${cli} (bun:sqlite is on stock SQLite — extensions disabled)`;
+    } else {
+      sqliteDetail = `${cli} + ${dylib.dylib}`;
+    }
+  } catch (e) {
+    sqliteOk = false;
+    sqliteDetail = e instanceof Error ? e.message : String(e);
+  }
   checks.push({
-    name: "bun:sqlite custom build",
-    ok: dylib.dylib != null,
-    detail: dylib.dylib ?? "(using stock SQLite — extensions disabled)",
-    hint: dylib.dylib ? undefined : "brew install sqlite",
+    name: "sqlite3 (extension-capable)",
+    ok: sqliteOk,
+    detail: sqliteDetail,
+    hint: sqliteOk ? undefined : "brew install sqlite",
   });
 
+  // 2. sqlite-vec
   let vecOk = false;
   let vecDetail = "";
   try {
@@ -70,6 +92,7 @@ export async function runDoctor(opts: DoctorOptions): Promise<{
     detail: vecDetail,
   });
 
+  // 3. Ollama
   const ollamaErr = await checkOllama({
     host: opts.ollamaHost,
     model: opts.embedModel,
@@ -86,6 +109,7 @@ export async function runDoctor(opts: DoctorOptions): Promise<{
           : "brew install ollama && brew services start ollama",
   });
 
+  // 4. Archive + data version + chunk coverage
   if (existsSync(opts.archive)) {
     checks.push({
       name: "archive present",
@@ -95,6 +119,32 @@ export async function runDoctor(opts: DoctorOptions): Promise<{
     checks.push(dataVersionCheck(opts.archive));
     checks.push(chunkCoverageCheck(opts.archive));
   }
+
+  // 5. Meeting watcher launchd agents
+  const listAgents = opts.listLaunchAgents ?? listMeetingLaunchAgents;
+  try {
+    const status = await listAgents();
+    const both = status.watch && status.menubar;
+    const detail = `watch=${status.watch ? "loaded" : "missing"}, menubar=${status.menubar ? "loaded" : "missing"}`;
+    checks.push({
+      name: "meeting watcher (launchd)",
+      ok: both,
+      detail,
+      hint: both ? undefined : "swrag meeting enable-watcher",
+    });
+  } catch (e) {
+    checks.push({
+      name: "meeting watcher (launchd)",
+      ok: false,
+      detail: e instanceof Error ? e.message : String(e),
+      hint: "swrag meeting enable-watcher",
+    });
+  }
+
+  // 6. macOS permissions (mic + screen recording + Apple Events)
+  const checkPerms = opts.checkPermissions ?? defaultCheckPermissions;
+  const perms = await checkPerms();
+  checks.push(buildPermissionsCheck(perms));
 
   const ok = checks.every((c) => c.ok);
   const lines: string[] = [];
@@ -107,17 +157,88 @@ export async function runDoctor(opts: DoctorOptions): Promise<{
   return { exitCode: ok ? 0 : 2, output: `${lines.join("\n")}\n` };
 }
 
-function safeCheck(name: string, fn: () => string, hint: string): Check {
+/**
+ * Probe launchctl for the two meeting-watcher labels. Uses
+ * `launchctl print` because `launchctl list` requires the legacy
+ * unprivileged domain which is flaky on modern macOS; `print
+ * gui/<uid>/<label>` exits 0 iff the agent is loaded for the current
+ * GUI session.
+ */
+async function listMeetingLaunchAgents(): Promise<{ watch: boolean; menubar: boolean }> {
+  const uid = process.getuid?.();
+  if (uid == null) {
+    throw new Error("cannot determine current uid for launchctl probe");
+  }
+  const probe = (label: string): boolean => {
+    const r = run(["launchctl", "print", `gui/${uid}/${label}`], { timeoutMs: 3_000 });
+    return r.exitCode === 0;
+  };
+  return {
+    watch: probe(MEETING_WATCH_PLIST_LABEL),
+    menubar: probe(MEETING_MENUBAR_PLIST_LABEL),
+  };
+}
+
+async function defaultCheckPermissions(): Promise<Permissions | null> {
   try {
-    return { name, ok: true, detail: fn() };
-  } catch (e) {
+    return await getPermissions({ prompt: false });
+  } catch {
+    // Swift helper missing or failed — treat as soft fail. The check
+    // is informational; we surface the error in the detail.
+    return null;
+  }
+}
+
+const PERM_LABELS = {
+  granted: "granted",
+  denied: "DENIED",
+  not_determined: "not_determined",
+} as const;
+
+function buildPermissionsCheck(perms: Permissions | null): Check {
+  const name = "macOS permissions (mic + screen + automation)";
+  if (perms == null) {
     return {
       name,
       ok: false,
-      detail: e instanceof Error ? e.message : String(e),
-      hint,
+      detail: "permissions probe failed (swrag-helper missing or errored)",
+      hint: "swrag meeting permissions-check --prompt",
     };
   }
+  const mic = PERM_LABELS[perms.microphone];
+  const screen = PERM_LABELS[perms.screen_recording];
+  const automationEntries = Object.entries(perms.automation);
+  const automationGranted = automationEntries.filter(([, v]) => v === "granted").length;
+  const automationDenied = automationEntries
+    .filter(([, v]) => v === "denied")
+    .map(([k]) => k);
+  const automationDetail =
+    automationEntries.length === 0
+      ? "automation=(none)"
+      : automationDenied.length > 0
+        ? `automation=${automationGranted}/${automationEntries.length} granted (denied: ${automationDenied.join(", ")})`
+        : `automation=${automationGranted}/${automationEntries.length} granted`;
+  const detail = `mic=${mic}, screen=${screen}, ${automationDetail}`;
+  const anyDenied =
+    perms.microphone === "denied" || perms.screen_recording === "denied" || automationDenied.length > 0;
+  // Treat `not_determined` as soft-fail: the user hasn't been
+  // prompted yet; the watcher will prompt on first use. We surface
+  // it so the user knows they can warm them eagerly.
+  const anyUndecided =
+    perms.microphone === "not_determined" ||
+    perms.screen_recording === "not_determined" ||
+    automationEntries.some(([, v]) => v === "not_determined");
+  const ok = !anyDenied && !anyUndecided;
+  return {
+    name,
+    ok,
+    detail,
+    hint: ok
+      ? undefined
+      : anyDenied
+        ? "Grant the denied permissions in System Settings → Privacy & Security"
+        : "swrag meeting permissions-check --prompt",
+  };
 }
 
 const CoverageRowSchema = z.object({
@@ -134,13 +255,12 @@ const DataVersionRowSchema = z.object({ value: z.string() });
  *
  *   - Matching: archive is current.
  *   - Lagging or missing: a pending updater will run on the next
- *     `swrag index` (which the launchd agent triggers hourly). The
- *     check tells the user what's coming; it doesn't try to repair
- *     anything itself.
+ *     `swrag index` (which the meeting watcher's processor triggers
+ *     after each completion, plus on demand via the `ensureFresh()`
+ *     hook on every `swrag sql`). The check tells the user what's
+ *     coming; it doesn't try to repair anything itself.
  *
- * The latter case is only an issue if the launchd agent is disabled,
- * in which case `swrag index` from the CLI catches up. Either way, the
- * fix is automatic — no manual intervention required.
+ * Either way, the fix is automatic — no manual intervention required.
  */
 function dataVersionCheck(archivePath: string): Check {
   const name = "data version";

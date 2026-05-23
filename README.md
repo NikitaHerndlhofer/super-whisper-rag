@@ -112,29 +112,87 @@ in for you). `swrag bootstrap` then does everything else:
 
 1. Starts the Ollama service if it isn't already running.
 2. Pulls `bge-m3` if it isn't already pulled (~2 GB, one-time).
-3. Indexes your Super Whisper archive (applies schema migrations 1–4,
+3. Warms the macOS permissions the meeting watcher needs (microphone,
+   screen recording, Apple Events per browser). macOS surfaces a
+   dialog for each not-yet-decided permission — say yes to each one.
+4. Installs the meeting watcher (a launchd KeepAlive daemon plus the
+   menu bar).
+5. Indexes your Super Whisper archive (applies schema migrations,
    chunks any long-form recordings; see above).
-4. Installs the hourly background sync (launchd agent).
-5. Installs the manual-invocation agent skill for Cursor and Claude Code.
-6. Runs `swrag doctor` and prints a summary.
+6. Installs the manual-invocation agent skill for Cursor and Claude Code.
+7. Runs `swrag doctor` and prints a summary.
 
 Idempotent — re-run any time to restore the setup to known-good state.
 Each step is independently invokable too (`swrag index`,
-`swrag enable-sync`, `swrag install-skill`, `swrag doctor`) if you'd
-rather pick and choose.
+`swrag meeting enable-watcher`, `swrag meeting permissions-check
+--prompt`, `swrag install-skill`, `swrag doctor`) if you'd rather
+pick and choose.
 
-### About the background sync
+### About the meeting watcher
 
-`swrag bootstrap` installs a launchd agent that runs `swrag index`
-hourly and at login, so the archive stays fresh without you thinking
-about it. Each run also applies any pending data updaters, so a
-`brew upgrade` that ships a new chunker or backfill catches your
-existing archive up automatically — no manual reindex. Even without
-the agent, every `swrag sql` runs a sub-millisecond mtime-fast-path
-ingest before the query, so on-demand freshness is automatic too.
+`swrag bootstrap` installs the meeting watcher: two `KeepAlive`
+launchd agents that keep two processes alive in the background.
 
-To remove the launchd agent: `swrag disable-sync`. To reinstall it:
-`swrag enable-sync` (or just `swrag bootstrap`).
+- `swrag meeting watch` — the daemon. Detects meetings event-driven
+  (NSWorkspace + CoreAudio notifications via a vendored Swift helper,
+  no polling), offers to start a recording when one begins, and
+  drives the FIFO meeting queue when you click `▶ Start queue
+  processing` in the menu bar. After a recording finishes,
+  Super Whisper transcribes it and the daemon targeted-ingests the
+  result into the swrag archive immediately.
+- `swrag meeting menubar` — the menu bar status item. Subscribes to
+  the daemon's unix socket over line-delimited JSON and renders the
+  current state. From it you can start/stop a recording, start/pause
+  queue processing, and discard or show items in Finder.
+
+Manage them with `swrag meeting enable-watcher` / `swrag meeting
+disable-watcher`. The bootstrap step is just a thin wrapper around
+`enable-watcher`.
+
+Prior versions of swrag installed an hourly `swrag index` launchd
+cron. That cron is gone — the watcher's processor calls a targeted
+ingest after every recording completes, and every `swrag sql` runs a
+sub-millisecond `ensureFresh()` mtime fast-path ingest before the
+query. Live Super Whisper dictations (made outside the watcher) land
+in the archive on first query — the first such query after a new
+dictation pays a one-time ~5–30 s embed pass; subsequent queries are
+fast.
+
+#### Mode is the user's responsibility
+
+The user sets Super Whisper's mode (Universal, Meeting, etc.) via
+Super Whisper's own UI **before** clicking `▶ Start queue
+processing`. The watcher does **not** touch Super Whisper's mode.
+
+- All items in a single Start → Pause cycle are transcribed in the
+  same mode. If you want different items in different modes, pause
+  between them, switch Super Whisper mode manually, then start again.
+  Pause's "finish current item, don't start next" semantics make this
+  clean.
+- After processing finishes, Super Whisper is still in whatever mode
+  you set. If you intend to dictate normally afterward, switch back
+  yourself.
+- We deliberately don't automate mode swapping. The space-character
+  bug in Super Whisper's mode-switch URL scheme is therefore not on
+  swrag's critical path.
+
+#### System audio recording — legal note
+
+swrag does **not** enable system audio capture by default. When you
+enable it (via `swrag meeting enable-watcher --system-audio` or
+`swrag meeting record start --system-audio`), the recorder captures
+audio output from all applications, including the other party's voice
+in calls.
+
+You are solely responsible for complying with local recording laws:
+two-party-consent jurisdictions (most of the EU, several US states,
+elsewhere), GDPR, and any company policies that apply to your calls.
+swrag does **not** notify other call participants — that's on you.
+
+The first time you enable system audio, you'll be asked to pass
+`--ack-legal` to acknowledge the warning. The acknowledgement is
+persisted in the archive's `config` table so subsequent invocations
+don't re-prompt.
 
 ### About the agent skill
 
@@ -155,8 +213,9 @@ Your edits are backed up to `SKILL.md.bak.<timestamp>` first.
 swrag doctor
 ```
 
-Should report 7/7 OK (sqlite3 + custom build + vec extension + Ollama +
-archive + data version + chunk coverage).
+Reports the health of every piece swrag depends on: extension-capable
+sqlite3 + vec extension + Ollama + archive + data version + chunk
+coverage + meeting watcher (launchd) + macOS permissions.
 
 ## Configuration
 
@@ -176,16 +235,29 @@ All have sensible defaults; you shouldn't need to set any of them.
 
 ## Commands
 
-| Command                               | What it does                                                                                      |
-| ------------------------------------- | ------------------------------------------------------------------------------------------------- |
-| `swrag sql [SQL]`                     | Run SQL via sqlite3 (default: list mode). Omit SQL to open the REPL. Pass `-` to read from stdin. |
-| `swrag index`                         | Ingest changes from Super Whisper now.                                                            |
-| `swrag bootstrap`                     | One-shot post-install: start ollama, pull `bge-m3`, verify. Safe to re-run.                       |
-| `swrag doctor`                        | Verify the environment.                                                                           |
-| `swrag path [archive\|sqlite3\|vec0]` | Print a filesystem path. Default: `archive`.                                                      |
-| `swrag embed "TEXT"`                  | Print the embedding of `TEXT` as a SQLite blob literal (`x'…'`), for shell composition.           |
-| `swrag install-skill`                 | Install the manual-invocation `SKILL.md` to Cursor and Claude Code.                               |
-| `swrag enable-sync` / `disable-sync`  | Manage the hourly launchd background sync agent.                                                  |
+| Command                                            | What it does                                                                                      |
+| -------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| `swrag sql [SQL]`                                  | Run SQL via sqlite3 (default: list mode). Omit SQL to open the REPL. Pass `-` to read from stdin. |
+| `swrag index`                                      | Ingest changes from Super Whisper now.                                                            |
+| `swrag bootstrap`                                  | One-shot post-install: start ollama, pull `bge-m3`, warm permissions, install the meeting watcher, index, install the agent skill, verify. Safe to re-run. |
+| `swrag doctor`                                     | Verify the environment.                                                                           |
+| `swrag path [archive\|sqlite3\|vec0]`              | Print a filesystem path. Default: `archive`.                                                      |
+| `swrag embed "TEXT"`                               | Print the embedding of `TEXT` as a SQLite blob literal (`x'…'`), for shell composition.           |
+| `swrag install-skill`                              | Install the manual-invocation `SKILL.md` to Cursor and Claude Code.                               |
+| `swrag enqueue <path.wav>`                         | Add a wav file to the meeting queue (for manual processing).                                      |
+| `swrag meeting watch`                              | Run the meeting capture daemon in the foreground (used by launchd).                               |
+| `swrag meeting menubar`                            | Run the menu bar status item (used by launchd).                                                   |
+| `swrag meeting enable-watcher [--system-audio]`    | Install the meeting-watcher launchd agents (daemon + menu bar). `--system-audio` opts into capturing other apps' audio output. |
+| `swrag meeting disable-watcher`                    | Remove the meeting-watcher launchd agents.                                                        |
+| `swrag meeting status`                             | Probe current meeting state (frontmost app, mic in use, detection signal).                        |
+| `swrag meeting permissions-check [--prompt]`       | Probe microphone / screen recording / Apple Events permissions. `--prompt` fires the macOS dialogs. |
+| `swrag meeting record start [--system-audio]`      | Start a recording (foreground without the daemon, or via daemon if running).                      |
+| `swrag meeting record stop [--discard]`            | Stop the daemon's current recording.                                                              |
+| `swrag meeting queue list [--status …]`            | Print queue contents.                                                                             |
+| `swrag meeting queue start`                        | Begin draining the queue.                                                                         |
+| `swrag meeting queue pause`                        | Pause after the current item finishes.                                                            |
+| `swrag meeting queue state`                        | Print the current queue state (one line).                                                         |
+| `swrag meeting queue discard <id>`                 | Discard a queued row (deletes the wav).                                                           |
 
 ## Forwarding flags to sqlite3
 

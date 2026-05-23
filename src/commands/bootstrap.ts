@@ -1,7 +1,7 @@
 /**
  * One-shot, idempotent finisher for `brew install`. Brings the entire
- * application from "binary on disk" to "ready to use, syncing in the
- * background, agent-searchable" — in a single command.
+ * application from "binary on disk" to "ready to use, meeting watcher
+ * running, agent-searchable" — in a single command.
  *
  * `brew install superwhisper-rag` puts the binary on disk and pulls
  * ollama as a hard dependency. Everything else lives here, in this
@@ -13,23 +13,36 @@
  *   2. Embed model — `ollama pull <model>` (one-time ~2 GB) if not
  *      already present, with the live progress UI inherited so the
  *      user sees what's happening.
- *   3. Archive — run an initial `swrag index` to populate the SQLite
+ *   3. Permissions warm-up — `swrag-helper permissions-check --prompt`.
+ *      Triggers the macOS permission dialogs for microphone, screen
+ *      recording, and per-browser Automation / Apple Events. Required
+ *      before the meeting watcher can run productively.
+ *   4. Meeting watcher — `enableWatcher` installs the two keepalive
+ *      launchd agents (`swrag meeting watch` daemon + `swrag meeting
+ *      menubar`). Replaces the old hourly `swrag index` cron — the
+ *      watcher's processor calls a targeted ingest after every
+ *      recording, and `swrag sql` runs `ensureFresh()` on every query,
+ *      so there's no separate hourly job needed.
+ *   5. Archive — run an initial `swrag index` to populate the SQLite
  *      database from Super Whisper's data (transcripts, embeddings,
  *      supersedence detection).
- *   4. Background sync — install the launchd agent so the archive
- *      stays in sync hourly without manual `swrag index` calls.
- *   5. Agent skill — write the manual-invocation SKILL.md to
+ *   6. Agent skill — write the manual-invocation SKILL.md to
  *      ~/.cursor/skills/superwhisper-rag/ and ~/.claude/skills/.
  *      Harmless if those tools aren't installed (the file just sits
  *      dormant).
- *   6. Final verify — run `swrag doctor`.
+ *   7. Final verify — run `swrag doctor`.
  *
  * Safe to re-run. Each step is a check-and-fix:
  *   - Ollama: skipped if reachable.
  *   - Model pull: skipped if `bge-m3` already present.
+ *   - Permissions: idempotent at the OS level — `--prompt` is a no-op
+ *     for items that are already granted; only `not_determined` ones
+ *     surface a dialog.
+ *   - Watcher: `installLaunchAgent` bootouts the running instance
+ *     first, so re-running `enable-watcher` rewires the plists
+ *     cleanly.
  *   - Ingest: mtime fast-path makes it sub-millisecond when nothing
  *     in Super Whisper has changed.
- *   - launchd: bootouts the running instance first, idempotent.
  *   - Skill: only overwrites when content matches the last hash we
  *     wrote — user edits are preserved.
  *
@@ -39,8 +52,9 @@
 import { existsSync, realpathSync } from "node:fs";
 import { checkOllama } from "../embed/ollama.ts";
 import { ensureFresh } from "../ingest/ingester.ts";
-import { installLaunchAgent } from "../launchd/install.ts";
-import { info, verbose } from "../log.ts";
+import { info, verbose, warn } from "../log.ts";
+import { getPermissions, type Permissions } from "../mac/helper.ts";
+import { enableWatcher, type EnableWatcherResult } from "./enable-watcher.ts";
 import { runDoctor } from "./doctor.ts";
 import { installSkill } from "./install-skill.ts";
 
@@ -70,18 +84,25 @@ export interface BootstrapOptions {
   checkOllamaModel?: (host: string, model: string) => Promise<string | null>;
   /** Override the post-service-start wait budget for tests. */
   serviceStartWaitMs?: number;
+  /** Override the permissions warm-up for tests. */
+  warmPermissions?: () => Promise<Permissions>;
+  /** Override the meeting-watcher install for tests. */
+  installWatcher?: () => Promise<EnableWatcherResult>;
   /** Override the initial archive ingest for tests. */
   ingest?: () => Promise<void>;
-  /** Override the launchd sync installer for tests. */
-  installSync?: () => Promise<void>;
   /** Override the agent skill installer for tests. */
   installAgentSkill?: () => Promise<void>;
   /**
-   * Skip the launchd sync install. Useful in dev (running via
+   * Skip the macOS permission warm-up. Useful in CI where dialogs
+   * aren't possible.
+   */
+  skipPermissions?: boolean;
+  /**
+   * Skip the meeting-watcher install. Useful in dev (running via
    * `bun run`) where the binary isn't yet at a stable Homebrew path
    * and `installLaunchAgent` would have nothing sensible to embed.
    */
-  skipSync?: boolean;
+  skipWatcher?: boolean;
   /** Skip the agent skill install. */
   skipSkill?: boolean;
 }
@@ -90,8 +111,9 @@ export interface BootstrapResult {
   exitCode: number;
   startedOllama: boolean;
   pulledModel: boolean;
+  warmedPermissions: boolean;
+  installedWatcher: boolean;
   ingested: boolean;
-  installedSync: boolean;
   installedSkill: boolean;
   doctorOutput: string;
 }
@@ -102,8 +124,9 @@ export async function runBootstrap(opts: BootstrapOptions): Promise<BootstrapRes
   const waitBudget = opts.serviceStartWaitMs ?? SERVICE_START_WAIT_MS;
   let startedOllama = false;
   let pulledModel = false;
+  let warmedPermissions = false;
+  let installedWatcher = false;
   let ingested = false;
-  let installedSync = false;
   let installedSkill = false;
 
   const reachable = opts.isOllamaReachable ?? (() => isOllamaReachable(host));
@@ -111,6 +134,15 @@ export async function runBootstrap(opts: BootstrapOptions): Promise<BootstrapRes
   const pullModel = opts.pullModel ?? ((m: string) => ollamaPull(host, m));
   const checkModel =
     opts.checkOllamaModel ?? ((h: string, m: string) => checkOllama({ host: h, model: m }));
+  const warmPermissionsFn =
+    opts.warmPermissions ?? (() => getPermissions({ prompt: true }));
+  const installWatcherFn =
+    opts.installWatcher ??
+    (() =>
+      enableWatcher({
+        binPath: resolveStableBinPath(),
+        archive: opts.archive,
+      }));
   const ingestFn =
     opts.ingest ??
     (async () => {
@@ -121,11 +153,6 @@ export async function runBootstrap(opts: BootstrapOptions): Promise<BootstrapRes
         embedModel: model,
         ollamaHost: host,
       });
-    });
-  const installSyncFn =
-    opts.installSync ??
-    (async () => {
-      await installLaunchAgent({ binPath: resolveStableBinPath() });
     });
   const installSkillFn =
     opts.installAgentSkill ??
@@ -163,31 +190,58 @@ export async function runBootstrap(opts: BootstrapOptions): Promise<BootstrapRes
     verbose(`bootstrap: ${model} already pulled`);
   }
 
-  // 3. Archive ingest
-  info("bootstrap: indexing the archive (sub-ms fast-path if Super Whisper hasn't changed)");
-  await ingestFn();
-  ingested = true;
-
-  // 4. launchd background sync
-  if (opts.skipSync) {
-    verbose("bootstrap: skipping launchd sync (--skip-sync)");
+  // 3. Permission warm-up
+  if (opts.skipPermissions) {
+    verbose("bootstrap: skipping permissions warm-up (--skip-permissions)");
   } else {
-    info("bootstrap: installing hourly background sync (launchd)");
+    info(
+      "bootstrap: warming macOS permissions (mic + screen recording + Apple Events). " +
+        "macOS will surface a dialog for each not-yet-decided permission — say yes to each one.",
+    );
     try {
-      await installSyncFn();
-      installedSync = true;
+      const perms = await warmPermissionsFn();
+      warmedPermissions = true;
+      logPermissionsSummary(perms);
+    } catch (e) {
+      // The Swift helper might be missing on dev installs or might
+      // hit an unexpected error path; don't abort the whole bootstrap.
+      warn(
+        `bootstrap: permissions warm-up failed (${e instanceof Error ? e.message : String(e)}). ` +
+          "You can re-run via `swrag meeting permissions-check --prompt`.",
+      );
+    }
+  }
+
+  // 4. Meeting watcher (replaces the old hourly sync cron)
+  if (opts.skipWatcher) {
+    verbose("bootstrap: skipping meeting watcher install (--skip-watcher)");
+  } else {
+    info(
+      "bootstrap: installing the meeting watcher (KeepAlive daemon + menu bar). " +
+        "The watcher's processor calls a targeted `swrag index` after each recording, " +
+        "so there's no separate hourly sync needed.",
+    );
+    try {
+      const r = await installWatcherFn();
+      installedWatcher = true;
+      verbose(`bootstrap: meeting watcher installed: watch=${r.watchPlist}, menubar=${r.menubarPlist}`);
     } catch (e) {
       // Most common failure: running from a `bun run` dev context
       // where there's no stable binary path. Surface the error but
       // don't abort — the rest of the bootstrap should still
       // complete.
       info(
-        `bootstrap: launchd sync install skipped (${e instanceof Error ? e.message : String(e)})`,
+        `bootstrap: meeting watcher install skipped (${e instanceof Error ? e.message : String(e)})`,
       );
     }
   }
 
-  // 5. Agent skill
+  // 5. Archive ingest
+  info("bootstrap: indexing the archive (sub-ms fast-path if Super Whisper hasn't changed)");
+  await ingestFn();
+  ingested = true;
+
+  // 6. Agent skill
   if (opts.skipSkill) {
     verbose("bootstrap: skipping agent skill install (--skip-skill)");
   } else {
@@ -196,7 +250,7 @@ export async function runBootstrap(opts: BootstrapOptions): Promise<BootstrapRes
     installedSkill = true;
   }
 
-  // 6. Doctor — final verify
+  // 7. Doctor — final verify
   const doctor =
     opts.doctor ??
     (() =>
@@ -213,8 +267,9 @@ export async function runBootstrap(opts: BootstrapOptions): Promise<BootstrapRes
   const summary: string[] = [];
   summary.push(startedOllama ? "started ollama" : "ollama already up");
   summary.push(pulledModel ? `pulled ${model}` : `${model} already pulled`);
+  summary.push(warmedPermissions ? "warmed permissions" : "permissions skipped");
+  summary.push(installedWatcher ? "meeting watcher enabled" : "watcher skipped");
   summary.push(ingested ? "archive indexed" : "archive skipped");
-  summary.push(installedSync ? "hourly sync enabled" : "sync skipped");
   summary.push(installedSkill ? "agent skill installed" : "skill skipped");
   info(`bootstrap done: ${summary.join("; ")}`);
 
@@ -222,19 +277,24 @@ export async function runBootstrap(opts: BootstrapOptions): Promise<BootstrapRes
     exitCode: r.exitCode,
     startedOllama,
     pulledModel,
+    warmedPermissions,
+    installedWatcher,
     ingested,
-    installedSync,
     installedSkill,
     doctorOutput: r.output,
   };
 }
 
 /**
- * Resolve the stable Homebrew symlink path for the swrag binary, the
- * same way `cli.ts::resolveBinPath` does for `swrag enable-sync`.
- * Duplicated here intentionally — the CLI's version reaches into
- * `process.execPath` which we don't want bootstrap (a library
- * function) to depend on.
+ * Resolve the stable Homebrew symlink path for the swrag binary.
+ *
+ * The launchd plists embed this path; the symlink is rewired by
+ * `brew upgrade superwhisper-rag` while the version-specific Cellar
+ * realpath would point at a deleted directory after `brew cleanup`.
+ *
+ * Duplicated from `cli.ts::resolveBinPath` intentionally — the CLI's
+ * version reaches into `process.execPath` which we don't want
+ * bootstrap (a library function) to depend on uniformly.
  */
 function resolveStableBinPath(): string {
   for (const p of ["/opt/homebrew/bin/swrag", "/usr/local/bin/swrag"]) {
@@ -256,6 +316,22 @@ function resolveStableBinPath(): string {
       "Install via Homebrew (`brew install NikitaHerndlhofer/tap/superwhisper-rag`) " +
       "and re-run `swrag bootstrap`.",
   );
+}
+
+/**
+ * Pretty-print a one-line summary of macOS permission state so the
+ * user sees what landed during the warm-up step.
+ */
+function logPermissionsSummary(perms: Permissions): void {
+  const automationStates = Object.values(perms.automation);
+  const automationGranted = automationStates.filter((s) => s === "granted").length;
+  const automationTotal = automationStates.length;
+  const parts = [
+    `mic=${perms.microphone}`,
+    `screen=${perms.screen_recording}`,
+    `automation=${automationGranted}/${automationTotal} granted`,
+  ];
+  info(`bootstrap: permissions — ${parts.join(", ")}`);
 }
 
 async function isOllamaReachable(host: string): Promise<boolean> {

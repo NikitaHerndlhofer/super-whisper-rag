@@ -17,7 +17,9 @@ Super Whisper ──read-only──┐
                             │       │   superwhisper-rag/swrag.sqlite
                             │       │   (canonical, append-only)
                             ├─►───┤
-                            │     swrag index (CLI / hourly launchd)
+                            │     swrag index (CLI on demand; per-recording
+                            │       │   targeted ingest from the meeting watcher;
+                            │       │   ensureFresh() on every `swrag sql`)
                             │       │
   meta.json per recording ──┘       │
                                     │
@@ -68,11 +70,12 @@ src/
 ├── commands/
 │   ├── sql.ts              # The thin sqlite3 proxy.
 │   ├── index.ts            # `swrag index`.
-│   ├── doctor.ts           # Minimal env check.
+│   ├── doctor.ts           # Env health check (sqlite, vec, ollama, archive, watcher, permissions).
 │   ├── path.ts             # `swrag path [archive|sqlite3|vec0]`.
 │   ├── embed.ts            # `swrag embed "text"` → x'…'.
 │   ├── install-skill.ts    # Write SKILL.md to ~/.cursor and/or ~/.claude.
-│   └── enable-sync.ts      # Opt-in launchd agent (install/uninstall).
+│   ├── bootstrap.ts        # One-shot post-install orchestrator.
+│   └── enable-watcher.ts   # Install/remove the meeting-watcher launchd agents.
 │
 ├── launchd/
 │   ├── plist.ts            # XML template.
@@ -121,7 +124,7 @@ Semantic search composes through the shell — see "Why semantic search is shell
 Schema changes ride a tiny migration runner backed by SQLite's built-in
 [`PRAGMA user_version`](https://www.sqlite.org/pragma.html#pragma_user_version).
 No external library, no checksums table, no opt-in command — every
-`swrag index` (and the launchd-driven sync) opens the archive read-write,
+`swrag index` (and the per-recording targeted ingest from the meeting watcher) opens the archive read-write,
 which runs `runMigrations()` before doing anything else.
 
 ### Layout
@@ -337,8 +340,11 @@ helpers that schema-parse every result.
 ## Where the tool writes
 
 - `~/Library/Application Support/superwhisper-rag/swrag.sqlite`
-- `~/Library/Logs/superwhisper-rag.log` (only when `enable-sync` is on)
-- `~/Library/LaunchAgents/com.superwhisper-rag.sync.plist` (only when `enable-sync` is on)
+- `~/Library/Application Support/superwhisper-rag/meeting.sock` (only while `meeting watch` is running)
+- `~/Library/Application Support/superwhisper-rag/meetings/incoming/*.wav` (queue audio)
+- `~/Library/Logs/superwhisper-rag.log` (only when the meeting watcher is on)
+- `~/Library/LaunchAgents/com.superwhisper-rag.meeting-watch.plist` (only when `meeting enable-watcher` is run)
+- `~/Library/LaunchAgents/com.superwhisper-rag.meeting-menubar.plist` (only when `meeting enable-watcher` is run)
 - `~/.cursor/skills/superwhisper-rag/SKILL.md` (only when `install-skill` is run)
 - `~/.claude/skills/superwhisper-rag/SKILL.md` (only when `install-skill` is run)
 - `/tmp/swrag-snap-*.sqlite` (deleted on success)

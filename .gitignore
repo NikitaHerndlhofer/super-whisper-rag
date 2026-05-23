@@ -56,6 +56,12 @@ typings/
 # scripts/fetch-vec-dylibs.ts; embedded into the compiled binary).
 /vendor/*.dylib
 
+# Swift helper build cache + compiled universal binary. The helper source
+# lives in `swift-helper/`; the binary is rebuilt fresh on every release
+# by `scripts/build-swift-helper.sh` (called from `scripts/build.ts`).
+/swift-helper/.build/
+/vendor/swrag-helper-darwin-universal
+
 # Local-only Homebrew formula used for testing the build pipeline against
 # a file:// URL on the developer's machine. The canonical formula lives
 # in https://github.com/NikitaHerndlhofer/homebrew-tap.

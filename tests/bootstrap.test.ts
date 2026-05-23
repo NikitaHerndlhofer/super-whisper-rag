@@ -1,12 +1,19 @@
 import { describe, expect, test } from "bun:test";
 import { runBootstrap } from "../src/commands/bootstrap.ts";
+import type { Permissions } from "../src/mac/helper.ts";
+import {
+  MEETING_MENUBAR_PLIST_LABEL,
+  MEETING_WATCH_PLIST_LABEL,
+} from "../src/launchd/plist.ts";
 
 /**
  * `runBootstrap` is small and orchestrational. The substance — talking
- * to ollama, shelling out to `brew services`, running `ollama pull` —
- * is all behind dependency-injected stubs that real callers don't
- * override but tests do. We exercise the orchestration logic here and
- * trust the (already-tested) `runDoctor` for the verification step.
+ * to ollama, shelling out to `brew services`, running `ollama pull`,
+ * warming macOS permissions, installing the meeting-watcher launch
+ * agents — is all behind dependency-injected stubs that real callers
+ * don't override but tests do. We exercise the orchestration logic
+ * here and trust the (already-tested) `runDoctor` for the
+ * verification step.
  */
 
 const baseOpts = {
@@ -18,6 +25,17 @@ const baseOpts = {
   // Keep tests fast — no real `brew services` polling budget needed.
   serviceStartWaitMs: 100,
 } as const;
+
+function grantedPermissions(): Permissions {
+  return {
+    microphone: "granted",
+    screen_recording: "granted",
+    automation: {
+      "com.apple.Safari": "granted",
+      "com.google.Chrome": "granted",
+    },
+  };
+}
 
 function stubDoctorOk() {
   return Promise.resolve({ exitCode: 0, output: "stub doctor: ok\n" });
@@ -35,8 +53,13 @@ function withDefaults<T extends object>(over: T) {
     startOllama: async () => {},
     pullModel: async () => {},
     checkOllamaModel: () => Promise.resolve(null),
+    warmPermissions: async () => grantedPermissions(),
+    installWatcher: async () => ({
+      watchPlist: `/tmp/${MEETING_WATCH_PLIST_LABEL}.plist`,
+      menubarPlist: `/tmp/${MEETING_MENUBAR_PLIST_LABEL}.plist`,
+      systemAudioPersisted: false,
+    }),
     ingest: async () => {},
-    installSync: async () => {},
     installAgentSkill: async () => {},
     doctor: stubDoctorOk,
     ...over,
@@ -63,37 +86,52 @@ describe("runBootstrap", () => {
           order.push("pull-model");
         },
         checkOllamaModel: () => Promise.resolve('embed model "x" not pulled. Run: ollama pull x'),
+        warmPermissions: async () => {
+          order.push("warm-permissions");
+          return grantedPermissions();
+        },
+        installWatcher: async () => {
+          order.push("install-watcher");
+          return {
+            watchPlist: `/tmp/${MEETING_WATCH_PLIST_LABEL}.plist`,
+            menubarPlist: `/tmp/${MEETING_MENUBAR_PLIST_LABEL}.plist`,
+            systemAudioPersisted: false,
+          };
+        },
         ingest: async () => {
           order.push("ingest");
-        },
-        installSync: async () => {
-          order.push("install-sync");
         },
         installAgentSkill: async () => {
           order.push("install-skill");
         },
       }),
     );
-    // Order is the spec: ollama → model → ingest → sync → skill.
+    // Order is the spec: ollama → model → permissions → watcher →
+    // ingest → skill. The "install hourly sync agent" step that was
+    // here in Phase 1–4 is GONE; the watcher's targeted ingest plus
+    // ensureFresh() replace it.
     expect(order).toEqual([
       "start-ollama",
       "pull-model",
+      "warm-permissions",
+      "install-watcher",
       "ingest",
-      "install-sync",
       "install-skill",
     ]);
     expect(r.exitCode).toBe(0);
     expect(r.startedOllama).toBe(true);
     expect(r.pulledModel).toBe(true);
+    expect(r.warmedPermissions).toBe(true);
+    expect(r.installedWatcher).toBe(true);
     expect(r.ingested).toBe(true);
-    expect(r.installedSync).toBe(true);
     expect(r.installedSkill).toBe(true);
   });
 
   test("no-op-friendly: nothing executes when everything is already in good shape", async () => {
     let startCalls = 0;
     let pullCalls = 0;
-    let syncCalls = 0;
+    let permCalls = 0;
+    let watcherCalls = 0;
     let skillCalls = 0;
     const r = await runBootstrap(
       withDefaults({
@@ -103,8 +141,17 @@ describe("runBootstrap", () => {
         pullModel: async () => {
           pullCalls++;
         },
-        installSync: async () => {
-          syncCalls++;
+        warmPermissions: async () => {
+          permCalls++;
+          return grantedPermissions();
+        },
+        installWatcher: async () => {
+          watcherCalls++;
+          return {
+            watchPlist: `/tmp/${MEETING_WATCH_PLIST_LABEL}.plist`,
+            menubarPlist: `/tmp/${MEETING_MENUBAR_PLIST_LABEL}.plist`,
+            systemAudioPersisted: false,
+          };
         },
         installAgentSkill: async () => {
           skillCalls++;
@@ -113,15 +160,18 @@ describe("runBootstrap", () => {
     );
     expect(startCalls).toBe(0);
     expect(pullCalls).toBe(0);
-    // Sync + skill always run (they're idempotent themselves). The
-    // *bootstrap* doesn't need to know whether they were already
-    // installed because their internal install logic handles that.
-    expect(syncCalls).toBe(1);
+    // Permissions, watcher, skill always run (they're idempotent
+    // themselves). The *bootstrap* doesn't need to know whether they
+    // were already in place because their internal install logic
+    // handles that.
+    expect(permCalls).toBe(1);
+    expect(watcherCalls).toBe(1);
     expect(skillCalls).toBe(1);
     expect(r.startedOllama).toBe(false);
     expect(r.pulledModel).toBe(false);
+    expect(r.warmedPermissions).toBe(true);
+    expect(r.installedWatcher).toBe(true);
     expect(r.ingested).toBe(true);
-    expect(r.installedSync).toBe(true);
     expect(r.installedSkill).toBe(true);
     expect(r.exitCode).toBe(0);
   });
@@ -174,14 +224,40 @@ describe("runBootstrap", () => {
     ).rejects.toThrow(/ollama check failed/);
   });
 
-  test("launchd install failure does not abort the bootstrap", async () => {
-    // The launchd step is best-effort because dev runs (`bun run`)
-    // don't have a stable binary path to embed in the plist. A failure
-    // there shouldn't take down the whole bootstrap.
+  test("permissions warm-up failure does not abort the bootstrap", async () => {
+    // The Swift helper might be missing on a dev install or hit a
+    // permission-system glitch. Don't take down the whole bootstrap.
+    let watcherRan = false;
+    const r = await runBootstrap(
+      withDefaults({
+        warmPermissions: async () => {
+          throw new Error("swrag-helper missing");
+        },
+        installWatcher: async () => {
+          watcherRan = true;
+          return {
+            watchPlist: `/tmp/${MEETING_WATCH_PLIST_LABEL}.plist`,
+            menubarPlist: `/tmp/${MEETING_MENUBAR_PLIST_LABEL}.plist`,
+            systemAudioPersisted: false,
+          };
+        },
+      }),
+    );
+    expect(r.warmedPermissions).toBe(false);
+    expect(watcherRan).toBe(true);
+    expect(r.installedWatcher).toBe(true);
+    expect(r.exitCode).toBe(0);
+  });
+
+  test("watcher install failure does not abort the bootstrap", async () => {
+    // The watcher install step is best-effort because dev runs
+    // (`bun run`) don't have a stable binary path to embed in the
+    // plist. A failure there shouldn't take down the whole
+    // bootstrap.
     let skillRan = false;
     const r = await runBootstrap(
       withDefaults({
-        installSync: async () => {
+        installWatcher: async () => {
           throw new Error("no stable bin path (dev mode)");
         },
         installAgentSkill: async () => {
@@ -189,30 +265,43 @@ describe("runBootstrap", () => {
         },
       }),
     );
-    expect(r.installedSync).toBe(false);
+    expect(r.installedWatcher).toBe(false);
     expect(skillRan).toBe(true);
     expect(r.installedSkill).toBe(true);
     expect(r.exitCode).toBe(0);
   });
 
-  test("skipSync / skipSkill flags do what they say", async () => {
-    let syncCalls = 0;
+  test("skipPermissions / skipWatcher / skipSkill flags do what they say", async () => {
+    let permCalls = 0;
+    let watcherCalls = 0;
     let skillCalls = 0;
     const r = await runBootstrap(
       withDefaults({
-        skipSync: true,
+        skipPermissions: true,
+        skipWatcher: true,
         skipSkill: true,
-        installSync: async () => {
-          syncCalls++;
+        warmPermissions: async () => {
+          permCalls++;
+          return grantedPermissions();
+        },
+        installWatcher: async () => {
+          watcherCalls++;
+          return {
+            watchPlist: `/tmp/${MEETING_WATCH_PLIST_LABEL}.plist`,
+            menubarPlist: `/tmp/${MEETING_MENUBAR_PLIST_LABEL}.plist`,
+            systemAudioPersisted: false,
+          };
         },
         installAgentSkill: async () => {
           skillCalls++;
         },
       }),
     );
-    expect(syncCalls).toBe(0);
+    expect(permCalls).toBe(0);
+    expect(watcherCalls).toBe(0);
     expect(skillCalls).toBe(0);
-    expect(r.installedSync).toBe(false);
+    expect(r.warmedPermissions).toBe(false);
+    expect(r.installedWatcher).toBe(false);
     expect(r.installedSkill).toBe(false);
   });
 

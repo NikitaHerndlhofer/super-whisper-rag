@@ -21,6 +21,8 @@ import {
   readSourceFolderNames,
   readSourceRecordings,
   sourceDbMtimeNs,
+  type MetaContext,
+  type SourceRecording,
 } from "./sources.ts";
 import { snapshotSourceDb } from "./snapshot.ts";
 import { markSourceDeletions, refreshAudioLiveness } from "./deletions.ts";
@@ -84,6 +86,103 @@ export interface IngestResult {
   audioChanges: number;
   modelSwitched: boolean;
   durationMs: number;
+}
+
+/**
+ * Single source of truth for the recording-upsert SQL. Used by both the
+ * bulk `ensureFresh` path and the per-folder `runIndexFolder` path so
+ * the two stay column-for-column identical without copy-paste.
+ *
+ * `language`, `app_name`, and `app_category` are COALESCEd on update to
+ * preserve previously-enriched values when SW reprocesses a row without
+ * a fresh meta.json.
+ */
+export const RECORDING_UPSERT_SQL = `
+  INSERT INTO recording (
+    folder_name, recording_id_hex, datetime, duration_ms,
+    mode_name, model_key, model_name, language_model_key, language_model_name,
+    recording_device, language, app_name, app_category,
+    raw_word_count, llm_word_count, result, llm_result, raw_result,
+    has_audio, meta_path, audio_path, indexed_at
+  ) VALUES (
+    $folder_name, $recording_id_hex, $datetime, $duration_ms,
+    $mode_name, $model_key, $model_name, $language_model_key, $language_model_name,
+    $recording_device, $language, $app_name, $app_category,
+    $raw_word_count, $llm_word_count, $result, $llm_result, $raw_result,
+    $has_audio, $meta_path, $audio_path, $indexed_at
+  )
+  ON CONFLICT(folder_name) DO UPDATE SET
+    datetime = excluded.datetime,
+    duration_ms = excluded.duration_ms,
+    mode_name = excluded.mode_name,
+    model_key = excluded.model_key,
+    model_name = excluded.model_name,
+    language_model_key = excluded.language_model_key,
+    language_model_name = excluded.language_model_name,
+    recording_device = excluded.recording_device,
+    language = COALESCE(excluded.language, recording.language),
+    app_name = COALESCE(excluded.app_name, recording.app_name),
+    app_category = COALESCE(excluded.app_category, recording.app_category),
+    raw_word_count = excluded.raw_word_count,
+    llm_word_count = excluded.llm_word_count,
+    result = excluded.result,
+    llm_result = excluded.llm_result,
+    raw_result = excluded.raw_result,
+    has_audio = excluded.has_audio,
+    meta_path = excluded.meta_path,
+    audio_path = excluded.audio_path,
+    indexed_at = excluded.indexed_at
+`;
+
+/**
+ * Outcome of `applyRecordingUpsert`: whether the row pre-existed
+ * (i.e. was UPDATED rather than INSERTed).
+ */
+export interface UpsertOutcome {
+  existed: boolean;
+}
+
+/**
+ * Apply RECORDING_UPSERT_SQL for a single (row, meta) pair. Caller
+ * provides prepared statements so the bulk path can reuse them across
+ * many rows; the per-folder path prepares them inline.
+ *
+ * Caller is responsible for wrapping in a transaction.
+ */
+export function applyRecordingUpsert(
+  upsertStmt: ReturnType<Database["prepare"]>,
+  existsStmt: ReturnType<Database["prepare"]>,
+  row: SourceRecording,
+  meta: MetaContext,
+  nowIso: string,
+): UpsertOutcome {
+  const existedRaw: unknown = existsStmt.get(row.folderName);
+  const existed = existedRaw != null && ExistsRowSchema.safeParse(existedRaw).success;
+  upsertStmt.run({
+    $folder_name: row.folderName,
+    $recording_id_hex: row.recordingIdHex,
+    $datetime: row.datetime,
+    $duration_ms: row.durationMs,
+    $mode_name: row.modeName,
+    $model_key: row.modelKey,
+    $model_name: row.modelName,
+    $language_model_key: row.languageModelKey,
+    $language_model_name: row.languageModelName,
+    $recording_device: row.recordingDevice,
+    $language: meta.language,
+    $app_name: meta.appName,
+    $app_category: meta.appCategory,
+    $raw_word_count: row.rawWordCount,
+    $llm_word_count: row.llmWordCount,
+    $result: row.result,
+    $llm_result: row.llmResult,
+    $raw_result: row.rawResult,
+    $has_audio: meta.hasAudio ? 1 : 0,
+    $meta_path: meta.metaPath,
+    $audio_path: meta.audioPath,
+    $indexed_at: nowIso,
+  });
+  return { existed };
 }
 
 /**
@@ -176,79 +275,19 @@ export async function ensureFresh(opts: IngestOptions): Promise<IngestResult> {
         );
 
         const nowIso = new Date().toISOString();
-        const upsertStmt = archive.prepare(`
-        INSERT INTO recording (
-          folder_name, recording_id_hex, datetime, duration_ms,
-          mode_name, model_key, model_name, language_model_key, language_model_name,
-          recording_device, language, app_name, app_category,
-          raw_word_count, llm_word_count, result, llm_result, raw_result,
-          has_audio, meta_path, audio_path, indexed_at
-        ) VALUES (
-          $folder_name, $recording_id_hex, $datetime, $duration_ms,
-          $mode_name, $model_key, $model_name, $language_model_key, $language_model_name,
-          $recording_device, $language, $app_name, $app_category,
-          $raw_word_count, $llm_word_count, $result, $llm_result, $raw_result,
-          $has_audio, $meta_path, $audio_path, $indexed_at
-        )
-        ON CONFLICT(folder_name) DO UPDATE SET
-          datetime = excluded.datetime,
-          duration_ms = excluded.duration_ms,
-          mode_name = excluded.mode_name,
-          model_key = excluded.model_key,
-          model_name = excluded.model_name,
-          language_model_key = excluded.language_model_key,
-          language_model_name = excluded.language_model_name,
-          recording_device = excluded.recording_device,
-          language = COALESCE(excluded.language, recording.language),
-          app_name = COALESCE(excluded.app_name, recording.app_name),
-          app_category = COALESCE(excluded.app_category, recording.app_category),
-          raw_word_count = excluded.raw_word_count,
-          llm_word_count = excluded.llm_word_count,
-          result = excluded.result,
-          llm_result = excluded.llm_result,
-          raw_result = excluded.raw_result,
-          has_audio = excluded.has_audio,
-          meta_path = excluded.meta_path,
-          audio_path = excluded.audio_path,
-          indexed_at = excluded.indexed_at
-      `);
-
-        let upserted = 0;
-        let updated = 0;
-        let latestDt = since ?? "";
+        const upsertStmt = archive.prepare(RECORDING_UPSERT_SQL);
         const existsStmt = archive.prepare(
           "SELECT folder_name FROM recording WHERE folder_name = ?",
         );
 
+        let upserted = 0;
+        let updated = 0;
+        let latestDt = since ?? "";
+
         const tx = archive.transaction(() => {
           for (const { row, meta } of upserts) {
-            const existedRaw: unknown = existsStmt.get(row.folderName);
-            const existed = existedRaw != null && ExistsRowSchema.safeParse(existedRaw).success;
-            upsertStmt.run({
-              $folder_name: row.folderName,
-              $recording_id_hex: row.recordingIdHex,
-              $datetime: row.datetime,
-              $duration_ms: row.durationMs,
-              $mode_name: row.modeName,
-              $model_key: row.modelKey,
-              $model_name: row.modelName,
-              $language_model_key: row.languageModelKey,
-              $language_model_name: row.languageModelName,
-              $recording_device: row.recordingDevice,
-              $language: meta.language,
-              $app_name: meta.appName,
-              $app_category: meta.appCategory,
-              $raw_word_count: row.rawWordCount,
-              $llm_word_count: row.llmWordCount,
-              $result: row.result,
-              $llm_result: row.llmResult,
-              $raw_result: row.rawResult,
-              $has_audio: meta.hasAudio ? 1 : 0,
-              $meta_path: meta.metaPath,
-              $audio_path: meta.audioPath,
-              $indexed_at: nowIso,
-            });
-            if (existed) updated++;
+            const outcome = applyRecordingUpsert(upsertStmt, existsStmt, row, meta, nowIso);
+            if (outcome.existed) updated++;
             else upserted++;
             if (row.datetime > latestDt) latestDt = row.datetime;
           }
@@ -306,7 +345,7 @@ function recordingsDir(sourceDir: string): string {
   return join(sourceDir, "recordings");
 }
 
-interface EmbedDirtyOpts {
+export interface EmbedDirtyOpts {
   model: string;
   host: string;
   fn?: (texts: string[]) => Promise<Float32Array[]>;
@@ -360,13 +399,15 @@ interface LongDirty {
  * versions). Fetch existing folder_names separately and check
  * membership in JS — slower in theory, correct in practice.
  */
-async function embedDirtyRows(archive: Database, opts: EmbedDirtyOpts): Promise<number> {
+export async function embedDirtyRows(archive: Database, opts: EmbedDirtyOpts): Promise<number> {
   const strategy = DEFAULT_CHUNK_STRATEGY;
   const currentStrategyJson = serializeChunkStrategy(strategy);
   const storedStrategy = getConfig(archive, "chunk_strategy");
   const strategyChanged = !!storedStrategy && storedStrategy !== currentStrategyJson;
   if (strategyChanged) {
-    info(`chunk_strategy changed (${storedStrategy} -> ${currentStrategyJson}); rechunking long rows`);
+    info(
+      `chunk_strategy changed (${storedStrategy} -> ${currentStrategyJson}); rechunking long rows`,
+    );
     // Up-front wipe. The AFTER DELETE trigger on `recording_chunk`
     // cleans up the FTS index. `recording_chunk_vec` has no FK and must
     // be wiped explicitly first.
@@ -697,7 +738,7 @@ function sha256(s: string): string {
  * shouldn't hold a write lock for it). We collect (folder_name, hash)
  * tuples first, then apply them in a single short transaction.
  */
-async function hashNewAudioFiles(archive: Database): Promise<void> {
+export async function hashNewAudioFiles(archive: Database): Promise<void> {
   const raw: unknown[] = archive
     .prepare(
       `SELECT folder_name, audio_path
@@ -738,7 +779,7 @@ async function hashNewAudioFiles(archive: Database): Promise<void> {
  * set `superseded_by = <canonical folder>` + `superseded_at = nowIso` on
  * the rest.
  */
-function refreshSupersedence(archive: Database, nowIso: string): number {
+export function refreshSupersedence(archive: Database, nowIso: string): number {
   const raw: unknown[] = archive
     .prepare(
       `SELECT folder_name, audio_hash, datetime

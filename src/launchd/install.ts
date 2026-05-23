@@ -1,68 +1,90 @@
+/**
+ * launchd install/uninstall helpers.
+ *
+ * Generic primitives:
+ *
+ *   - `installLaunchAgent({ label, plistXml })`
+ *   - `uninstallLaunchAgent({ label })`
+ *
+ * `enable-watcher` (Phase 4) uses these directly to install two
+ * plists (daemon + menubar) atomically.
+ *
+ * The label drives the plist path: every install lands at
+ * `~/Library/LaunchAgents/<label>.plist`. Uninstall is idempotent —
+ * removing a plist that isn't installed succeeds silently.
+ */
 import { existsSync } from "node:fs";
 import { mkdir, unlink, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
-import { userInfo } from "node:os";
-import { DEFAULTS } from "../paths.ts";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 import { run } from "../spawn.ts";
-import { PLIST_LABEL, renderPlist } from "./plist.ts";
 
-export interface InstallSyncOptions {
-  binPath: string;
-  logPath?: string;
-  intervalSeconds?: number;
+/* -------------------------------------------------------------------------- */
+/* Generic primitives                                                         */
+/* -------------------------------------------------------------------------- */
+
+export interface InstallLaunchAgentOptions {
+  label: string;
+  plistXml: string;
 }
 
-export async function installLaunchAgent(opts: InstallSyncOptions): Promise<string> {
-  const plistPath = DEFAULTS.launchPlist;
+/**
+ * Idempotently install a launch agent: write the plist file under
+ * `~/Library/LaunchAgents/`, then `launchctl bootstrap` it. Any
+ * existing agent under the same label is `bootout`-ed first so
+ * re-running the command picks up the new XML.
+ *
+ * Returns the absolute plist path on success; throws on failure.
+ */
+export async function installLaunchAgent(opts: InstallLaunchAgentOptions): Promise<string> {
+  const plistPath = plistPathForLabel(opts.label);
   await mkdir(dirname(plistPath), { recursive: true });
-  await mkdir(dirname(opts.logPath ?? DEFAULTS.logFile), { recursive: true });
+  await writeFile(plistPath, opts.plistXml, "utf8");
 
-  const xml = renderPlist({
-    binPath: opts.binPath,
-    user: userInfo().username,
-    logPath: opts.logPath ?? DEFAULTS.logFile,
-    intervalSeconds: opts.intervalSeconds,
-  });
-  await writeFile(plistPath, xml, "utf8");
-
-  // Make idempotent: bootout any existing instance first.
-  bootout();
+  bootoutLabel(opts.label);
 
   const r = run(["launchctl", "bootstrap", `gui/${currentUid()}`, plistPath], {
     timeoutMs: 10_000,
   });
   if (r.exitCode !== 0) {
-    throw new Error(`launchctl bootstrap failed: ${r.stderr}`);
+    throw new Error(`launchctl bootstrap ${opts.label} failed: ${r.stderr}`);
   }
   return plistPath;
 }
 
 /**
- * Returns true iff a plist was present on disk and got removed. Whether
- * the launchd service itself was actually running before the bootout is
- * deliberately not reported — `launchctl bootout`'s exit code isn't a
- * reliable signal across macOS versions (sometimes 0 with "no such
- * service", sometimes non-zero). The caller's UI message should
- * therefore phrase the absence-case as "was not installed" only when the
- * plist file was missing.
+ * Idempotently uninstall a launch agent by label. Returns true if a
+ * plist file was present (and is now removed); false if the plist
+ * was already absent.
+ *
+ * The launchd side of the world is best-effort: `launchctl bootout`'s
+ * exit code is not consistent across macOS versions for "no such
+ * service", so we always run it and ignore the result. The plist
+ * file is the source of truth.
  */
-export async function uninstallLaunchAgent(): Promise<boolean> {
-  const plistPath = DEFAULTS.launchPlist;
+export async function uninstallLaunchAgent(opts: { label: string }): Promise<boolean> {
+  const plistPath = plistPathForLabel(opts.label);
+  bootoutLabel(opts.label);
   if (!existsSync(plistPath)) return false;
-  bootout();
   await unlink(plistPath);
   return true;
 }
 
 /**
- * `launchctl bootout` the running instance, if any. The plist on disk is
- * not consulted — `launchctl` looks the service up by label. Exit code
- * is ignored: across macOS versions it's not consistent whether
- * "service wasn't loaded" is success or failure, and either way we
- * don't care for our purposes.
+ * Plist path for `<label>` under `~/Library/LaunchAgents/`. The
+ * `.plist` suffix is appended automatically — labels never include
+ * one.
  */
-function bootout(): void {
-  run(["launchctl", "bootout", `gui/${currentUid()}/${PLIST_LABEL}`], {
+export function plistPathForLabel(label: string): string {
+  return join(homedir(), "Library", "LaunchAgents", `${label}.plist`);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Internals                                                                  */
+/* -------------------------------------------------------------------------- */
+
+function bootoutLabel(label: string): void {
+  run(["launchctl", "bootout", `gui/${currentUid()}/${label}`], {
     timeoutMs: 5_000,
   });
 }

@@ -100,6 +100,32 @@ export function readSourceRecordings(
   }
 }
 
+/**
+ * Look up a single row by `folderName`, returning null if not found.
+ *
+ * Companion to `readSourceRecordings` for the targeted-ingest path in
+ * `runIndexFolder`. Bypassing the `WHERE r.datetime > ?` filter is
+ * required for rows whose datetime we've patched into the past — the
+ * bulk path's since-filter would silently drop them (§1.1 bug).
+ */
+export function readSourceRecordingByFolder(
+  path: string,
+  folderName: string,
+): SourceRecording | null {
+  if (!existsSync(path)) {
+    throw new Error(`source DB not found: ${path}`);
+  }
+  const db = new Database(path, { readonly: true });
+  try {
+    const sql = `${SELECT_ROWS} WHERE r.folderName = ? LIMIT 1`;
+    const raw: unknown = db.prepare(sql).get(folderName);
+    if (raw == null) return null;
+    return SourceRecordingSchema.parse(raw);
+  } finally {
+    db.close();
+  }
+}
+
 /** All folder names currently present in the source DB. */
 export function readSourceFolderNames(path: string): Set<string> {
   if (!existsSync(path)) return new Set();

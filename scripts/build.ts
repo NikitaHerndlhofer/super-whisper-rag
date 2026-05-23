@@ -43,6 +43,29 @@ async function main() {
   });
   if (fetch.exitCode !== 0) throw new Error("vendor fetch failed");
 
+  // The Swift helper is built locally (no npm package to fetch from).
+  // We always run the build script — it's idempotent and SPM's cache
+  // makes a no-source-change rebuild near-instant.
+  console.log("[build] building swift helper");
+  const helper = Bun.spawnSync({
+    cmd: ["bash", "scripts/build-swift-helper.sh"],
+    cwd: ROOT,
+    stdout: "inherit",
+    stderr: "inherit",
+  });
+  if (helper.exitCode !== 0) {
+    throw new Error(
+      "swift helper build failed. " +
+        "Run `bash scripts/build-swift-helper.sh` for the underlying error. " +
+        "If the swift toolchain is missing, install Command Line Tools via " +
+        "`xcode-select --install`.",
+    );
+  }
+  const helperPath = join(ROOT, "vendor", "swrag-helper-darwin-universal");
+  if (!existsSync(helperPath)) {
+    throw new Error(`swift helper missing after build: ${helperPath}`);
+  }
+
   if (existsSync(DIST)) rmSync(DIST, { recursive: true, force: true });
   mkdirSync(DIST, { recursive: true });
 
