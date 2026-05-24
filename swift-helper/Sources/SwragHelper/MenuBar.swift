@@ -91,7 +91,10 @@ private final class MenuBarController: NSObject {
   private var queueState: QueueStatePayload?
   private var queueItems: [QueueStatePayload.QueueItem] = []
   private var undoCountdownTimer: Timer?
-  private var menuRebuildTimer: Timer?
+  // 1 Hz timer that re-renders the menu while a recording is in
+  // progress. Without it, the "Recording M:SS" header freezes at the
+  // value of the first `status_changed` push (v0.9.2 fix).
+  private var recordingTickTimer: Timer?
 
   // Subscriber connection (long-lived). Per-op ops use one-shots.
   private var subscriber: DaemonConnection?
@@ -354,6 +357,45 @@ private final class MenuBarController: NSObject {
     return f.date(from: s)
   }
 
+  // MARK: - Recording elapsed-time timer (v0.9.2)
+
+  /// Reconcile `recordingTickTimer` against the current
+  /// `(disconnected, status.recording)` state. Called from
+  /// `rebuildMenu()` after every state mutation:
+  ///
+  ///   - Idle → recording: spin up a 1 Hz timer that drives
+  ///     `rebuildMenu()` so the "Recording M:SS" header tracks real
+  ///     time instead of freezing on the first push event.
+  ///   - Recording → idle (or disconnected, or shutdown): tear down
+  ///     the timer so we don't keep waking the run loop or holding a
+  ///     strong reference to self via the timer block.
+  ///   - Recording → still recording: no-op (we don't churn the
+  ///     timer; otherwise every tick would also re-create the
+  ///     timer the tick is currently driving).
+  ///
+  /// `Timer.invalidate()` is required to release the timer's retain
+  /// on its block; ARC alone doesn't break the cycle.
+  private func updateRecordingTickTimer() {
+    let needsTimer = !disconnected && (status?.recording ?? false)
+    if needsTimer {
+      if recordingTickTimer != nil { return }
+      let t = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+        guard let self = self else { return }
+        if self.disconnected || !(self.status?.recording ?? false) {
+          self.recordingTickTimer?.invalidate()
+          self.recordingTickTimer = nil
+          return
+        }
+        self.rebuildMenu()
+      }
+      RunLoop.main.add(t, forMode: .common)
+      recordingTickTimer = t
+    } else if recordingTickTimer != nil {
+      recordingTickTimer?.invalidate()
+      recordingTickTimer = nil
+    }
+  }
+
   // MARK: - Menu construction
 
   private func rebuildMenu() {
@@ -482,6 +524,10 @@ private final class MenuBarController: NSObject {
 
     statusItem.menu = menu
     updateIcon(state: iconStateFor())
+    // Drive the recording elapsed-time tick off the same state we
+    // just rendered. Idempotent — only re-creates the timer on
+    // recording-state transitions.
+    updateRecordingTickTimer()
   }
 
   // MARK: - Icon
@@ -592,7 +638,10 @@ private final class MenuBarController: NSObject {
   }
 
   private func formatElapsed(_ seconds: TimeInterval) -> String {
-    let s = Int(seconds)
+    let s = max(0, Int(seconds))
+    if s >= 3600 {
+      return String(format: "%d:%02d:%02d", s / 3600, (s / 60) % 60, s % 60)
+    }
     return String(format: "%02d:%02d", s / 60, s % 60)
   }
 }

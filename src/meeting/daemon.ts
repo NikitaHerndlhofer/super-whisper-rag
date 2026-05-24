@@ -79,6 +79,7 @@ import {
   notifyAutoStopped as defaultNotifyAutoStopped,
 } from "./popup.ts";
 import {
+  afinfoDurationMs,
   type RecordingHandle,
   type RecordDeps,
   startRecording as defaultStartRecording,
@@ -1050,16 +1051,43 @@ export class MeetingDaemon {
       }
       const ageMs = now - st.mtime.getTime();
       if (ageMs >= ORPHAN_RECOVERY_MIN_AGE_MS) {
-        // Recover: enqueue with captured_at = mtime.
+        // Recover: probe the wav for duration first. The processor's
+        // waitForCompletion SQL gate matches the SW recording row on
+        // `ABS(duration - ?) < 50` — passing NULL there evaluates to
+        // NULL → never matches → worker hangs forever. So we MUST
+        // populate duration_ms at enqueue time. A failed probe means
+        // the wav is corrupt / unreadable: quarantine it rather than
+        // enqueue an unprocessable row that would just block the
+        // queue on the next start.
+        let durationMs: number | null = null;
+        try {
+          durationMs = await afinfoDurationMs(full);
+        } catch (e) {
+          warn(`meeting daemon: afinfo threw for orphan ${full}: ${errMsg(e)}`);
+        }
+        if (durationMs == null) {
+          const target = join(this.quarantineDir, name);
+          try {
+            await rename(full, target);
+            warn(
+              `meeting daemon: quarantined corrupt orphan wav ${name} (afinfo failed; age=${Math.round(ageMs / 1000)}s)`,
+            );
+          } catch (e) {
+            warn(`meeting daemon: failed to quarantine corrupt orphan ${name}: ${errMsg(e)}`);
+          }
+          continue;
+        }
         const db2 = openArchive(this.opts.archive, {});
         try {
           queue.enqueue(db2, {
             audio_path: full,
             captured_at: st.mtime.toISOString(),
-            duration_ms: null,
+            duration_ms: durationMs,
             label: null,
           });
-          info(`meeting daemon: recovered orphan wav ${full} (age=${Math.round(ageMs / 1000)}s)`);
+          info(
+            `meeting daemon: recovered orphan wav ${full} (age=${Math.round(ageMs / 1000)}s, duration=${durationMs}ms)`,
+          );
         } catch (e) {
           warn(`meeting daemon: failed to enqueue orphan wav ${full}: ${errMsg(e)}`);
         } finally {

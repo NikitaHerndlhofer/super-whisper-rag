@@ -992,11 +992,66 @@ describe("daemon: queue_discard now deletes the row (v0.9.1)", () => {
   });
 });
 
+/**
+ * 44-byte RIFF/WAVE header + 6400 bytes of silence = a valid 200 ms
+ * mono 16 kHz 16-bit PCM wav that `afinfo` can probe (returns
+ * `estimated duration: 0.200 sec`). Same layout used by the recorder
+ * stub in `tests/meeting/record.test.ts` — we reproduce it here so
+ * the orphan-recovery tests exercise the real `afinfoDurationMs`
+ * path end-to-end without smuggling a fixture file into the repo.
+ */
+function writeValidWavAt(path: string): void {
+  const header = Buffer.from([
+    0x52, 0x49, 0x46, 0x46, 0x24, 0x19, 0x00, 0x00, 0x57, 0x41, 0x56, 0x45,
+    0x66, 0x6d, 0x74, 0x20, 0x10, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00,
+    0x80, 0x3e, 0x00, 0x00, 0x00, 0x7d, 0x00, 0x00, 0x02, 0x00, 0x10, 0x00,
+    0x64, 0x61, 0x74, 0x61, 0x00, 0x19, 0x00, 0x00,
+  ]);
+  const data = Buffer.alloc(6400);
+  writeFileSync(path, Buffer.concat([header, data]));
+}
+
 describe("daemon: orphan wav recovery on startup", () => {
-  test("wav older than 10 minutes gets auto-enqueued", async () => {
-    // Pre-create the incoming dir with a wav whose mtime is 30 min ago.
+  test("wav older than 10 minutes gets auto-enqueued with afinfo-probed duration_ms", async () => {
+    // Pre-create the incoming dir with a valid wav whose mtime is 30
+    // min ago. We use a real RIFF/WAVE blob so the daemon's
+    // `afinfoDurationMs` probe returns a real duration — this asserts
+    // the v0.9.2 fix end-to-end (no NULL duration_ms → no worker
+    // hang in waitForCompletion).
     const wav = join(incomingDir, "orphan.wav");
-    // Ensure dir exists.
+    rmSync(incomingDir, { recursive: true, force: true });
+    require("node:fs").mkdirSync(incomingDir, { recursive: true });
+    writeValidWavAt(wav);
+    const stale = (Date.now() - 30 * 60 * 1000) / 1000;
+    utimesSync(wav, stale, stale);
+
+    const daemon = new MeetingDaemon(
+      baseOptions({ deps: { spawnEventsHelper: silentEventsHandle } }),
+    );
+    await daemon.start();
+    try {
+      const list = await callSocket<{ items: queue.MeetingQueueRow[] }>({ op: "queue_list" });
+      expect(list.items.length).toBe(1);
+      const row = list.items[0];
+      expect(row?.audio_path).toBe(wav);
+      // The 200 ms test wav must surface as a non-null, plausible
+      // duration. We allow a generous tolerance because afinfo
+      // rounds the estimated duration to the millisecond.
+      expect(row?.duration_ms).not.toBeNull();
+      expect(typeof row?.duration_ms).toBe("number");
+      expect(row?.duration_ms ?? 0).toBeGreaterThanOrEqual(180);
+      expect(row?.duration_ms ?? 0).toBeLessThanOrEqual(220);
+    } finally {
+      await daemon.stop();
+    }
+  });
+
+  test("corrupt stale wav is quarantined, not enqueued (afinfo probe failure)", async () => {
+    // Stale (>10 min old) but with a garbage payload: afinfo will
+    // reject this, so the v0.9.2 recovery path must move it to
+    // quarantine rather than enqueue a row with NULL duration_ms
+    // (which would otherwise hang the worker forever).
+    const wav = join(incomingDir, "corrupt.wav");
     rmSync(incomingDir, { recursive: true, force: true });
     require("node:fs").mkdirSync(incomingDir, { recursive: true });
     writeFileSync(wav, Buffer.alloc(64));
@@ -1008,9 +1063,11 @@ describe("daemon: orphan wav recovery on startup", () => {
     );
     await daemon.start();
     try {
+      expect(existsSync(wav)).toBe(false);
+      const quarantined = join(quarantineDir, "corrupt.wav");
+      expect(existsSync(quarantined)).toBe(true);
       const list = await callSocket<{ items: queue.MeetingQueueRow[] }>({ op: "queue_list" });
-      expect(list.items.length).toBe(1);
-      expect(list.items[0]?.audio_path).toBe(wav);
+      expect(list.items.length).toBe(0);
     } finally {
       await daemon.stop();
     }
