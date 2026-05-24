@@ -335,7 +335,12 @@ private final class MenuBarController: NSObject {
     guard let until = isoDate(iso) else { return }
     let now = Date()
     if until <= now { return }
-    let t = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+    // Manual Timer + dual-mode registration (v0.9.4): same reasoning as the
+    // recording-tick timer. The "Undo auto-stop (Ns)" banner is rendered inside
+    // the menu, so without `.eventTracking` the countdown freezes while the
+    // user is hovering it — exactly the case where they're deciding whether
+    // to undo.
+    let t = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
       guard let self = self else { return }
       if Date() >= until {
         self.undoCountdownTimer?.invalidate()
@@ -346,6 +351,7 @@ private final class MenuBarController: NSObject {
       }
     }
     RunLoop.main.add(t, forMode: .common)
+    RunLoop.main.add(t, forMode: .eventTracking)
     undoCountdownTimer = t
   }
 
@@ -379,7 +385,12 @@ private final class MenuBarController: NSObject {
     let needsTimer = !disconnected && (status?.recording ?? false)
     if needsTimer {
       if recordingTickTimer != nil { return }
-      let t = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+      // Manual Timer + dual-mode registration (v0.9.4): `.common` keeps the
+      // tick alive in `.default`/modal-panel modes; `.eventTracking` keeps it
+      // alive while the user has the NSMenu open (NSMenu tracking is NOT a
+      // member of `.common`, so a scheduledTimer freezes the visible
+      // "Recording M:SS" header until the menu is dismissed).
+      let t = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
         guard let self = self else { return }
         if self.disconnected || !(self.status?.recording ?? false) {
           self.recordingTickTimer?.invalidate()
@@ -389,6 +400,7 @@ private final class MenuBarController: NSObject {
         self.rebuildMenu()
       }
       RunLoop.main.add(t, forMode: .common)
+      RunLoop.main.add(t, forMode: .eventTracking)
       recordingTickTimer = t
     } else if recordingTickTimer != nil {
       recordingTickTimer?.invalidate()
