@@ -366,6 +366,17 @@ function materialiseHelper(embedded: string): MaterialisedHelper {
     // every common filesystem). Two concurrent extractors will
     // race here — the loser's rename will throw EEXIST or ENOTEMPTY
     // and we fall through to the existsSync recheck.
+    //
+    // v0.9.5: if rename trips ENOTEMPTY/EEXIST we retry once after
+    // another rmSync. We've seen the race surface on first-kickstart
+    // after `brew upgrade` (v0.9.2 + v0.9.4) when both the
+    // meeting-watch and meeting-menubar launchd jobs materialise the
+    // helper concurrently: process A finishes its rename in the
+    // window between B's rmSync and B's rename, and B's rename then
+    // sees A's freshly-landed bundle. A single retry resolves this
+    // 99% of the time — same content in both staged trees, so the
+    // second rename either succeeds (B wins after re-clean) or fails
+    // again and falls through to the existsSync(innerBin) handoff.
     try {
       rmSync(appPath, { recursive: true, force: true });
     } catch {
@@ -374,12 +385,25 @@ function materialiseHelper(embedded: string): MaterialisedHelper {
     try {
       renameSync(stagedApp, appPath);
     } catch (e) {
-      if (!existsSync(innerBin)) {
+      const msg = e instanceof Error ? e.message : String(e);
+      const isRaceErr = /ENOTEMPTY|EEXIST/.test(msg);
+      let recovered = false;
+      if (isRaceErr) {
+        try {
+          rmSync(appPath, { recursive: true, force: true });
+          renameSync(stagedApp, appPath);
+          recovered = true;
+        } catch {
+          // fall through
+        }
+      }
+      if (!recovered && !existsSync(innerBin)) {
         throw new Error(
-          `swrag-helper: bundle materialisation failed: ${e instanceof Error ? e.message : String(e)}`,
+          `swrag-helper: bundle materialisation failed: ${msg}`,
         );
       }
-      // Lost the race — the parallel extractor finished first.
+      // Either we recovered on retry, or another extractor finished
+      // first and left a usable innerBin in place.
     }
     // Drop the size marker last so a half-finished extract isn't
     // mistakenly reused on the next call.

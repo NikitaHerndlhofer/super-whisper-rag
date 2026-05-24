@@ -95,6 +95,15 @@ private final class MenuBarController: NSObject {
   // progress. Without it, the "Recording M:SS" header freezes at the
   // value of the first `status_changed` push (v0.9.2 fix).
   private var recordingTickTimer: Timer?
+  // Live references to the two header items whose titles tick on a
+  // timer. v0.9.5: we mutate the title on the currently-tracking
+  // item + call `NSMenu.update()` instead of calling `rebuildMenu()`,
+  // because reassigning `statusItem.menu` doesn't refresh the
+  // already-tracking menu (NSMenu snapshots its layout when it
+  // opens). The refs are reset on every `rebuildMenu()`; the timer
+  // callbacks no-op when the ref is nil (state transitioned away).
+  private weak var recordingHeaderItem: NSMenuItem?
+  private weak var undoBannerItem: NSMenuItem?
 
   // Subscriber connection (long-lived). Per-op ops use one-shots.
   private var subscriber: DaemonConnection?
@@ -339,15 +348,18 @@ private final class MenuBarController: NSObject {
     // recording-tick timer. The "Undo auto-stop (Ns)" banner is rendered inside
     // the menu, so without `.eventTracking` the countdown freezes while the
     // user is hovering it — exactly the case where they're deciding whether
-    // to undo.
+    // to undo. v0.9.5: on tick we mutate the banner item's title in-place +
+    // call `menu.update()` rather than `rebuildMenu()` — see
+    // `tickRecordingElapsed()` for the underlying NSMenu-layout-cache reason.
     let t = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
       guard let self = self else { return }
       if Date() >= until {
         self.undoCountdownTimer?.invalidate()
         self.undoCountdownTimer = nil
+        // Window expired — full rebuild removes the banner.
         self.rebuildMenu()
       } else {
-        self.rebuildMenu()
+        self.tickUndoCountdown(until: until)
       }
     }
     RunLoop.main.add(t, forMode: .common)
@@ -370,11 +382,15 @@ private final class MenuBarController: NSObject {
   /// `rebuildMenu()` after every state mutation:
   ///
   ///   - Idle → recording: spin up a 1 Hz timer that drives
-  ///     `rebuildMenu()` so the "Recording M:SS" header tracks real
-  ///     time instead of freezing on the first push event.
+  ///     `tickRecordingElapsed()` so the "Recording M:SS" header
+  ///     tracks real time instead of freezing on the first push event
+  ///     (v0.9.2 base fix; v0.9.5 changed it from `rebuildMenu()` to
+  ///     an in-place title update so the visible counter ticks even
+  ///     while the menu is open — see `tickRecordingElapsed`).
   ///   - Recording → idle (or disconnected, or shutdown): tear down
   ///     the timer so we don't keep waking the run loop or holding a
-  ///     strong reference to self via the timer block.
+  ///     strong reference to self via the timer block, and call
+  ///     `rebuildMenu()` once to swap the menu shape.
   ///   - Recording → still recording: no-op (we don't churn the
   ///     timer; otherwise every tick would also re-create the
   ///     timer the tick is currently driving).
@@ -395,9 +411,12 @@ private final class MenuBarController: NSObject {
         if self.disconnected || !(self.status?.recording ?? false) {
           self.recordingTickTimer?.invalidate()
           self.recordingTickTimer = nil
+          // State transitioned out of recording — full rebuild swaps
+          // the menu to the non-recording shape.
+          self.rebuildMenu()
           return
         }
-        self.rebuildMenu()
+        self.tickRecordingElapsed()
       }
       RunLoop.main.add(t, forMode: .common)
       RunLoop.main.add(t, forMode: .eventTracking)
@@ -406,6 +425,46 @@ private final class MenuBarController: NSObject {
       recordingTickTimer?.invalidate()
       recordingTickTimer = nil
     }
+  }
+
+  /// v0.9.5: in-place title update on the currently-tracking menu item
+  /// instead of `rebuildMenu()`.
+  ///
+  /// `rebuildMenu()` constructs a brand-new `NSMenu` and assigns it to
+  /// `statusItem.menu`, but that doesn't refresh the menu the user is
+  /// currently looking at — NSMenu snapshots its layout when it opens
+  /// and the reassignment only takes effect on the *next* open. The
+  /// dual-mode timer registration from v0.9.4 made the tick fire, but
+  /// the visible header still froze because we were mutating an
+  /// off-screen menu.
+  ///
+  /// The fix: keep a weak ref to the recording header item created in
+  /// the last `rebuildMenu()`, mutate its `title` directly, then call
+  /// `menu.update()` to force NSMenu to re-validate its items and
+  /// redraw the changed title in the currently-tracking layout.
+  ///
+  /// `NSMenuItem.menu` is the (weak) backref to the enclosing NSMenu;
+  /// if `rebuildMenu()` has run since the item was created, the item
+  /// is detached and `menu` is nil → no-op until the next rebuild
+  /// re-establishes a ref.
+  private func tickRecordingElapsed() {
+    guard let status = status, status.recording else { return }
+    guard let item = recordingHeaderItem else { return }
+    let since = status.since.flatMap(isoDate)
+    let elapsed = since.map { Date().timeIntervalSince($0) } ?? 0
+    item.title = String(format: "Recording %@", formatElapsed(elapsed))
+    item.menu?.update()
+  }
+
+  /// See `tickRecordingElapsed()` — identical reasoning for the
+  /// "Undo auto-stop (Ns)" banner whose seconds-remaining counter
+  /// also froze inside an open menu.
+  private func tickUndoCountdown(until: Date) {
+    guard let item = undoBannerItem else { return }
+    let remaining = max(0, Int(until.timeIntervalSinceNow.rounded(.up)))
+    if remaining <= 0 { return }
+    item.title = "Undo auto-stop (\(remaining)s)"
+    item.menu?.update()
   }
 
   // MARK: - Menu construction
@@ -425,7 +484,9 @@ private final class MenuBarController: NSObject {
     }
 
     // Recording header (orthogonal overlay per the spec — visible
-    // independently of the queue state).
+    // independently of the queue state). v0.9.5: stash the header ref
+    // so the tick timer can mutate its title in-place + force a
+    // redraw via `NSMenu.update()`.
     if let status = status, status.recording {
       let since = status.since.flatMap(isoDate)
       let elapsed = since.map { Date().timeIntervalSince($0) } ?? 0
@@ -436,20 +497,25 @@ private final class MenuBarController: NSObject {
       )
       header.isEnabled = false
       menu.addItem(header)
+      recordingHeaderItem = header
       menu.addItem(makeItem(title: "Stop & save", action: #selector(stopAndSave)))
       menu.addItem(makeItem(title: "Stop & discard", action: #selector(stopAndDiscard)))
       menu.addItem(.separator())
     } else {
+      recordingHeaderItem = nil
       menu.addItem(makeItem(title: "Start recording…", action: #selector(startRecording)))
       menu.addItem(.separator())
     }
 
-    // Undo window banner (transient).
+    // Undo window banner (transient). Same v0.9.5 pattern: stash the
+    // banner ref so the countdown timer can update the title in-place.
+    undoBannerItem = nil
     if let status = status, let untilIso = status.undoWindowUntil, let until = isoDate(untilIso) {
       let remaining = max(0, Int(until.timeIntervalSinceNow.rounded(.up)))
       if remaining > 0 {
         let item = makeItem(title: "Undo auto-stop (\(remaining)s)", action: #selector(undoLast))
         menu.addItem(item)
+        undoBannerItem = item
         menu.addItem(.separator())
       }
     }
