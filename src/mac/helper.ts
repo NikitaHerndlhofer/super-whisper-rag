@@ -53,8 +53,9 @@ export const PermissionsSchema = z.object({
   microphone: z.enum(["granted", "denied", "not_determined"]),
   screen_recording: z.enum(["granted", "denied", "not_determined"]),
   // Per-bundle-id automation status. Keys are arbitrary strings (we
-  // care about the six well-known browsers, but parsing is intentionally
-  // permissive so a future Swift-side addition doesn't break TS first).
+  // care about the seven well-known browsers — Safari, Chrome, Brave,
+  // Arc, Vivaldi, Edge, Comet — but parsing is intentionally permissive
+  // so a future Swift-side addition doesn't break TS first).
   automation: z.record(z.string(), PermissionStateSchema),
 });
 export type Permissions = z.infer<typeof PermissionsSchema>;

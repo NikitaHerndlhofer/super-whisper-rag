@@ -51,7 +51,7 @@ describe.skipIf(!HELPER_PRESENT)("mac/helper one-shots", () => {
     // microphone / screen_recording are tri-state enums.
     expect(["granted", "denied", "not_determined"]).toContain(result.microphone);
     expect(["granted", "denied", "not_determined"]).toContain(result.screen_recording);
-    // automation should contain entries for the six well-known browsers.
+    // automation should contain entries for the seven well-known browsers.
     const expectedBrowsers = [
       "com.apple.Safari",
       "com.google.Chrome",
@@ -59,6 +59,7 @@ describe.skipIf(!HELPER_PRESENT)("mac/helper one-shots", () => {
       "company.thebrowser.Browser",
       "com.vivaldi.Vivaldi",
       "com.microsoft.edgemac",
+      "ai.perplexity.comet",
     ];
     for (const b of expectedBrowsers) {
       const state = result.automation[b];

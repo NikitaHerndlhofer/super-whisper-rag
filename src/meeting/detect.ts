@@ -53,6 +53,7 @@ export const BROWSERS: ReadonlySet<string> = new Set([
   "company.thebrowser.Browser",
   "com.vivaldi.Vivaldi",
   "com.microsoft.edgemac",
+  "ai.perplexity.comet",
 ]);
 
 /**

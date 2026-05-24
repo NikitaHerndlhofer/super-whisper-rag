@@ -10,10 +10,12 @@
  *
  * Each known browser has its own AppleScript dialect:
  *   - Safari:    `URL of current tab of front window`
- *   - Chromium-family (Chrome, Brave, Vivaldi, Edge):
+ *   - Chromium-family (Chrome, Brave, Vivaldi, Edge, Comet):
  *                `URL of active tab of front window`
  *   - Arc:       `URL of active tab of front window` (same as Chromium-family;
  *                Arc inherits The Browser Company's WebKit-Chromium shape).
+ *   - Comet:     `URL of active tab of front window` (Perplexity's Chromium
+ *                fork; verified to accept the Chrome dialect verbatim).
  *
  * Failure modes (all return null — this is a soft signal):
  *   - bundleId not in our table
@@ -61,6 +63,10 @@ export const BROWSER_OSASCRIPT_DIALECTS = {
   "com.microsoft.edgemac": {
     appName: "Microsoft Edge",
     script: 'tell application "Microsoft Edge" to return URL of active tab of front window',
+  },
+  "ai.perplexity.comet": {
+    appName: "Comet",
+    script: 'tell application "Comet" to return URL of active tab of front window',
   },
 } as const;
 

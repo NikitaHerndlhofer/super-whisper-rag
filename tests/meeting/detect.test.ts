@@ -17,6 +17,7 @@
 import { describe, expect, test } from "bun:test";
 import type { EventLine } from "../../src/mac/helper.ts";
 import {
+  BROWSERS,
   MeetingDetector,
   MEETING_URL_PATTERNS,
   type MeetingEdge,
@@ -240,6 +241,37 @@ describe("computeSignal — confidence rules", () => {
       browserUrl: "https://meet.google.com/about",
     });
     expect(sig.confidence).toBe("MEDIUM");
+  });
+
+  test("HIGH: mic + Comet (Perplexity's Chromium browser) frontmost on a real meeting URL", () => {
+    // Regression for v0.7.0: Comet wasn't in BROWSERS, so a Meet room
+    // opened in Comet stayed at MEDIUM (mic-only) and the popup never
+    // fired. Comet uses the same Chromium AppleScript dialect as Chrome.
+    const sig = computeSignal({
+      frontmostBundleId: "ai.perplexity.comet",
+      micInUse: true,
+      runningCallAppsStrict: [],
+      runningCallAppsSoft: [],
+      browserUrl: "https://meet.google.com/abc-defg-hij",
+    });
+    expect(sig.confidence).toBe("HIGH");
+  });
+
+  test("MEDIUM: mic + Comet frontmost on a NON-meeting URL", () => {
+    const sig = computeSignal({
+      frontmostBundleId: "ai.perplexity.comet",
+      micInUse: true,
+      runningCallAppsStrict: [],
+      runningCallAppsSoft: [],
+      browserUrl: "https://example.com/",
+    });
+    expect(sig.confidence).toBe("MEDIUM");
+  });
+});
+
+describe("BROWSERS set", () => {
+  test("includes Perplexity Comet (ai.perplexity.comet)", () => {
+    expect(BROWSERS.has("ai.perplexity.comet")).toBe(true);
   });
 });
 

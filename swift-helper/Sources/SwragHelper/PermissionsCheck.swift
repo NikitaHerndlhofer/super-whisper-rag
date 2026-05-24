@@ -12,6 +12,7 @@ let SUPPORTED_BROWSER_BUNDLE_IDS: [String] = [
   "company.thebrowser.Browser",
   "com.vivaldi.Vivaldi",
   "com.microsoft.edgemac",
+  "ai.perplexity.comet",
 ]
 
 // Display names used by NSAppleScript `tell application "X"`. Maps from
@@ -24,6 +25,7 @@ let BROWSER_APP_NAMES: [String: String] = [
   "company.thebrowser.Browser": "Arc",
   "com.vivaldi.Vivaldi": "Vivaldi",
   "com.microsoft.edgemac": "Microsoft Edge",
+  "ai.perplexity.comet": "Comet",
 ]
 
 struct PermissionsPayload: Codable {

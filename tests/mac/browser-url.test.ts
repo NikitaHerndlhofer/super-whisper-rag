@@ -82,9 +82,10 @@ function makeThrowingSpawn(err: Error) {
 /* -------------------------------------------------------------------------- */
 
 describe("BROWSER_OSASCRIPT_DIALECTS dispatch table", () => {
-  test("contains the six well-known browser bundle IDs", () => {
+  test("contains the seven well-known browser bundle IDs", () => {
     expect(Object.keys(BROWSER_OSASCRIPT_DIALECTS).sort()).toEqual(
       [
+        "ai.perplexity.comet",
         "com.apple.Safari",
         "com.brave.Browser",
         "com.google.Chrome",
@@ -100,13 +101,14 @@ describe("BROWSER_OSASCRIPT_DIALECTS dispatch table", () => {
     expect(BROWSER_OSASCRIPT_DIALECTS["com.apple.Safari"].appName).toBe("Safari");
   });
 
-  test("Chromium-family browsers use `active tab` (Chrome / Brave / Vivaldi / Edge / Arc)", () => {
+  test("Chromium-family browsers use `active tab` (Chrome / Brave / Vivaldi / Edge / Arc / Comet)", () => {
     for (const bid of [
       "com.google.Chrome",
       "com.brave.Browser",
       "com.vivaldi.Vivaldi",
       "com.microsoft.edgemac",
       "company.thebrowser.Browser",
+      "ai.perplexity.comet",
     ] as const) {
       expect(BROWSER_OSASCRIPT_DIALECTS[bid].script).toContain("active tab");
     }
@@ -120,6 +122,7 @@ describe("BROWSER_OSASCRIPT_DIALECTS dispatch table", () => {
       "company.thebrowser.Browser": "Arc",
       "com.vivaldi.Vivaldi": "Vivaldi",
       "com.microsoft.edgemac": "Microsoft Edge",
+      "ai.perplexity.comet": "Comet",
     };
     for (const [bid, expectedName] of Object.entries(expectedNames)) {
       const dialect = BROWSER_OSASCRIPT_DIALECTS[bid as keyof typeof BROWSER_OSASCRIPT_DIALECTS];
@@ -133,7 +136,7 @@ describe("BROWSER_OSASCRIPT_DIALECTS dispatch table", () => {
 });
 
 describe("isKnownBrowser", () => {
-  test("recognises all six dispatch-table keys", () => {
+  test("recognises all seven dispatch-table keys", () => {
     for (const bid of Object.keys(BROWSER_OSASCRIPT_DIALECTS)) {
       expect(isKnownBrowser(bid)).toBe(true);
     }
@@ -172,6 +175,23 @@ describe("getBrowserUrl", () => {
     expect(calls[0]?.cmd[2]).toContain("current tab");
     // Sanity: should NOT contain `active tab` (Chromium dialect).
     expect(calls[0]?.cmd[2]).not.toContain("active tab");
+  });
+
+  test("Comet (ai.perplexity.comet) dispatches through the Chrome-style `active tab` osascript", async () => {
+    const { spawn, calls } = makeSpawnMock({
+      stdout: "https://meet.google.com/abc-defg-hij\n",
+      exitCode: 0,
+    });
+    const url = await getBrowserUrl("ai.perplexity.comet", { spawn });
+    expect(url).toBe("https://meet.google.com/abc-defg-hij");
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.cmd[0]).toBe("osascript");
+    expect(calls[0]?.cmd[1]).toBe("-e");
+    // The dispatch routed Comet to the Chromium-family `active tab`
+    // script targeting `tell application "Comet"`.
+    expect(calls[0]?.cmd[2]).toContain('tell application "Comet"');
+    expect(calls[0]?.cmd[2]).toContain("active tab");
+    expect(calls[0]?.cmd[2]).not.toContain("current tab");
   });
 
   test("returns null without invoking spawn when bundle is unknown", async () => {

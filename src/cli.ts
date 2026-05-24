@@ -3,7 +3,7 @@ import { existsSync, realpathSync, statSync } from "node:fs";
 import { resolve as resolvePath } from "node:path";
 import { VERSION } from "./config.ts";
 import { getEnv } from "./env.ts";
-import { error, info } from "./log.ts";
+import { error, info, warn } from "./log.ts";
 import { resolvePaths, type ResolvedPaths } from "./paths.ts";
 import type { Env } from "./schemas.ts";
 import { runBootstrap } from "./commands/bootstrap.ts";
@@ -26,6 +26,18 @@ import {
 import { runDaemonForeground } from "./meeting/daemon.ts";
 import { callDaemon, DaemonUnavailableError, isDaemonRunning } from "./meeting/daemon-client.ts";
 import { helperBinaryPath, getPermissions, spawnEventsHelper } from "./mac/helper.ts";
+import {
+  cmdExport as meetingConfigExport,
+  cmdGet as meetingConfigGet,
+  cmdImport as meetingConfigImport,
+  cmdListOp as meetingConfigListOp,
+  cmdReset as meetingConfigReset,
+  cmdScheduleAdd as meetingConfigScheduleAdd,
+  cmdScheduleClear as meetingConfigScheduleClear,
+  cmdScheduleEnable as meetingConfigScheduleEnable,
+  cmdSet as meetingConfigSet,
+  formatConfig as meetingConfigFormat,
+} from "./commands/meeting-config.ts";
 
 // The CLI surface is intentionally tiny — zero flags. Everything that used
 // to be a flag is an env var, parsed and validated through `getEnv()`.
@@ -1019,6 +1031,318 @@ const meetingDisableWatcherCmd = defineCommand({
   },
 });
 
+/* -------------------------------------------------------------------------- */
+/* meeting config — popup trigger configuration (v0.8.0)                      */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Fire `{op:"config_reload"}` on the daemon socket so the running
+ * watcher picks up the change in-process. If the daemon isn't
+ * running, the change is still persisted (every CLI mutation writes
+ * through the DB) — we just emit a note so the user knows the
+ * reload is deferred.
+ *
+ * Wrapped so a daemon-side error becomes a CLI warning rather than
+ * a hard failure: the persisted write succeeded, and the next
+ * daemon restart will pick it up.
+ */
+async function reloadDaemonConfig(): Promise<void> {
+  if (!(await isDaemonRunning())) {
+    info("(daemon not running — change persisted; will load on next start)");
+    return;
+  }
+  try {
+    const r = await callDaemon<{ ok?: true; error?: string }>({ op: "config_reload" });
+    if (r.error) {
+      warn(`config_reload returned error: ${r.error}`);
+    }
+  } catch (e) {
+    if (e instanceof DaemonUnavailableError) {
+      info("(daemon went away between probe and reload — change persisted)");
+      return;
+    }
+    warn(`config_reload failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
+const meetingConfigGetCmd = defineCommand({
+  meta: { name: "get", description: "Print the meeting popup config as JSON." },
+  args: {},
+  run() {
+    const c = meetingConfigGet(ctx().paths.archive);
+    process.stdout.write(meetingConfigFormat(c));
+  },
+});
+
+const meetingConfigSetCmd = defineCommand({
+  meta: {
+    name: "set",
+    description:
+      "Set a config value by dotted path (e.g. `set threshold MEDIUM`, `set schedule.enabled true`). Arrays are replaced wholesale; pass `[]` to clear.",
+  },
+  args: {
+    path: { type: "positional", required: true, description: "Dotted path (e.g. threshold, schedule.enabled)" },
+    value: { type: "positional", required: true, description: "New value (true/false → bool, integer → number, else string)" },
+  },
+  async run({ args }) {
+    const dottedPath = asString(args.path);
+    const value = asString(args.value);
+    if (!dottedPath) {
+      error("missing required positional: path");
+      process.exit(2);
+    }
+    if (value == null) {
+      error("missing required positional: value");
+      process.exit(2);
+    }
+    try {
+      const c = meetingConfigSet(ctx().paths.archive, dottedPath, value);
+      process.stdout.write(meetingConfigFormat(c));
+    } catch (e) {
+      error(e instanceof Error ? e.message : String(e));
+      process.exit(1);
+    }
+    await reloadDaemonConfig();
+  },
+});
+
+const meetingConfigResetCmd = defineCommand({
+  meta: { name: "reset", description: "Reset the meeting popup config to defaults." },
+  args: {},
+  async run() {
+    const c = meetingConfigReset(ctx().paths.archive);
+    process.stdout.write(meetingConfigFormat(c));
+    await reloadDaemonConfig();
+  },
+});
+
+/**
+ * Tiny factory for the eight list-op subcommands. Each takes one
+ * positional and threads through to `cmdListOp`. We keep them as
+ * separate citty commands (rather than one with a `kind` flag) so
+ * `swrag meeting config --help` lists the user-visible verbs.
+ */
+function listOpCmd(opts: {
+  name: string;
+  description: string;
+  argLabel: string;
+  kind:
+    | "allow-app"
+    | "unallow-app"
+    | "block-app"
+    | "unblock-app"
+    | "allow-url"
+    | "unallow-url"
+    | "block-url"
+    | "unblock-url";
+}) {
+  return defineCommand({
+    meta: { name: opts.name, description: opts.description },
+    args: {
+      value: { type: "positional", required: true, description: opts.argLabel },
+    },
+    async run({ args }) {
+      const value = asString(args.value);
+      if (!value) {
+        error(`missing required positional: ${opts.argLabel}`);
+        process.exit(2);
+      }
+      try {
+        const c = meetingConfigListOp(ctx().paths.archive, opts.kind, value);
+        process.stdout.write(meetingConfigFormat(c));
+      } catch (e) {
+        error(e instanceof Error ? e.message : String(e));
+        process.exit(1);
+      }
+      await reloadDaemonConfig();
+    },
+  });
+}
+
+const meetingConfigAllowAppCmd = listOpCmd({
+  name: "allow-app",
+  description: "Add a bundle id to allowlist.bundle_ids (always-fire). Idempotent.",
+  argLabel: "bundle_id",
+  kind: "allow-app",
+});
+const meetingConfigUnallowAppCmd = listOpCmd({
+  name: "unallow-app",
+  description: "Remove a bundle id from allowlist.bundle_ids.",
+  argLabel: "bundle_id",
+  kind: "unallow-app",
+});
+const meetingConfigBlockAppCmd = listOpCmd({
+  name: "block-app",
+  description: "Add a bundle id to blocklist.bundle_ids (suppress popup).",
+  argLabel: "bundle_id",
+  kind: "block-app",
+});
+const meetingConfigUnblockAppCmd = listOpCmd({
+  name: "unblock-app",
+  description: "Remove a bundle id from blocklist.bundle_ids.",
+  argLabel: "bundle_id",
+  kind: "unblock-app",
+});
+const meetingConfigAllowUrlCmd = listOpCmd({
+  name: "allow-url",
+  description: "Add a regex to allowlist.url_patterns (always-fire on browser URL match).",
+  argLabel: "regex",
+  kind: "allow-url",
+});
+const meetingConfigUnallowUrlCmd = listOpCmd({
+  name: "unallow-url",
+  description: "Remove a regex from allowlist.url_patterns.",
+  argLabel: "regex",
+  kind: "unallow-url",
+});
+const meetingConfigBlockUrlCmd = listOpCmd({
+  name: "block-url",
+  description: "Add a regex to blocklist.url_patterns (suppress popup on browser URL match).",
+  argLabel: "regex",
+  kind: "block-url",
+});
+const meetingConfigUnblockUrlCmd = listOpCmd({
+  name: "unblock-url",
+  description: "Remove a regex from blocklist.url_patterns.",
+  argLabel: "regex",
+  kind: "unblock-url",
+});
+
+const meetingConfigScheduleAddCmd = defineCommand({
+  meta: {
+    name: "add",
+    description:
+      'Append a schedule window. Examples: `add mon-fri 09:00-18:00`, `add sat,sun 10:00-14:00`. Does not enable the schedule.',
+  },
+  args: {
+    days: { type: "positional", required: true, description: "Day spec: mon | mon-fri | mon,wed,fri" },
+    time: { type: "positional", required: true, description: "Time range: HH:MM-HH:MM" },
+  },
+  async run({ args }) {
+    const days = asString(args.days);
+    const time = asString(args.time);
+    if (!days || !time) {
+      error("missing required positional(s): days and time");
+      process.exit(2);
+    }
+    try {
+      const c = meetingConfigScheduleAdd(ctx().paths.archive, days, time);
+      process.stdout.write(meetingConfigFormat(c));
+    } catch (e) {
+      error(e instanceof Error ? e.message : String(e));
+      process.exit(1);
+    }
+    await reloadDaemonConfig();
+  },
+});
+
+const meetingConfigScheduleClearCmd = defineCommand({
+  meta: { name: "clear", description: "Remove every window from schedule.windows." },
+  args: {},
+  async run() {
+    const c = meetingConfigScheduleClear(ctx().paths.archive);
+    process.stdout.write(meetingConfigFormat(c));
+    await reloadDaemonConfig();
+  },
+});
+
+const meetingConfigScheduleEnableCmd = defineCommand({
+  meta: { name: "enable", description: "Set schedule.enabled = true." },
+  args: {},
+  async run() {
+    const c = meetingConfigScheduleEnable(ctx().paths.archive, true);
+    process.stdout.write(meetingConfigFormat(c));
+    await reloadDaemonConfig();
+  },
+});
+
+const meetingConfigScheduleDisableCmd = defineCommand({
+  meta: { name: "disable", description: "Set schedule.enabled = false." },
+  args: {},
+  async run() {
+    const c = meetingConfigScheduleEnable(ctx().paths.archive, false);
+    process.stdout.write(meetingConfigFormat(c));
+    await reloadDaemonConfig();
+  },
+});
+
+const meetingConfigScheduleCmd = defineCommand({
+  meta: { name: "schedule", description: "Manage schedule windows (add | clear | enable | disable)." },
+  subCommands: {
+    add: meetingConfigScheduleAddCmd,
+    clear: meetingConfigScheduleClearCmd,
+    enable: meetingConfigScheduleEnableCmd,
+    disable: meetingConfigScheduleDisableCmd,
+  },
+});
+
+const meetingConfigExportCmd = defineCommand({
+  meta: { name: "export", description: "Write the current config to a JSON file." },
+  args: {
+    path: { type: "positional", required: true, description: "Output file path" },
+  },
+  run({ args }) {
+    const path = asString(args.path);
+    if (!path) {
+      error("missing required positional: path");
+      process.exit(2);
+    }
+    const out = resolvePath(path);
+    const r = meetingConfigExport(ctx().paths.archive, out);
+    info(`exported config → ${r.path}`);
+  },
+});
+
+const meetingConfigImportCmd = defineCommand({
+  meta: {
+    name: "import",
+    description: "Load and validate a JSON config from disk, replacing the current one.",
+  },
+  args: {
+    path: { type: "positional", required: true, description: "Input file path" },
+  },
+  async run({ args }) {
+    const path = asString(args.path);
+    if (!path) {
+      error("missing required positional: path");
+      process.exit(2);
+    }
+    const inp = resolvePath(path);
+    try {
+      const c = meetingConfigImport(ctx().paths.archive, inp);
+      process.stdout.write(meetingConfigFormat(c));
+    } catch (e) {
+      error(e instanceof Error ? e.message : String(e));
+      process.exit(1);
+    }
+    await reloadDaemonConfig();
+  },
+});
+
+const meetingConfigCmd = defineCommand({
+  meta: {
+    name: "config",
+    description:
+      "Configure the meeting popup triggers (threshold, schedule, allow/block lists). Every successful write fires config_reload on the daemon.",
+  },
+  subCommands: {
+    get: meetingConfigGetCmd,
+    set: meetingConfigSetCmd,
+    reset: meetingConfigResetCmd,
+    "allow-app": meetingConfigAllowAppCmd,
+    "unallow-app": meetingConfigUnallowAppCmd,
+    "block-app": meetingConfigBlockAppCmd,
+    "unblock-app": meetingConfigUnblockAppCmd,
+    "allow-url": meetingConfigAllowUrlCmd,
+    "unallow-url": meetingConfigUnallowUrlCmd,
+    "block-url": meetingConfigBlockUrlCmd,
+    "unblock-url": meetingConfigUnblockUrlCmd,
+    schedule: meetingConfigScheduleCmd,
+    export: meetingConfigExportCmd,
+    import: meetingConfigImportCmd,
+  },
+});
+
 const meetingCmd = defineCommand({
   meta: { name: "meeting", description: "Meeting capture pipeline commands" },
   subCommands: {
@@ -1026,6 +1350,7 @@ const meetingCmd = defineCommand({
     status: meetingStatusCmd,
     "permissions-check": meetingPermissionsCmd,
     record: meetingRecordGroupCmd,
+    config: meetingConfigCmd,
     watch: meetingWatchCmd,
     menubar: meetingMenubarCmd,
     "enable-watcher": meetingEnableWatcherCmd,

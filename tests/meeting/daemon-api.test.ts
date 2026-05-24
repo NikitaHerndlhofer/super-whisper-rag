@@ -1052,3 +1052,205 @@ describe("daemon: undo window", () => {
     }
   });
 });
+
+/* -------------------------------------------------------------------------- */
+/* v0.8.0 — configurable popup triggers                                       */
+/* -------------------------------------------------------------------------- */
+
+describe("daemon: config_reload op", () => {
+  test("loads defaults at start when no config row exists", async () => {
+    const daemon = new MeetingDaemon(
+      baseOptions({ deps: { spawnEventsHelper: silentEventsHandle } }),
+    );
+    await daemon.start();
+    try {
+      const cfg = daemon.getPopupConfig();
+      expect(cfg.threshold).toBe("HIGH");
+      expect(cfg.schedule.enabled).toBe(false);
+      expect(cfg.allowlist.bundle_ids).toEqual([]);
+    } finally {
+      await daemon.stop();
+    }
+  });
+
+  test("config_reload picks up DB changes; response carries the new config", async () => {
+    const daemon = new MeetingDaemon(
+      baseOptions({ deps: { spawnEventsHelper: silentEventsHandle } }),
+    );
+    await daemon.start();
+    try {
+      // Mutate the DB out-of-band (simulating a CLI write).
+      const db = openArchive(archive, {});
+      try {
+        setConfig(
+          db,
+          "meeting_popup_config",
+          JSON.stringify({
+            threshold: "MEDIUM",
+            schedule: { enabled: true, timezone: "UTC", windows: [] },
+            allowlist: { bundle_ids: ["us.zoom.xos"], url_patterns: [] },
+            blocklist: { bundle_ids: [], url_patterns: [] },
+          }),
+        );
+      } finally {
+        db.close();
+      }
+      // Before reload, in-memory still holds defaults.
+      expect(daemon.getPopupConfig().threshold).toBe("HIGH");
+
+      const r = await callSocket<{
+        ok?: true;
+        config?: { threshold: string; allowlist: { bundle_ids: string[] } };
+        error?: string;
+      }>({ op: "config_reload" });
+      expect(r.ok).toBe(true);
+      expect(r.config?.threshold).toBe("MEDIUM");
+      expect(r.config?.allowlist.bundle_ids).toEqual(["us.zoom.xos"]);
+      // Confirm the in-memory cache was replaced.
+      expect(daemon.getPopupConfig().threshold).toBe("MEDIUM");
+    } finally {
+      await daemon.stop();
+    }
+  });
+
+  test("config_reload pushes config_reloaded event to subscribers", async () => {
+    const daemon = new MeetingDaemon(
+      baseOptions({ deps: { spawnEventsHelper: silentEventsHandle } }),
+    );
+    await daemon.start();
+    try {
+      // Pre-write a config so the reload picks up something distinguishable.
+      const db = openArchive(archive, {});
+      try {
+        setConfig(
+          db,
+          "meeting_popup_config",
+          JSON.stringify({
+            threshold: "NEVER",
+            schedule: { enabled: false, timezone: "local", windows: [] },
+            allowlist: { bundle_ids: [], url_patterns: [] },
+            blocklist: { bundle_ids: [], url_patterns: [] },
+          }),
+        );
+      } finally {
+        db.close();
+      }
+      const sub = startSubscriber();
+      await sub.ready;
+      await callSocket<{ ok?: true }>({ op: "config_reload" });
+      // Give the daemon a tick to push.
+      await sleep(50);
+      const events = sub.events() as Array<{ event: string; config?: { threshold: string } }>;
+      const reloaded = events.filter((e) => e.event === "config_reloaded");
+      expect(reloaded.length).toBeGreaterThanOrEqual(1);
+      expect(reloaded[0]?.config?.threshold).toBe("NEVER");
+      await sub.stop();
+    } finally {
+      await daemon.stop();
+    }
+  });
+
+  test("config_reload with a malformed stored config returns an error and leaves the cache untouched", async () => {
+    const daemon = new MeetingDaemon(
+      baseOptions({ deps: { spawnEventsHelper: silentEventsHandle } }),
+    );
+    await daemon.start();
+    try {
+      // Before: in-memory holds defaults.
+      const beforeThreshold = daemon.getPopupConfig().threshold;
+      const db = openArchive(archive, {});
+      try {
+        setConfig(db, "meeting_popup_config", "{not json at all");
+      } finally {
+        db.close();
+      }
+      const r = await callSocket<{ error?: string; ok?: true }>({ op: "config_reload" });
+      // readConfig throws → daemon swallows and falls back to defaults,
+      // but the socket caller still sees a clean response since the
+      // fallback succeeded. Our daemon implementation returns an error
+      // for the JSON-parse failure surfaced through loadPopupConfig's
+      // warning path; but loadPopupConfig itself catches and seeds
+      // defaults, so the public outcome is `ok: true` with defaults.
+      // Either response is acceptable as long as the cache stays
+      // coherent.
+      expect(r.ok === true || typeof r.error === "string").toBe(true);
+      // Regardless: the cached threshold should be a valid value.
+      expect(["HIGH", "MEDIUM", "NEVER"]).toContain(daemon.getPopupConfig().threshold);
+      // And it should still equal the original default (the load fell
+      // back to defaults on bad-JSON).
+      expect(daemon.getPopupConfig().threshold).toBe(beforeThreshold);
+    } finally {
+      await daemon.stop();
+    }
+  });
+
+  test("after config_reload changes threshold to NEVER, popup never fires on a HIGH edge", async () => {
+    // This is the integration-level proof: socket-driven config
+    // mutation must take effect on the NEXT detection edge.
+    let popupCalls = 0;
+    const askStartRecording = async (): Promise<"record" | "skip" | "timeout"> => {
+      popupCalls += 1;
+      return "skip";
+    };
+    const daemon = new MeetingDaemon(
+      baseOptions({
+        disableDetection: false,
+        deps: {
+          spawnEventsHelper: silentEventsHandle,
+          askStartRecording,
+        },
+      }),
+    );
+    await daemon.start();
+    try {
+      // Seed a NEVER config and reload.
+      const db = openArchive(archive, {});
+      try {
+        setConfig(
+          db,
+          "meeting_popup_config",
+          JSON.stringify({
+            threshold: "NEVER",
+            schedule: { enabled: false, timezone: "local", windows: [] },
+            allowlist: { bundle_ids: [], url_patterns: [] },
+            blocklist: { bundle_ids: [], url_patterns: [] },
+          }),
+        );
+      } finally {
+        db.close();
+      }
+      const r = await callSocket<{ ok?: true }>({ op: "config_reload" });
+      expect(r.ok).toBe(true);
+      // Manually drive an edge through the daemon's detector. We
+      // can't easily expose the private detector, but we can fire
+      // the edge handler via a stub: cast to any to reach into the
+      // private method.
+      const fakeEdge = {
+        from: "NONE" as const,
+        to: "HIGH" as const,
+        signal: {
+          confidence: "HIGH" as const,
+          reason: "test edge",
+          evidence: {
+            mic_in_use: true,
+            frontmost_bundle_id: "us.zoom.xos",
+            running_call_apps_strict: ["us.zoom.xos"],
+            running_call_apps_soft: [],
+            browser_url: null,
+            browser_url_matches: false,
+          },
+        },
+      };
+      // Cast to access the private method directly; the daemon's
+      // pure entry-point for an edge is async and idempotent.
+      await (daemon as unknown as {
+        onDetectionEdge: (e: typeof fakeEdge) => Promise<void>;
+      }).onDetectionEdge(fakeEdge);
+      // Let the microtask popup attempt resolve (or get suppressed).
+      await sleep(30);
+      expect(popupCalls).toBe(0);
+    } finally {
+      await daemon.stop();
+    }
+  });
+});

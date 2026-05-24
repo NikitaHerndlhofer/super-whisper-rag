@@ -62,6 +62,8 @@ import {
   spawnEventsHelper,
   type SpawnEventsOptions,
 } from "../mac/helper.ts";
+import { defaultConfig, type PopupConfig, readConfig } from "./config.ts";
+import { decidePopup } from "./decide-popup.ts";
 import { type MeetingEdge, MeetingDetector } from "./detect.ts";
 import {
   MeetingProcessor,
@@ -140,6 +142,7 @@ export const SocketRequestSchema = z.discriminatedUnion("op", [
   z.object({ op: z.literal("queue_pause") }),
   z.object({ op: z.literal("queue_discard"), id: z.number().int() }),
   z.object({ op: z.literal("subscribe") }),
+  z.object({ op: z.literal("config_reload") }),
 ]);
 export type SocketRequest = z.infer<typeof SocketRequestSchema>;
 
@@ -265,6 +268,17 @@ export class MeetingDaemon {
   private connections: Set<SocketHandle> = new Set();
   private lastEdgeSignal: MeetingEdge["signal"] | null = null;
 
+  /**
+   * In-memory snapshot of the user's popup config. Loaded at
+   * `start()` and replaced on `config_reload`. Stored on the
+   * instance so the detection edge handler doesn't have to hit
+   * the DB on every edge — popups are decided against the
+   * cached value, and a CLI write must explicitly fire
+   * `config_reload` (the CLI does this for us) to take effect
+   * in-process.
+   */
+  private popupConfig: PopupConfig = defaultConfig();
+
   private stopping = false;
 
   constructor(opts: DaemonOptions) {
@@ -301,6 +315,8 @@ export class MeetingDaemon {
     mkdirSync(this.incomingDir, { recursive: true });
     mkdirSync(this.quarantineDir, { recursive: true });
     mkdirSync(dirname(this.socketPath), { recursive: true });
+
+    this.loadPopupConfig();
 
     await this.scanOrphanWavs();
     await this.processor.recoverTranscribingRows();
@@ -426,10 +442,17 @@ export class MeetingDaemon {
   /* ----------------------------- detection ------------------------------- */
 
   /**
-   * Detection edge handler. NONE → HIGH fires the start popup if we
-   * aren't already recording; HIGH → NONE while recording fires the
-   * auto-stop with notification + 5 s undo window. Both paths push
-   * `detect_changed` to subscribers.
+   * Detection edge handler. NONE → HIGH (or → MEDIUM, when the
+   * user configured `threshold=MEDIUM`) fires the start popup if
+   * we aren't already recording; HIGH → NONE while recording
+   * fires the auto-stop with notification + 5 s undo window. Both
+   * paths push `detect_changed` to subscribers.
+   *
+   * The popup gate is now configurable via `decidePopup`:
+   * allow/blocklists, schedule windows, and a confidence threshold
+   * all funnel through that one pure function. The detector itself
+   * only cares about HIGH/MEDIUM/NONE edges; everything user-facing
+   * lives in the config.
    */
   private async onDetectionEdge(edge: MeetingEdge): Promise<void> {
     this.lastEdgeSignal = edge.signal;
@@ -439,7 +462,11 @@ export class MeetingDaemon {
       reason: edge.signal.reason,
       evidence: edge.signal.evidence,
     });
-    if (edge.from === "NONE" && edge.to === "HIGH" && !this.recording) {
+    // Popup gate: any edge INTO a non-NONE state may fire a popup.
+    // The decision function filters out NONE itself, plus everything
+    // gated by config. We still only ever fire when we aren't
+    // already mid-recording.
+    if (edge.from === "NONE" && edge.to !== "NONE" && !this.recording) {
       // Don't block the detector tick on the popup; run it on the
       // microtask queue.
       void this.firePopupForEdge(edge);
@@ -449,6 +476,12 @@ export class MeetingDaemon {
   }
 
   private async firePopupForEdge(edge: MeetingEdge): Promise<void> {
+    const decision = decidePopup(edge.signal, this.popupConfig, new Date());
+    if (!decision.fire) {
+      info(`meeting daemon: popup suppressed (${decision.reason})`);
+      return;
+    }
+    verbose(`meeting daemon: popup fire decision: ${decision.reason}`);
     const ask = this.deps.askStartRecording ?? defaultAskStartRecording;
     let choice: "record" | "skip" | "timeout";
     try {
@@ -688,6 +721,20 @@ export class MeetingDaemon {
         // Send an immediate snapshot so the menubar can render
         // before any state changes.
         this.writeJson(socket, { event: "subscribed", status: this.snapshotStatus() });
+        return;
+      }
+      case "config_reload": {
+        try {
+          this.loadPopupConfig();
+        } catch (e) {
+          // loadPopupConfig already logs; surface the error to the
+          // CLI caller too so a malformed config is visible at the
+          // mutation site.
+          this.writeJson(socket, { error: `config_reload: ${errMsg(e)}` });
+          return;
+        }
+        this.writeJson(socket, { ok: true, config: this.popupConfig });
+        this.pushEvent({ event: "config_reloaded", config: this.popupConfig });
         return;
       }
     }
@@ -1030,6 +1077,35 @@ export class MeetingDaemon {
     } finally {
       db.close();
     }
+  }
+
+  /**
+   * Read the popup config from the DB and cache it on the
+   * instance. Falls back to `defaultConfig()` with a logged warning
+   * if the stored row is malformed — we never want a bad config
+   * row to block startup or break popup decisions outright.
+   */
+  private loadPopupConfig(): void {
+    const db = openArchive(this.opts.archive, {});
+    try {
+      this.popupConfig = readConfig(db);
+    } catch (e) {
+      warn(
+        `meeting daemon: failed to read popup config; using defaults (${errMsg(e)})`,
+      );
+      this.popupConfig = defaultConfig();
+    } finally {
+      db.close();
+    }
+  }
+
+  /**
+   * Test-only accessor. The popup config is a private cache; tests
+   * that want to assert behaviour against it without poking the DB
+   * read it through this method.
+   */
+  getPopupConfig(): PopupConfig {
+    return this.popupConfig;
   }
 
   private systemAudioDefault(): boolean {
