@@ -21,6 +21,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  cmdClearFailed,
   cmdExport,
   cmdGet,
   cmdImport,
@@ -33,6 +34,13 @@ import {
   parseDaysSpec,
   parseTimeRange,
 } from "../../src/commands/meeting-config.ts";
+import { openArchive } from "../../src/archive/open.ts";
+import {
+  enqueue,
+  getById,
+  markFailed,
+  markTranscribing,
+} from "../../src/meeting/queue.ts";
 
 let workDir: string;
 let archive: string;
@@ -247,6 +255,46 @@ describe("cmdScheduleClear / Enable / Disable", () => {
 /* -------------------------------------------------------------------------- */
 /* export / import                                                            */
 /* -------------------------------------------------------------------------- */
+
+/* -------------------------------------------------------------------------- */
+/* clear-failed (v0.9.1)                                                      */
+/* -------------------------------------------------------------------------- */
+
+describe("cmdClearFailed", () => {
+  test("returns 0 on an empty queue", () => {
+    expect(cmdClearFailed(archive)).toBe(0);
+  });
+
+  test("deletes every failed row, leaves pending and transcribing alone", () => {
+    const db = openArchive(archive, {});
+    let pendingId = 0;
+    let transcribingId = 0;
+    try {
+      const a = enqueue(db, { audio_path: "/tmp/a.wav", captured_at: "2026-05-22T00:00:00Z" });
+      const b = enqueue(db, { audio_path: "/tmp/b.wav", captured_at: "2026-05-22T01:00:00Z" });
+      const c = enqueue(db, { audio_path: "/tmp/c.wav", captured_at: "2026-05-22T02:00:00Z" });
+      const d = enqueue(db, { audio_path: "/tmp/d.wav", captured_at: "2026-05-22T03:00:00Z" });
+      markFailed(db, a.id, "x");
+      markFailed(db, b.id, "y");
+      markTranscribing(db, c.id);
+      pendingId = d.id;
+      transcribingId = c.id;
+    } finally {
+      db.close();
+    }
+    const n = cmdClearFailed(archive);
+    expect(n).toBe(2);
+    const db2 = openArchive(archive, {});
+    try {
+      expect(getById(db2, pendingId)?.status).toBe("pending");
+      expect(getById(db2, transcribingId)?.status).toBe("transcribing");
+    } finally {
+      db2.close();
+    }
+    // Re-running is a no-op (idempotent).
+    expect(cmdClearFailed(archive)).toBe(0);
+  });
+});
 
 describe("cmdExport / cmdImport", () => {
   test("export writes a parseable JSON file with the live config", () => {

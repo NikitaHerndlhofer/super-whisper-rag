@@ -43,6 +43,7 @@ import {
   resetConfig,
   writeConfig,
 } from "../meeting/config.ts";
+import { deleteFailedRows } from "../meeting/queue.ts";
 
 /* -------------------------------------------------------------------------- */
 /* Small helpers                                                              */
@@ -346,6 +347,24 @@ export function cmdImport(archive: string, inPath: string): PopupConfig {
     throw new Error(`import: ${inPath} failed validation: ${v.error.message}`);
   }
   return withDb(archive, (db) => writeConfig(db, v.data));
+}
+
+/* -------------------------------------------------------------------------- */
+/* Queue maintenance (v0.9.1)                                                 */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Delete every `status='failed'` row from the queue. Returns the
+ * count of rows removed. Backs `swrag meeting queue clear-failed`.
+ *
+ * Lives here (alongside the other CLI-adapter functions) rather than
+ * in `src/cli.ts` so it's directly importable from tests. The CLI
+ * wrapper in `src/cli.ts` does daemon-route-first via
+ * `queue_clear_failed`, falling back to this function when the
+ * daemon isn't running.
+ */
+export function cmdClearFailed(archive: string): number {
+  return withDb(archive, (db) => deleteFailedRows(db));
 }
 
 /* -------------------------------------------------------------------------- */

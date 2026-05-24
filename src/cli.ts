@@ -27,6 +27,7 @@ import { runDaemonForeground } from "./meeting/daemon.ts";
 import { callDaemon, DaemonUnavailableError, isDaemonRunning } from "./meeting/daemon-client.ts";
 import { helperBinaryPath, getPermissions, spawnEventsHelper } from "./mac/helper.ts";
 import {
+  cmdClearFailed as meetingQueueClearFailed,
   cmdExport as meetingConfigExport,
   cmdGet as meetingConfigGet,
   cmdImport as meetingConfigImport,
@@ -564,7 +565,7 @@ const queueStateCmd = defineCommand({
 });
 
 const queueDiscardCmd = defineCommand({
-  meta: { name: "discard", description: "Mark a queued row as discarded; deletes the wav." },
+  meta: { name: "discard", description: "Delete a queued row and its wav." },
   args: {
     id: {
       type: "positional",
@@ -602,6 +603,33 @@ const queueDiscardCmd = defineCommand({
   },
 });
 
+const queueClearFailedCmd = defineCommand({
+  meta: {
+    name: "clear-failed",
+    description:
+      "Bulk-delete every queue row with status='failed'. Useful for tidying up after debugging genuine failures.",
+  },
+  args: {},
+  async run() {
+    const { paths } = ctx();
+    // Route through the daemon when it's listening so the deletion
+    // is observed by subscribers (a `queue_changed` push fires for
+    // the batch). Fall back to direct DB delete when the daemon is
+    // off; the menubar would just refresh on its own next poll.
+    const deleted = await viaDaemonOrFallback(
+      async () => {
+        const r = await callDaemon<{ ok?: true; deleted?: number; error?: string }>({
+          op: "queue_clear_failed",
+        });
+        if (r.error) throw new Error(r.error);
+        return r.deleted ?? 0;
+      },
+      () => meetingQueueClearFailed(paths.archive),
+    );
+    process.stdout.write(`deleted ${deleted} row${deleted === 1 ? "" : "s"}\n`);
+  },
+});
+
 const queueGroupCmd = defineCommand({
   meta: { name: "queue", description: "Manage the meeting queue" },
   subCommands: {
@@ -610,6 +638,7 @@ const queueGroupCmd = defineCommand({
     pause: queuePauseCmd,
     state: queueStateCmd,
     discard: queueDiscardCmd,
+    "clear-failed": queueClearFailedCmd,
   },
 });
 

@@ -851,6 +851,147 @@ describe("daemon: subscription / push events", () => {
   });
 });
 
+describe("daemon: queue_clear_failed op (v0.9.1)", () => {
+  test("deletes status='failed' rows, leaves pending alone, returns count", async () => {
+    // Pre-populate: 2 failed + 1 pending. The daemon's startup
+    // recovery scan would also fail any `transcribing` rows whose
+    // SW counterpart it can't cross-check, which conflates the
+    // policy under test — so we keep the fixtures to the two
+    // statuses the op semantics live on.
+    let pendingId = 0;
+    {
+      const db = openArchive(archive, {});
+      try {
+        const a = queue.enqueue(db, {
+          audio_path: join(workDir, "a.wav"),
+          captured_at: "2026-05-22T00:00:00Z",
+        });
+        const b = queue.enqueue(db, {
+          audio_path: join(workDir, "b.wav"),
+          captured_at: "2026-05-22T01:00:00Z",
+        });
+        const d = queue.enqueue(db, {
+          audio_path: join(workDir, "d.wav"),
+          captured_at: "2026-05-22T03:00:00Z",
+        });
+        queue.markFailed(db, a.id, "real failure 1");
+        queue.markFailed(db, b.id, "real failure 2");
+        pendingId = d.id;
+      } finally {
+        db.close();
+      }
+    }
+    const daemon = new MeetingDaemon(
+      baseOptions({ deps: { spawnEventsHelper: silentEventsHandle } }),
+    );
+    await daemon.start();
+    try {
+      const r = await callSocket<{ ok?: true; deleted?: number; error?: string }>({
+        op: "queue_clear_failed",
+      });
+      expect(r.ok).toBe(true);
+      expect(r.deleted).toBe(2);
+      const list = await callSocket<{ items: queue.MeetingQueueRow[] }>({ op: "queue_list" });
+      expect(list.items.length).toBe(1);
+      expect(list.items[0]?.id).toBe(pendingId);
+      expect(list.items[0]?.status).toBe("pending");
+      // Idempotent: re-running with no failed rows reports 0.
+      const r2 = await callSocket<{ ok?: true; deleted?: number }>({
+        op: "queue_clear_failed",
+      });
+      expect(r2.ok).toBe(true);
+      expect(r2.deleted).toBe(0);
+    } finally {
+      await daemon.stop();
+    }
+  });
+
+  test("pushes queue_changed event with reason 'cleared-failed' and count", async () => {
+    {
+      const db = openArchive(archive, {});
+      try {
+        const a = queue.enqueue(db, {
+          audio_path: join(workDir, "a.wav"),
+          captured_at: "2026-05-22T00:00:00Z",
+        });
+        const b = queue.enqueue(db, {
+          audio_path: join(workDir, "b.wav"),
+          captured_at: "2026-05-22T01:00:00Z",
+        });
+        queue.markFailed(db, a.id, "x");
+        queue.markFailed(db, b.id, "y");
+      } finally {
+        db.close();
+      }
+    }
+    const daemon = new MeetingDaemon(
+      baseOptions({ deps: { spawnEventsHelper: silentEventsHandle } }),
+    );
+    await daemon.start();
+    try {
+      const sub = startSubscriber();
+      await sub.ready;
+      await callSocket<{ ok?: true; deleted?: number }>({ op: "queue_clear_failed" });
+      // Let the push land.
+      await sleep(30);
+      const events = sub.events() as Array<{
+        event: string;
+        reason?: string;
+        count?: number;
+      }>;
+      const matching = events.filter(
+        (e) => e.event === "queue_changed" && e.reason === "cleared-failed",
+      );
+      expect(matching.length).toBe(1);
+      expect(matching[0]?.count).toBe(2);
+      await sub.stop();
+    } finally {
+      await daemon.stop();
+    }
+  });
+});
+
+describe("daemon: queue_discard now deletes the row (v0.9.1)", () => {
+  test("queue_discard removes the row + wav (no more 'failed/discarded' sentinel)", async () => {
+    const wav = join(workDir, "x.wav");
+    writeFileSync(wav, "x");
+    let rowId = 0;
+    {
+      const db = openArchive(archive, {});
+      try {
+        const r = queue.enqueue(db, {
+          audio_path: wav,
+          captured_at: "2026-05-22T00:00:00Z",
+          duration_ms: 1000,
+        });
+        rowId = r.id;
+      } finally {
+        db.close();
+      }
+    }
+    const daemon = new MeetingDaemon(
+      baseOptions({ deps: { spawnEventsHelper: silentEventsHandle } }),
+    );
+    await daemon.start();
+    try {
+      const r = await callSocket<{ ok?: true; error?: string }>({
+        op: "queue_discard",
+        id: rowId,
+      });
+      expect(r.ok).toBe(true);
+      const db = openArchive(archive, {});
+      try {
+        expect(queue.getById(db, rowId)).toBeNull();
+      } finally {
+        db.close();
+      }
+      expect(existsSync(wav)).toBe(false);
+    } finally {
+      await daemon.stop();
+    }
+  });
+});
+
 describe("daemon: orphan wav recovery on startup", () => {
   test("wav older than 10 minutes gets auto-enqueued", async () => {
     // Pre-create the incoming dir with a wav whose mtime is 30 min ago.

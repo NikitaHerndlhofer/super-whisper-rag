@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { openArchive } from "../../src/archive/open.ts";
 import {
   countPending,
+  deleteFailedRows,
   DISCARD_ERROR,
   enqueue,
   getById,
@@ -16,6 +17,7 @@ import {
   markTranscribing,
   MeetingQueueRowSchema,
   nextPending,
+  removeRow,
 } from "../../src/meeting/queue.ts";
 
 let archivePath: string;
@@ -162,6 +164,41 @@ describe("meeting/queue", () => {
       markTranscribing(db, r2.id);
       const t = listTranscribing(db);
       expect(t.map((r) => r.id).sort()).toEqual([r1.id, r2.id].sort());
+    });
+  });
+
+  test("removeRow deletes the row and returns true; returns false for unknown id", () => {
+    withDb((db) => {
+      const row = enqueue(db, {
+        audio_path: "/tmp/a.wav",
+        captured_at: "2026-05-22T00:00:00Z",
+      });
+      expect(removeRow(db, row.id)).toBe(true);
+      expect(getById(db, row.id)).toBeNull();
+      // Idempotent re-call returns false (no row to remove).
+      expect(removeRow(db, row.id)).toBe(false);
+      expect(removeRow(db, 99999)).toBe(false);
+    });
+  });
+
+  test("deleteFailedRows removes all status='failed' rows, returns count, leaves others alone", () => {
+    withDb((db) => {
+      const r1 = enqueue(db, { audio_path: "/tmp/a.wav", captured_at: "2026-05-22T00:00:00Z" });
+      const r2 = enqueue(db, { audio_path: "/tmp/b.wav", captured_at: "2026-05-22T01:00:00Z" });
+      const r3 = enqueue(db, { audio_path: "/tmp/c.wav", captured_at: "2026-05-22T02:00:00Z" });
+      const r4 = enqueue(db, { audio_path: "/tmp/d.wav", captured_at: "2026-05-22T03:00:00Z" });
+      markFailed(db, r1.id, "boom1");
+      markFailed(db, r2.id, "boom2");
+      markTranscribing(db, r3.id);
+      // r4 stays pending.
+      const n = deleteFailedRows(db);
+      expect(n).toBe(2);
+      expect(getById(db, r1.id)).toBeNull();
+      expect(getById(db, r2.id)).toBeNull();
+      expect(getById(db, r3.id)?.status).toBe("transcribing");
+      expect(getById(db, r4.id)?.status).toBe("pending");
+      // A subsequent call with nothing failed returns 0.
+      expect(deleteFailedRows(db)).toBe(0);
     });
   });
 

@@ -168,9 +168,39 @@ export function markFailed(db: Database, id: number, errorMsg: string): void {
 /**
  * Discard mirrors `markFailed` but uses a sentinel error so the UI can
  * distinguish user-initiated discards from real failures.
+ *
+ * As of v0.9.1, the production code paths (processor.discard,
+ * daemon.undo_last) prefer `removeRow` over `markDiscarded` — successful
+ * and user-discarded items are deleted from the queue rather than left
+ * behind as `failed` rows. The function stays exported so any
+ * downstream caller wanting to "soft-discard" with the sentinel error
+ * still has it; nothing in-tree calls it anymore.
  */
 export function markDiscarded(db: Database, id: number): void {
   markFailed(db, id, DISCARD_ERROR);
+}
+
+/**
+ * Delete a single queue row by id. Returns true iff a row was deleted.
+ *
+ * v0.9.1 policy: rows the user no longer needs in the queue table are
+ * deleted, not parked as `failed`. The archive's `recording` table
+ * already holds the canonical transcript post-`runIndexFolder`, and
+ * "discarded by user" rows are pure clutter.
+ */
+export function removeRow(db: Database, id: number): boolean {
+  const r = db.prepare("DELETE FROM meeting_queue WHERE id = ?").run(id);
+  return r.changes > 0;
+}
+
+/**
+ * Bulk-delete every row with `status='failed'`. Returns the number of
+ * rows removed. Backs the v0.9.1 `swrag meeting queue clear-failed`
+ * CLI op and the `queue_clear_failed` daemon socket op.
+ */
+export function deleteFailedRows(db: Database): number {
+  const r = db.prepare("DELETE FROM meeting_queue WHERE status = 'failed'").run();
+  return r.changes;
 }
 
 function setStatus(

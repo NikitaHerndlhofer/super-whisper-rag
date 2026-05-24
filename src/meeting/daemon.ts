@@ -141,6 +141,7 @@ export const SocketRequestSchema = z.discriminatedUnion("op", [
   z.object({ op: z.literal("queue_start") }),
   z.object({ op: z.literal("queue_pause") }),
   z.object({ op: z.literal("queue_discard"), id: z.number().int() }),
+  z.object({ op: z.literal("queue_clear_failed") }),
   z.object({ op: z.literal("subscribe") }),
   z.object({ op: z.literal("config_reload") }),
 ]);
@@ -723,6 +724,22 @@ export class MeetingDaemon {
         }
         return;
       }
+      case "queue_clear_failed": {
+        const db = openArchive(this.opts.archive, {});
+        let deleted: number;
+        try {
+          deleted = queue.deleteFailedRows(db);
+        } finally {
+          db.close();
+        }
+        this.writeJson(socket, { ok: true, deleted });
+        this.pushEvent({
+          event: "queue_changed",
+          reason: "cleared-failed",
+          count: deleted,
+        });
+        return;
+      }
       case "subscribe": {
         if (!socket.data) return;
         socket.data.isSubscriber = true;
@@ -838,7 +855,10 @@ export class MeetingDaemon {
     }
     const db2 = openArchive(this.opts.archive, {});
     try {
-      queue.markDiscarded(db2, undo.queueRowId);
+      // v0.9.1 policy: undo == discard == DELETE the queue row. The
+      // sentinel-error `failed` row we used pre-v0.9.1 was clutter
+      // for users who never look at the failed lane.
+      queue.removeRow(db2, undo.queueRowId);
     } finally {
       db2.close();
     }
@@ -953,6 +973,11 @@ export class MeetingDaemon {
         this.pushEvent({ event: "queue_state_changed", ...snap });
       },
       onItemChanged: (id, status) => {
+        // `status` is one of the four SQL statuses, OR the sentinel
+        // `"deleted"` that the processor uses to signal a row was
+        // removed (post-completion or via discard). The menubar
+        // re-fetches `queue_list` on any `queue_changed` push, so
+        // either reason value works at the wire.
         this.pushEvent({ event: "queue_changed", reason: `item:${status}`, id });
       },
     };

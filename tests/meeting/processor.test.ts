@@ -114,22 +114,28 @@ describe("MeetingProcessor — state machine", () => {
     expect(readState(archive)).toBe("paused");
   });
 
-  test("start drains the queue and lands at paused", async () => {
+  test("start drains the queue, deletes completed rows, lands at paused", async () => {
+    // v0.9.1 policy: a successfully processed row is DELETED from
+    // meeting_queue. The archive's `recording` table holds the
+    // canonical transcript after runIndexFolder returns, so the
+    // queue row is just operational state worth garbage-collecting.
     const wavA = join(workDir, "a.wav");
     const wavB = join(workDir, "b.wav");
     writeWav(wavA);
     writeWav(wavB);
+    let aId = 0;
+    let bId = 0;
     withDb((db) => {
-      enqueue(db, {
+      aId = enqueue(db, {
         audio_path: wavA,
         captured_at: "2026-05-22T00:00:00Z",
         duration_ms: 1000,
-      });
-      enqueue(db, {
+      }).id;
+      bId = enqueue(db, {
         audio_path: wavB,
         captured_at: "2026-05-22T01:00:00Z",
         duration_ms: 1000,
-      });
+      }).id;
     });
 
     const processedOrder: string[] = [];
@@ -150,7 +156,10 @@ describe("MeetingProcessor — state machine", () => {
     expect(processedOrder).toEqual(["ingest:A", "wait", "ingest:B", "wait"]);
     withDb((db) => {
       expect(countPending(db)).toBe(0);
-      expect(list(db, { status: "completed" }).length).toBe(2);
+      expect(list(db, { status: "completed" }).length).toBe(0);
+      expect(list(db).length).toBe(0);
+      expect(getById(db, aId)).toBeNull();
+      expect(getById(db, bId)).toBeNull();
     });
   });
 
@@ -213,11 +222,13 @@ describe("MeetingProcessor — state machine", () => {
     const processor = new MeetingProcessor(freshProcessorOpts(hooks));
     await processor.start();
     withDb((db) => {
+      // v0.9.1: the failed row stays for diagnosability, the good
+      // row is deleted (canonical transcript lives in the archive).
       const bad = getById(db, badId);
       const good = getById(db, goodId);
       expect(bad?.status).toBe("failed");
       expect(bad?.error).toContain("simulated SW launch failure");
-      expect(good?.status).toBe("completed");
+      expect(good).toBeNull();
     });
   });
 
@@ -299,9 +310,12 @@ describe("MeetingProcessor — state machine", () => {
     const processor = new MeetingProcessor(opts);
     await processor.recoverTranscribingRows();
     withDb((db) => {
+      // v0.9.1: recovery uses the same markCompletedSafe path as the
+      // happy loop, which DELETES the row after a successful
+      // patch+index. The recording lives in the archive's
+      // `recording` table at this point.
       const cur = getById(db, rowId);
-      expect(cur?.status).toBe("completed");
-      expect(cur?.sw_folder_name).toBe("SWFOLDER");
+      expect(cur).toBeNull();
     });
     // Recovery should also clean up the wav (matching processOne's
     // behavior) — otherwise meetings/incoming/ accumulates orphaned
@@ -309,7 +323,11 @@ describe("MeetingProcessor — state machine", () => {
     expect(existsSync(wav)).toBe(false);
   });
 
-  test("discard refuses currently-processing item, succeeds otherwise", async () => {
+  test("discard refuses currently-processing item, succeeds otherwise; row + wav both vanish", async () => {
+    // v0.9.1: a successful discard DELETES the queue row outright
+    // (no more "discarded by user" sentinel-error rows). The
+    // currently-processing item is still refused; an unknown id
+    // is still refused.
     const wavA = join(workDir, "a.wav");
     const wavB = join(workDir, "b.wav");
     writeWav(wavA);
@@ -329,17 +347,25 @@ describe("MeetingProcessor — state machine", () => {
       }).id;
     });
     const processor = new MeetingProcessor(freshProcessorOpts(happyHooks("F")));
-    // Discard B before starting → ok.
+    // Discard B before starting → ok; row + wav both vanish.
     const r1 = processor.discard(bId);
     expect(r1.ok).toBe(true);
+    withDb((db) => {
+      expect(getById(db, bId)).toBeNull();
+    });
+    expect(existsSync(wavB)).toBe(false);
+    // Re-discarding the same id is now a "no row" failure (we
+    // refuse to invent state).
+    const r1again = processor.discard(bId);
+    expect(r1again.ok).toBe(false);
     // Discard non-existent → fail.
     const r2 = processor.discard(99999);
     expect(r2.ok).toBe(false);
-    // The wav file should be gone if it existed.
     await processor.start();
     withDb((db) => {
-      expect(getById(db, aId)?.status).toBe("completed");
-      expect(getById(db, bId)?.status).toBe("failed");
+      // A: processed-then-deleted. B: discarded-then-deleted.
+      expect(getById(db, aId)).toBeNull();
+      expect(getById(db, bId)).toBeNull();
     });
   });
 

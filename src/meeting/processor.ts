@@ -113,11 +113,18 @@ export interface ProcessorOptions {
   onStateChange?: (snap: StateSnapshot) => void;
   /**
    * Phase 4 integration glue. Invoked whenever a queue row's status
-   * changes (transcribing → completed / failed). The daemon uses
-   * this to push `queue_changed` events to subscribed sockets.
-   * Optional; CLI callers without the daemon leave it `undefined`.
+   * changes (transcribing → failed) or the row is deleted entirely
+   * (completed-and-deleted, or user-discarded). The daemon uses this
+   * to push `queue_changed` events to subscribed sockets. Optional;
+   * CLI callers without the daemon leave it `undefined`.
+   *
+   * The `"deleted"` sentinel is not a SQL `status` value — it's the
+   * notification that a row vanished from the table. The daemon's
+   * fan-out treats it the same as a status change: emit
+   * `queue_changed` with reason `item:deleted` so subscribers
+   * re-fetch.
    */
-  onItemChanged?: (id: number, status: queue.MeetingQueueStatus) => void;
+  onItemChanged?: (id: number, status: queue.MeetingQueueStatus | "deleted") => void;
   /**
    * Test hooks. Production code leaves all of these `undefined`.
    */
@@ -287,9 +294,19 @@ export class MeetingProcessor {
 
   /**
    * Discard a queued row. Refuses if the row is currently in flight
-   * (i.e. `currentItem.id === id`). The discard does NOT delete the
-   * wav by default; the audio_path field stays so the user can recover
-   * the file manually if needed.
+   * (i.e. `currentItem.id === id`).
+   *
+   * v0.9.1: the row is DELETED from the queue table (not marked
+   * `failed` with a sentinel error). The archive's `recording` table
+   * stays untouched — discard is for queue-state-only cleanup, never
+   * for already-completed items that have a transcript. The
+   * `row.status === 'completed'` check is now defence-in-depth: under
+   * the new policy completed rows shouldn't exist in the queue at
+   * all, but we still refuse just in case a legacy row survives the
+   * upgrade.
+   *
+   * The on-disk wav is also removed (best-effort) so
+   * `meetings/incoming/` stays bounded.
    */
   discard(id: number): DiscardResult {
     if (this.currentItem?.id === id) {
@@ -304,9 +321,10 @@ export class MeetingProcessor {
       if (row.status === "completed") {
         return { ok: false, reason: `row ${id} is already completed` };
       }
-      queue.markDiscarded(db, id);
-      // Best-effort: remove the wav too. The plan calls for this so
-      // the meetings/incoming/ dir stays bounded.
+      const removed = queue.removeRow(db, id);
+      if (!removed) {
+        return { ok: false, reason: `row ${id} vanished before delete` };
+      }
       if (row.audio_path && existsSync(row.audio_path)) {
         try {
           // sync unlink to keep `discard` non-async (it's a one-shot CLI op)
@@ -316,6 +334,11 @@ export class MeetingProcessor {
           // best-effort
         }
       }
+      // Notify the daemon observer so the menubar can refresh. We
+      // reuse the existing `onItemChanged` callback with a sentinel
+      // "deleted" status — the daemon translates this to a
+      // `queue_changed` push and the menubar re-fetches `queue_list`.
+      this.notifyItemChanged(id, "deleted");
       return { ok: true };
     } finally {
       db.close();
@@ -550,13 +573,28 @@ export class MeetingProcessor {
     this.notifyItemChanged(id, "transcribing");
   }
 
+  /**
+   * v0.9.1 policy: a successfully processed item is DELETED from the
+   * queue table rather than parked as `status='completed'`. The
+   * archive's `recording` table already holds the canonical
+   * transcript after `runIndexFolder` returns, so the queue row is
+   * just operational state at this point.
+   *
+   * We still fire the `onItemChanged` callback with `"completed"`
+   * (not `"deleted"`) so the daemon's `queue_changed` push carries
+   * a reason the menubar already recognises — subscribers refetch
+   * `queue_list` and see the row is gone. The `folderName` argument
+   * is retained for log / future-extension purposes; it's not stored
+   * (the row no longer exists).
+   */
   private markCompletedSafe(id: number, folderName: string): void {
     const db = openArchive(this.opts.archive, {});
     try {
-      queue.markCompleted(db, id, folderName);
+      queue.removeRow(db, id);
     } finally {
       db.close();
     }
+    verbose(`meeting queue: deleted completed row id=${id} (sw_folder=${folderName})`);
     this.notifyItemChanged(id, "completed");
   }
 
@@ -598,7 +636,7 @@ export class MeetingProcessor {
     }
   }
 
-  private notifyItemChanged(id: number, status: queue.MeetingQueueStatus): void {
+  private notifyItemChanged(id: number, status: queue.MeetingQueueStatus | "deleted"): void {
     const cb = this.opts.onItemChanged;
     if (!cb) return;
     try {
