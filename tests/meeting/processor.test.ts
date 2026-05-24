@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getConfig, openArchive } from "../../src/archive/open.ts";
 import {
+  EMPTY_TRANSCRIPT_ERROR,
   LOST_IN_TRANSIT_ERROR,
   MEETING_QUEUE_STATE_KEY,
   MeetingProcessor,
@@ -396,6 +397,68 @@ describe("MeetingProcessor — state machine", () => {
     const final = procRef.p.state();
     expect(final.state).toBe("paused");
     expect(final.current_item).toBeNull();
+  });
+
+  test("empty-transcript completion marks row failed and skips patch+index", async () => {
+    // Reproduces the silent-audio safety net: when `waitForCompletion`
+    // resolves with `emptyTranscript: true` (SW finished but produced
+    // no text), the processor MUST NOT call patcher.patch or
+    // runIndexFolder — there's no transcript to archive — and MUST
+    // mark the queue row failed with the sentinel error.
+    const wav = join(workDir, "silent.wav");
+    writeWav(wav);
+    let rowId = 0;
+    withDb((db) => {
+      rowId = enqueue(db, {
+        audio_path: wav,
+        captured_at: "2026-05-22T00:00:00Z",
+        duration_ms: 1000,
+      }).id;
+    });
+    let patchCalls = 0;
+    let indexCalls = 0;
+    const hooks = happyHooks("SILENT_SW_FOLDER");
+    hooks.waitForCompletion = async () => ({
+      folderName: "SILENT_SW_FOLDER",
+      emptyTranscript: true,
+    });
+    hooks.makePatcher = () => ({
+      patch: async (f: string, d: string) => {
+        patchCalls++;
+        return {
+          folderName: f,
+          capturedAt: d,
+          swAppVersion: null,
+          versionWarned: false,
+          attempts: 1,
+        };
+      },
+      close: () => {},
+    });
+    hooks.runIndexFolder = async (o) => {
+      indexCalls++;
+      return {
+        folderName: o.folderName,
+        existed: false,
+        embedded: 0,
+        superseded: 0,
+        durationMs: 0,
+      };
+    };
+    // keepAudio=false so we also verify the wav is unlinked.
+    const processor = new MeetingProcessor({
+      ...freshProcessorOpts(hooks),
+      keepAudio: false,
+    });
+    await processor.start();
+    expect(patchCalls).toBe(0);
+    expect(indexCalls).toBe(0);
+    withDb((db) => {
+      const row = getById(db, rowId);
+      expect(row?.status).toBe("failed");
+      expect(row?.error).toBe(EMPTY_TRANSCRIPT_ERROR);
+    });
+    expect(existsSync(wav)).toBe(false);
   });
 
   test("config-table state and queue.* survive a 'restart' (close + reopen)", async () => {

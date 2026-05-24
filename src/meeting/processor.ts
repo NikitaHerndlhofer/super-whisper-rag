@@ -139,12 +139,19 @@ export interface ProcessorHooks {
     cutoffIso: string;
     durationMs: number | null;
     timeoutMs: number;
-  }) => Promise<{ folderName: string }>;
+  }) => Promise<{ folderName: string; emptyTranscript?: boolean }>;
   /** Replace SwPatcher with a stub. */
   makePatcher?: () => { patch: SwPatcher["patch"]; close: SwPatcher["close"] };
   /** Replace `runIndexFolder` (default: real targeted ingest). */
   runIndexFolder?: typeof runIndexFolder;
 }
+
+/**
+ * Sentinel error stored on the queue row when SW reports the audio
+ * went all the way through its pipeline but produced no text. Tracked
+ * as a constant so callers (UI, tests) can match on it.
+ */
+export const EMPTY_TRANSCRIPT_ERROR = "SW returned empty transcript (silent audio?)";
 
 export interface StateSnapshot {
   state: MeetingQueueState;
@@ -407,6 +414,31 @@ export class MeetingProcessor {
       timeoutMs: effectiveCompletionTimeout(row.duration_ms, this.opts.completionTimeoutMs),
     });
     const folderName = completion.folderName;
+
+    // SW reported processing-finished with empty result — silent audio.
+    // We must NOT proceed to patch + index (there's no transcript to
+    // archive, and patching an empty row would just pollute SW's DB
+    // with a backdated stub). Mark the queue row failed with a clear
+    // sentinel error and unlink the wav so `meetings/incoming/` doesn't
+    // accumulate. This is the safety net for the VPIO-zero-buffer bug
+    // (v0.9.3): even if the recorder regresses to silence, the queue
+    // won't hang forever on a row that will never grow text.
+    if (completion.emptyTranscript) {
+      warn(
+        `meeting queue: item ${row.id} → SW empty transcript (folder=${folderName})`,
+      );
+      this.markFailedSafe(row.id, EMPTY_TRANSCRIPT_ERROR);
+      if (!this.opts.keepAudio && existsSync(row.audio_path)) {
+        try {
+          await unlink(row.audio_path);
+        } catch (e) {
+          verbose(
+            `meeting queue: failed to unlink ${row.audio_path}: ${e instanceof Error ? e.message : String(e)}`,
+          );
+        }
+      }
+      return;
+    }
 
     const patcher = this.opts.hooks?.makePatcher
       ? this.opts.hooks.makePatcher()

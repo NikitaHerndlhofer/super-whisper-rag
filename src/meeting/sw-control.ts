@@ -45,11 +45,29 @@ import { Database } from "bun:sqlite";
 import { z } from "zod";
 import { verbose, warn } from "../log.ts";
 
-const FolderRowSchema = z.object({ folderName: z.string() });
+const CandidateRowSchema = z.object({
+  folderName: z.string(),
+  resultLen: z.number(),
+  rawResultLen: z.number(),
+  // SW writes `processingTime` (INTEGER, milliseconds) once it's done
+  // with the file. `null` means SW hasn't finished yet — used to
+  // disambiguate "still processing, just no text yet" from "finished
+  // and the audio was silent".
+  processingTime: z.number().nullable(),
+});
 
 const DEFAULT_QUIESCENCE_MS = 2_000;
 const DEFAULT_DEBOUNCE_MS = 300;
 const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000;
+/**
+ * Quiescence window for the empty-transcript success path. Longer
+ * than the normal 2 s gate because a silent audio file goes through
+ * SW's pipeline atypically — `processingTime` gets set at the end
+ * of ASR (~10 s after ingest for a short wav) and we want extra
+ * confidence the row won't suddenly grow text. 30 s is well past
+ * SW's worst observed LLM-cleanup re-write delay.
+ */
+const DEFAULT_EMPTY_QUIESCENCE_MS = 30_000;
 /**
  * Safety net for dropped FSEvents. macOS occasionally coalesces or
  * outright drops events under load (and Bun's `fs.watch` recursive
@@ -111,6 +129,12 @@ export interface WaitForCompletionOptions {
   timeoutMs?: number;
   /** Override the quiescence window length. */
   quiescenceMs?: number;
+  /**
+   * Override the empty-transcript-path quiescence window. Tests use a
+   * short value (e.g. 200 ms) to keep the suite fast; production
+   * code leaves this undefined and the 30-second default applies.
+   */
+  emptyQuiescenceMs?: number;
   /** Override the post-event debounce window. */
   debounceMs?: number;
   /**
@@ -127,6 +151,16 @@ export interface WaitForCompletionResult {
   elapsedMs: number;
   /** Total number of fs.watch fires observed during the wait. */
   eventCount: number;
+  /**
+   * True if SW finished processing but produced an empty transcript
+   * (`processingTime` is set, both `fts.result` and `fts.rawResult`
+   * are zero-length). The caller — meeting processor — should treat
+   * this as a soft failure (silent audio: mic muted mid-call, audio
+   * dropout, VPIO regression) rather than block forever on a row
+   * that will never grow text. Default `false`/undefined for the
+   * normal success path.
+   */
+  emptyTranscript?: boolean;
 }
 
 interface InternalState {
@@ -156,6 +190,7 @@ export function waitForCompletion(
 ): Promise<WaitForCompletionResult> {
   const timeoutMs = opts.timeoutMs ?? computeDefaultTimeoutMs(opts.durationMs);
   const quiescenceMs = opts.quiescenceMs ?? DEFAULT_QUIESCENCE_MS;
+  const emptyQuiescenceMs = opts.emptyQuiescenceMs ?? DEFAULT_EMPTY_QUIESCENCE_MS;
   const debounceMs = opts.debounceMs ?? DEFAULT_DEBOUNCE_MS;
   const safetyRecheckMs = opts.safetyRecheckMs ?? SAFETY_RECHECK_MS;
   if (!existsSync(opts.swDbPath)) {
@@ -169,12 +204,29 @@ export function waitForCompletion(
   const dbBasename = basename(opts.swDbPath);
   const dbParentDir = dirname(opts.swDbPath);
   // The query: row exists newer than cutoff, marked as `fromFile`
-  // (matches our `open -a` drop-ins), with non-empty post-LLM result
-  // text, and a duration within ±50 ms of the expected wav length.
+  // (matches our `open -a` drop-ins), within ±50 ms of expected
+  // duration. Two distinct success paths gate on the row contents:
+  //
+  //   (A) Normal: `length(fts.result) > 0` after the 2 s quiescence
+  //       window. SW finished ASR + (optional) LLM cleanup and the
+  //       output text is settled.
+  //
+  //   (B) Empty transcript: `processingTime IS NOT NULL` AND both
+  //       `fts.result` and `fts.rawResult` are zero-length, after the
+  //       longer 30 s quiescence window. SW finished processing but
+  //       the audio was silent (mic muted, VPIO regression, audio
+  //       dropout). Returning this as a soft success — with the
+  //       `emptyTranscript: true` flag — lets the processor mark
+  //       the queue row failed instead of hanging until timeout.
+  //
+  // The SQL returns enough fields for the caller to distinguish; the
+  // branching lives in TS so we don't have to query twice. We DON'T
+  // filter on `length(fts.result) > 0` in the WHERE clause anymore —
+  // that filter would mask path (B) entirely.
   //
   // Duration filter only applied when the caller supplied a duration;
   // tests can pass null to disable the filter (the gate still requires
-  // the other three conditions plus mtime quiescence).
+  // the other conditions plus mtime quiescence).
   //
   // We wrap both sides of the date comparison in SQLite's `datetime()`
   // function so the cutoff (ISO 8601 with `T` and `Z`, produced by
@@ -186,12 +238,14 @@ export function waitForCompletion(
   // `waitForCompletion` hung until timeout — a bug surfaced by Phase 1
   // end-to-end verification on real SW.
   const querySql = `
-    SELECT r.folderName
+    SELECT r.folderName            AS folderName,
+           length(fts.result)      AS resultLen,
+           length(fts.rawResult)   AS rawResultLen,
+           r.processingTime        AS processingTime
       FROM recording r
       JOIN recording_fts fts ON fts.recordingId = r.id
      WHERE datetime(r.datetime) > datetime(?)
        AND r.fromFile = 1
-       AND length(fts.result) > 0
        ${opts.durationMs != null ? "AND ABS(r.duration - ?) < 50" : ""}
      ORDER BY r.datetime DESC
      LIMIT 1
@@ -244,40 +298,83 @@ export function waitForCompletion(
       if (settled) return;
       const now = Date.now();
       const sinceMtime = now - state.lastDbMtimeMs;
-      if (sinceMtime < quiescenceMs) {
-        // Not quiescent yet. We can't rely on a subsequent fs event to
-        // re-trigger this check (the DB might already be settled — no
-        // more events will fire). Re-schedule ourselves to fire when
-        // the quiescence window is up. Any earlier fs event that
-        // arrives will bump `lastDbMtimeMs` and re-schedule via
-        // `onEvent` → the older timer becomes a stale no-op.
-        verbose(`sw-control: not quiescent yet (mtime ${sinceMtime} ms ago); rechecking`);
-        const remaining = quiescenceMs - sinceMtime + 10;
-        if (debounceHandle) clearTimeout(debounceHandle);
-        debounceHandle = setTimeout(checkNow, remaining);
-        return;
-      }
+      // Always fetch the candidate row first — both success paths gate
+      // on a row existing. We then branch on `resultLen` / `processingTime`
+      // to decide WHICH quiescence window applies (2 s for the normal
+      // text-present path, 30 s for the empty-transcript path).
       const raw: unknown =
         opts.durationMs != null
           ? stmt.get(opts.cutoffIso, opts.durationMs)
           : stmt.get(opts.cutoffIso);
       if (raw == null) {
-        verbose(`sw-control: quiescent but no row matches yet`);
+        verbose(`sw-control: no candidate row yet`);
         return;
       }
-      const parsed = FolderRowSchema.safeParse(raw);
+      const parsed = CandidateRowSchema.safeParse(raw);
       if (!parsed.success) {
         warn(`sw-control: row shape failed validation: ${parsed.error.message}`);
         return;
       }
       state.partialMatchSeen = true;
-      const elapsed = now - start;
-      cleanup();
-      resolve({
-        folderName: parsed.data.folderName,
-        elapsedMs: elapsed,
-        eventCount: state.eventCount,
-      });
+      const row = parsed.data;
+
+      // Path (A): SW has produced post-LLM text. Standard 2 s quiescence.
+      if (row.resultLen > 0) {
+        if (sinceMtime < quiescenceMs) {
+          verbose(
+            `sw-control: text present but not quiescent (mtime ${sinceMtime} ms ago); rechecking`,
+          );
+          const remaining = quiescenceMs - sinceMtime + 10;
+          if (debounceHandle) clearTimeout(debounceHandle);
+          debounceHandle = setTimeout(checkNow, remaining);
+          return;
+        }
+        const elapsed = now - start;
+        cleanup();
+        resolve({
+          folderName: row.folderName,
+          elapsedMs: elapsed,
+          eventCount: state.eventCount,
+        });
+        return;
+      }
+
+      // Path (B): empty result but SW is done processing (processingTime
+      // is set). Require the longer 30 s quiescence so we don't race a
+      // late LLM rewrite that fills in text.
+      if (
+        row.processingTime != null &&
+        row.resultLen === 0 &&
+        row.rawResultLen === 0
+      ) {
+        if (sinceMtime < emptyQuiescenceMs) {
+          verbose(
+            `sw-control: empty-transcript candidate, awaiting ${emptyQuiescenceMs} ms quiescence (mtime ${sinceMtime} ms ago)`,
+          );
+          const remaining = emptyQuiescenceMs - sinceMtime + 10;
+          if (debounceHandle) clearTimeout(debounceHandle);
+          debounceHandle = setTimeout(checkNow, remaining);
+          return;
+        }
+        const elapsed = now - start;
+        verbose(
+          `sw-control: resolving with empty transcript for folder=${row.folderName} (silent audio?)`,
+        );
+        cleanup();
+        resolve({
+          folderName: row.folderName,
+          elapsedMs: elapsed,
+          eventCount: state.eventCount,
+          emptyTranscript: true,
+        });
+        return;
+      }
+
+      // Row exists but neither path is satisfied yet — SW is still
+      // processing. Keep waiting for the next FS event / safety tick.
+      verbose(
+        `sw-control: candidate row not ready (resultLen=${row.resultLen} processingTime=${row.processingTime})`,
+      );
     };
 
     const onEvent = (source: "recordings" | "db", filename: string | null) => {

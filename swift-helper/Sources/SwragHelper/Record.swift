@@ -181,13 +181,42 @@ private final class Recorder {
       )
     }
     // Convert mic → 16 kHz mono Float32.
-    micConverter = AVAudioConverter(from: inputFormat, to: targetFormat)
-    if micConverter == nil {
+    //
+    // CRITICAL: when VPIO is enabled on macOS, the AVAudioEngine input
+    // node delivers a multi-channel format (observed in the wild as
+    // 9 channels at 48 kHz Float32 on macOS Tahoe). Channel 0 is the
+    // AEC-processed mic; the remaining channels carry the system
+    // audio reference signals VPIO uses internally for echo
+    // cancellation. The reference channels are typically zero (or
+    // close to it) when the user isn't actively playing audio.
+    //
+    // AVAudioConverter's default channel downmix from N → 1 channels
+    // is to AVERAGE every input channel. With 1 mic + 8 reference
+    // channels, the resulting mono signal is `(mic + 0 * 8) / 9` —
+    // an 18.6 dB attenuation that pushes most speech below the noise
+    // floor and reads as -91 dBFS in `volumedetect`. The mic IS being
+    // captured; it's just being mathematically diluted into oblivion.
+    //
+    // The fix is `channelMap`: explicitly route only the mic channel
+    // (index 0) into the mono output. The reference channels are
+    // ignored, mic gain is preserved end-to-end.
+    let converter = AVAudioConverter(from: inputFormat, to: targetFormat)
+    if converter == nil {
       throw RecorderError(
         "failed to construct mic AVAudioConverter from " +
         "\(inputFormat) to \(targetFormat)"
       )
     }
+    // channelMap is `[NSNumber]?` with length = OUTPUT channels. Each
+    // entry is the INPUT channel index to route to that output. For
+    // mono output: `[0]` means "output ch 0 = input ch 0 (the mic)".
+    // Only apply when the input has more channels than the output —
+    // for a true mono mic (channelCount == 1) the default 1:1 mapping
+    // is already correct and setting channelMap is unnecessary.
+    if inputFormat.channelCount > targetFormat.channelCount {
+      converter?.channelMap = [0]
+    }
+    micConverter = converter
     // Tap installed at the input node's NATIVE format so VPIO sees no
     // intermediate conversion. We convert in the tap callback.
     input.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] buffer, _ in

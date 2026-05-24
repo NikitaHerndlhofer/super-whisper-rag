@@ -22,9 +22,9 @@ afterEach(() => {
 
 /**
  * Build a minimal SW DB with the column subset `waitForCompletion` reads:
- * `recording(folderName, id, datetime, duration, fromFile)` plus the
- * `recording_fts(recordingId, result, ...)` join. Each test seeds rows
- * directly.
+ * `recording(folderName, id, datetime, duration, fromFile, processingTime)`
+ * plus the `recording_fts(recordingId, result, rawResult, ...)` join.
+ * Each test seeds rows directly.
  */
 function makeSwDb(): Database {
   const db = new Database(swDbPath, { create: true, readwrite: true });
@@ -33,7 +33,8 @@ function makeSwDb(): Database {
     folderName TEXT NOT NULL,
     datetime TEXT NOT NULL,
     duration REAL NOT NULL,
-    fromFile INTEGER NOT NULL
+    fromFile INTEGER NOT NULL,
+    processingTime INTEGER
   )`);
   db.exec(
     `CREATE VIRTUAL TABLE recording_fts USING fts5(recordingId, llmResult, rawResult, result, tokenize='porter unicode61')`,
@@ -49,15 +50,24 @@ function insertRow(
     duration: number;
     fromFile?: number;
     result?: string;
+    rawResult?: string;
+    processingTime?: number | null;
   },
 ): void {
   const id = args.folderName;
   db.prepare(
-    "INSERT INTO recording (id, folderName, datetime, duration, fromFile) VALUES (?, ?, ?, ?, ?)",
-  ).run(id, args.folderName, args.datetime, args.duration, args.fromFile ?? 1);
+    "INSERT INTO recording (id, folderName, datetime, duration, fromFile, processingTime) VALUES (?, ?, ?, ?, ?, ?)",
+  ).run(
+    id,
+    args.folderName,
+    args.datetime,
+    args.duration,
+    args.fromFile ?? 1,
+    args.processingTime ?? null,
+  );
   db.prepare(
-    "INSERT INTO recording_fts (recordingId, llmResult, rawResult, result) VALUES (?, '', '', ?)",
-  ).run(id, args.result ?? "");
+    "INSERT INTO recording_fts (recordingId, llmResult, rawResult, result) VALUES (?, '', ?, ?)",
+  ).run(id, args.rawResult ?? "", args.result ?? "");
 }
 
 /**
@@ -345,6 +355,127 @@ describe("meeting/sw-control waitForCompletion", () => {
     } finally {
       clearTimeout(insertTimer);
     }
+  });
+
+  test("empty-transcript: resolves with emptyTranscript=true when SW finished but produced no text", async () => {
+    // Reproduces the silent-audio scenario surfaced by the v0.9.3 VPIO
+    // bug: SW processed the wav (`processingTime` set) but `fts.result`
+    // and `fts.rawResult` are both empty. Without this success path
+    // the worker would hang on the row forever.
+    const db = makeSwDb();
+    insertRow(db, {
+      folderName: "SILENT_FOLDER",
+      datetime: new Date().toISOString().replace("T", " ").slice(0, 23),
+      duration: 3000,
+      result: "",
+      rawResult: "",
+      processingTime: 1234,
+    });
+    db.close();
+    const cutoffIso = "2026-05-21T00:00:00.000Z";
+    const result = await waitForCompletion({
+      swDbPath,
+      swRecordingsDir: recordingsDir,
+      cutoffIso,
+      durationMs: 3000,
+      timeoutMs: 2_000,
+      quiescenceMs: 50,
+      emptyQuiescenceMs: 200,
+      debounceMs: 30,
+    });
+    expect(result.folderName).toBe("SILENT_FOLDER");
+    expect(result.emptyTranscript).toBe(true);
+  });
+
+  test("empty-transcript: does NOT trigger when processingTime is null (still processing)", async () => {
+    // Empty result + null processingTime means SW hasn't finished yet
+    // (the row was inserted by the ASR-starts side of SW's pipeline
+    // but the result hasn't been written). Must keep waiting, not
+    // mis-classify this as "silent audio". The wait should time out.
+    const db = makeSwDb();
+    insertRow(db, {
+      folderName: "IN_PROGRESS",
+      datetime: new Date().toISOString().replace("T", " ").slice(0, 23),
+      duration: 3000,
+      result: "",
+      rawResult: "",
+      processingTime: null,
+    });
+    db.close();
+    const cutoffIso = "2026-05-21T00:00:00.000Z";
+    await expect(
+      waitForCompletion({
+        swDbPath,
+        swRecordingsDir: recordingsDir,
+        cutoffIso,
+        durationMs: 3000,
+        timeoutMs: 600,
+        quiescenceMs: 50,
+        emptyQuiescenceMs: 200,
+        debounceMs: 30,
+      }),
+    ).rejects.toThrow(/timed out/i);
+  });
+
+  test("empty-transcript path waits the longer quiescence window", async () => {
+    // Even with `processingTime` already set, the wait must hold off
+    // resolving for at least `emptyQuiescenceMs` so a late LLM rewrite
+    // could still fill in text. Configure emptyQuiescenceMs=400 and
+    // confirm elapsed >= 400.
+    const db = makeSwDb();
+    insertRow(db, {
+      folderName: "PATIENCE",
+      datetime: new Date().toISOString().replace("T", " ").slice(0, 23),
+      duration: 3000,
+      result: "",
+      rawResult: "",
+      processingTime: 5000,
+    });
+    db.close();
+    const cutoffIso = "2026-05-21T00:00:00.000Z";
+    const start = Date.now();
+    const result = await waitForCompletion({
+      swDbPath,
+      swRecordingsDir: recordingsDir,
+      cutoffIso,
+      durationMs: 3000,
+      timeoutMs: 2_000,
+      quiescenceMs: 50,
+      emptyQuiescenceMs: 400,
+      debounceMs: 30,
+    });
+    const elapsed = Date.now() - start;
+    expect(result.emptyTranscript).toBe(true);
+    expect(elapsed).toBeGreaterThanOrEqual(400);
+  });
+
+  test("text result still wins when both processingTime AND fts.result are set", async () => {
+    // The dual-path query must not mis-prioritise: if SW has a text
+    // result AND a processingTime, we resolve via the normal path
+    // (emptyTranscript undefined/false), not the empty path.
+    const db = makeSwDb();
+    insertRow(db, {
+      folderName: "REAL_TEXT",
+      datetime: new Date().toISOString().replace("T", " ").slice(0, 23),
+      duration: 4000,
+      result: "actual transcribed text",
+      rawResult: "raw asr text",
+      processingTime: 2500,
+    });
+    db.close();
+    const cutoffIso = "2026-05-21T00:00:00.000Z";
+    const result = await waitForCompletion({
+      swDbPath,
+      swRecordingsDir: recordingsDir,
+      cutoffIso,
+      durationMs: 4000,
+      timeoutMs: 2_000,
+      quiescenceMs: 100,
+      emptyQuiescenceMs: 30_000,
+      debounceMs: 30,
+    });
+    expect(result.folderName).toBe("REAL_TEXT");
+    expect(result.emptyTranscript).toBeFalsy();
   });
 
   test("default timeout scales to max(30 min, 3 × durationMs)", () => {
