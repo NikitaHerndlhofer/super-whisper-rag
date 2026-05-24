@@ -13,13 +13,14 @@ declare module "*.sql" {
   export default text;
 }
 
-// The Swift helper binary has no extension, so we declare an exact-path
-// module so `import "../../vendor/swrag-helper-darwin-universal" with
-// { type: "file" }` typechecks. Bun produces a string path at runtime;
-// in dev it's a real fs path, in a `bun build --compile` bundle it's
-// a `/$bunfs/...` path that `src/mac/helper.ts::materialiseHelper`
-// resolves to a per-user cache dir.
-declare module "*swrag-helper-darwin-universal" {
+// The Swift helper ships as a `.app` bundle, tarballed at build time
+// into `vendor/swrag-helper.app.tar` and embedded via
+// `import ... with { type: "file" }`. Bun produces a string path at
+// runtime; in dev it's a real fs path next to the sibling
+// `swrag-helper.app/` directory, in a `bun build --compile` bundle
+// it's a `/$bunfs/...` path that `src/mac/helper.ts::materialiseHelper`
+// extracts into a per-user cache dir.
+declare module "*swrag-helper.app.tar" {
   const path: string;
   export default path;
 }

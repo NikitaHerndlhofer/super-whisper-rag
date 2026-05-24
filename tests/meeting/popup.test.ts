@@ -1,49 +1,26 @@
 /**
  * Popup module tests.
  *
- * The real osascript is never invoked — every test passes an
- * injected exec stub. We focus on:
+ * v0.9.0 split the popup into two code paths:
+ *   - `askStartRecording` — now a thin wrapper around
+ *     `fireStartRecordingNotification` (UNUserNotificationCenter via
+ *     the Swift helper's `notify` subcommand). Tests inject a fake
+ *     `fireNotification` and assert the daemon-visible contract:
+ *     map any of the helper-side outputs to the right `StartChoice`.
+ *   - `notifyAutoStopped` — still uses `osascript display
+ *     notification` (single-line, no action buttons). Tests inject
+ *     an exec stub and assert the AppleScript command shape +
+ *     escaping behaviour.
  *
- *   - Output parsing covers the three osascript states (button,
- *     timeout, dismiss).
- *   - The reason text round-trips through the AppleScript escape
- *     layer without breaking the inner double-quoted string.
- *   - Notification path swallows non-zero exit codes (cosmetic
- *     failures must never crash the caller).
+ * The real Swift helper / osascript are never invoked from this
+ * suite — both are dependency-injected.
  */
 import { describe, expect, test } from "bun:test";
 import {
   askStartRecording,
   escapeForAppleScript,
   notifyAutoStopped,
-  parseDialogOutput,
 } from "../../src/meeting/popup.ts";
-
-describe("parseDialogOutput", () => {
-  test("regular click: button:Record, gave up:false", () => {
-    const r = parseDialogOutput("button returned:Record, gave up:false\n");
-    expect(r.button).toBe("Record");
-    expect(r.gaveUp).toBe(false);
-  });
-
-  test("timeout: gave up:true with empty button", () => {
-    const r = parseDialogOutput("button returned:, gave up:true\n");
-    expect(r.button).toBe("");
-    expect(r.gaveUp).toBe(true);
-  });
-
-  test("dismissed via cmd-W: empty button + false", () => {
-    const r = parseDialogOutput("button returned:, gave up:false\n");
-    expect(r.button).toBe("");
-    expect(r.gaveUp).toBe(false);
-  });
-
-  test("Skip click maps to skip-button", () => {
-    const r = parseDialogOutput("button returned:Skip, gave up:false");
-    expect(r.button).toBe("Skip");
-    expect(r.gaveUp).toBe(false);
-  });
-});
 
 describe("escapeForAppleScript", () => {
   test("escapes double-quotes", () => {
@@ -54,97 +31,72 @@ describe("escapeForAppleScript", () => {
   });
 });
 
-describe("askStartRecording", () => {
-  test("Record click → 'record'", async () => {
+describe("askStartRecording (v0.9.0 banner)", () => {
+  test("notify returning 'record' propagates as 'record'", async () => {
     const r = await askStartRecording({
       reason: "Test",
       giveUpAfterSec: 1,
-      exec: async () => ({
-        exitCode: 0,
-        stdout: "button returned:Record, gave up:false\n",
-        stderr: "",
-      }),
+      fireNotification: async () => "record",
     });
     expect(r).toBe("record");
   });
 
-  test("Skip click → 'skip'", async () => {
+  test("notify returning 'skip' propagates as 'skip'", async () => {
     const r = await askStartRecording({
       reason: "Test",
       giveUpAfterSec: 1,
-      exec: async () => ({
-        exitCode: 0,
-        stdout: "button returned:Skip, gave up:false\n",
-        stderr: "",
-      }),
+      fireNotification: async () => "skip",
     });
     expect(r).toBe("skip");
   });
 
-  test("timeout → 'timeout'", async () => {
+  test("notify returning 'timeout' propagates as 'timeout'", async () => {
     const r = await askStartRecording({
       reason: "Test",
       giveUpAfterSec: 1,
-      exec: async () => ({
-        exitCode: 0,
-        stdout: "button returned:, gave up:true\n",
-        stderr: "",
-      }),
+      fireNotification: async () => "timeout",
     });
     expect(r).toBe("timeout");
   });
 
-  test("osascript User canceled exit → 'skip' (no exception)", async () => {
+  test("notify throwing degrades to 'timeout' (never crashes the daemon)", async () => {
     const r = await askStartRecording({
       reason: "Test",
       giveUpAfterSec: 1,
-      exec: async () => ({
-        exitCode: 1,
-        stdout: "",
-        stderr: "execution error: User canceled. (-128)",
-      }),
+      fireNotification: async () => {
+        throw new Error("helper missing");
+      },
     });
-    expect(r).toBe("skip");
+    expect(r).toBe("timeout");
   });
 
-  test("osascript non-canceled exit → 'skip' (degrades gracefully)", async () => {
-    const r = await askStartRecording({
-      reason: "Test",
-      giveUpAfterSec: 1,
-      exec: async () => ({
-        exitCode: 2,
-        stdout: "",
-        stderr: "some other error",
-      }),
-    });
-    expect(r).toBe("skip");
-  });
-
-  test("reason text with quotes is escaped in the osascript command", async () => {
-    let capturedScript: string | null = null;
+  test("reason text is forwarded verbatim to the notification firer", async () => {
+    type Captured = { reason: string; timeoutSeconds?: number };
+    let captured: Captured | null = null;
     await askStartRecording({
       reason: 'Meeting "detected": go?',
-      giveUpAfterSec: 1,
-      exec: async (cmd) => {
-        capturedScript = cmd[cmd.length - 1] ?? null;
-        return { exitCode: 0, stdout: "button returned:Skip, gave up:false\n", stderr: "" };
+      giveUpAfterSec: 30,
+      fireNotification: async (opts) => {
+        captured = { reason: opts.reason, timeoutSeconds: opts.timeoutSeconds };
+        return "skip";
       },
     });
-    expect(capturedScript).not.toBeNull();
-    // The inner double-quotes of the dialog string must be escaped.
-    expect(capturedScript ?? "").toContain('Meeting \\"detected\\": go?');
+    expect(captured).not.toBeNull();
+    const c = captured as Captured | null;
+    expect(c?.reason).toBe('Meeting "detected": go?');
+    expect(c?.timeoutSeconds).toBe(30);
   });
 
-  test("default giveUpAfterSec passes 90 to osascript", async () => {
-    let capturedScript: string | null = null;
+  test("default giveUpAfterSec is 90", async () => {
+    let capturedTimeout: number | undefined;
     await askStartRecording({
       reason: "Test",
-      exec: async (cmd) => {
-        capturedScript = cmd[cmd.length - 1] ?? null;
-        return { exitCode: 0, stdout: "button returned:Skip, gave up:false\n", stderr: "" };
+      fireNotification: async (opts) => {
+        capturedTimeout = opts.timeoutSeconds;
+        return "skip";
       },
     });
-    expect(capturedScript ?? "").toContain("giving up after 90");
+    expect(capturedTimeout).toBe(90);
   });
 });
 
@@ -195,5 +147,18 @@ describe("notifyAutoStopped", () => {
       caught = e instanceof Error ? e : new Error(String(e));
     }
     expect(caught).toBeNull();
+  });
+
+  test("wavPath basename is rendered with escaped quotes if necessary", async () => {
+    let script = "";
+    await notifyAutoStopped({
+      wavPath: '/tmp/strange "quoted".wav',
+      queueRowId: 7,
+      exec: async (cmd) => {
+        script = cmd[cmd.length - 1] ?? "";
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+    });
+    expect(script).toContain('strange \\"quoted\\".wav');
   });
 });

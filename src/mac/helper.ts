@@ -1,29 +1,50 @@
 /**
  * TypeScript wrapper around the Swift `swrag-helper` binary.
  *
- * The helper exists because four macOS-only APIs need direct access:
+ * The helper exists because a handful of macOS-only APIs need direct
+ * access:
  *   - `NSWorkspace.shared.{frontmostApplication,runningApplications}`
  *   - CoreAudio property listeners on `kAudioDevicePropertyDeviceIsRunningSomewhere`
  *   - `AVCaptureDevice.authorizationStatus(for: .audio)` / `requestAccess`
  *   - `CGPreflightScreenCaptureAccess` / `CGRequestScreenCaptureAccess`
+ *   - `UNUserNotificationCenter` (the `notify` subcommand)
  *
- * One universal Mach-O ships at `vendor/swrag-helper-darwin-universal`.
- * At dev time we resolve the path from the repo's `vendor/`; inside a
- * `bun build --compile` binary the helper is embedded via `with { type:
- * "file" }` and materialised on first use to a per-user cache dir (see
- * `src/archive/vec-loader.ts` for the same pattern applied to vec0).
+ * Starting in v0.9.0, the helper ships as a code-signed `.app` bundle
+ * at `vendor/swrag-helper.app/` rather than a raw Mach-O. macOS TCC
+ * identifies a raw binary by (absolute path + checksum), so every
+ * `brew upgrade` revoked Screen Recording / Microphone grants because
+ * the materialised path's size suffix changed. A `.app` is identified
+ * by (CFBundleIdentifier + ad-hoc signature), so grants now survive
+ * upgrades. Bundling is also a hard prerequisite for
+ * `UNUserNotificationCenter`.
  *
- * Every output crosses a process boundary, so every output is parsed
- * through a zod schema in this file. The detector / daemon consumes
- * only the inferred TS types, never the raw JSON.
+ * The bundle is tarballed at build time into
+ * `vendor/swrag-helper.app.tar`, embedded into the compiled swrag
+ * CLI via `with { type: "file" }`, and extracted on first use to a
+ * stable per-user cache path. Stable path matters: TCC's ad-hoc-sign
+ * heuristics give the most reliable grant-persistence when the .app
+ * lives at the same absolute path on every upgrade.
+ *
+ * Every cross-process payload is validated through a zod schema in
+ * this file. The detector / daemon consumes only inferred TS types,
+ * never raw JSON.
  */
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { unlink } from "node:fs/promises";
 import { tmpdir, userInfo } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { z } from "zod";
-import { verbose } from "../log.ts";
-import embeddedHelperPath from "../../vendor/swrag-helper-darwin-universal" with { type: "file" };
+import { verbose, warn } from "../log.ts";
+import embeddedHelperTar from "../../vendor/swrag-helper.app.tar" with { type: "file" };
 
 /* -------------------------------------------------------------------------- */
 /* Schemas — every cross-process payload validated through one of these.      */
@@ -57,6 +78,11 @@ export const PermissionsSchema = z.object({
   // Arc, Vivaldi, Edge, Comet — but parsing is intentionally permissive
   // so a future Swift-side addition doesn't break TS first).
   automation: z.record(z.string(), PermissionStateSchema),
+  // Notifications: tracked starting in v0.9.0 once the helper became a
+  // .app bundle (UNUserNotificationCenter requires bundle identity).
+  // `.provisional` is a real APNs state for opt-in-without-asking
+  // alerts; we surface it through to the doctor output unchanged.
+  notifications: z.enum(["granted", "denied", "not_determined", "provisional"]),
 });
 export type Permissions = z.infer<typeof PermissionsSchema>;
 
@@ -139,47 +165,133 @@ export const RecorderHeartbeatSchema = z.object({
 export type RecorderHeartbeat = z.infer<typeof RecorderHeartbeatSchema>;
 
 /* -------------------------------------------------------------------------- */
-/* Helper-binary path resolution                                              */
+/* Helper-bundle path resolution                                              */
 /* -------------------------------------------------------------------------- */
 
-let cachedHelperPath: string | null = null;
+let cachedHelperBinaryPath: string | null = null;
+let cachedHelperAppPath: string | null = null;
 
 /**
- * Returns an absolute, executable path to the Swift helper.
+ * Returns an absolute, executable path to the Swift helper binary
+ * (the inner `Contents/MacOS/swrag-helper` of the .app bundle).
  *
  * Resolution order:
- *   1. SWRAG_HELPER_PATH env var override (test hook).
- *   2. The embedded asset path. At dev time this is a real path under
- *      `vendor/`; in the compiled bundle it's `/$bunfs/...` and we
- *      materialise it into a per-user cache dir with `+x` so the OS
- *      can `execve()` it.
+ *   1. SWRAG_HELPER_PATH env var override (test hook). If the override
+ *      is a directory ending in `.app`, we resolve to its inner
+ *      `Contents/MacOS/swrag-helper`. If it's a file, we use it
+ *      verbatim (legacy compat for tests that point at a raw binary).
+ *   2. Dev mode: the bundle exists at `vendor/swrag-helper.app/` on
+ *      disk; run the inner binary directly.
+ *   3. Compiled bundle: extract the embedded `vendor/swrag-helper.app.tar`
+ *      to a per-user cache dir, then return the inner binary path.
+ *
+ * Extraction is gated on a per-tarball-size marker file — if the
+ * marker matches and the inner binary exists, we reuse the on-disk
+ * bundle without re-extracting. The cache path is intentionally
+ * stable across versions: TCC's ad-hoc-sign heuristics for
+ * permission-grant persistence on `brew upgrade` are most reliable
+ * when (bundle id, absolute path) both stay the same.
  */
 export function helperBinaryPath(): string {
-  if (cachedHelperPath) return cachedHelperPath;
+  if (cachedHelperBinaryPath) return cachedHelperBinaryPath;
   const override = process.env.SWRAG_HELPER_PATH;
   if (override && existsSync(override)) {
-    cachedHelperPath = override;
-    return cachedHelperPath;
+    cachedHelperBinaryPath = resolveOverridePath(override);
+    return cachedHelperBinaryPath;
   }
   if (process.platform !== "darwin") {
     throw new Error(
       `swrag-helper: unsupported platform: ${process.platform} (only darwin is supported)`,
     );
   }
-  cachedHelperPath = materialiseHelper(embeddedHelperPath);
-  return cachedHelperPath;
+  const { binary, app } = materialiseHelper(embeddedHelperTar);
+  cachedHelperBinaryPath = binary;
+  cachedHelperAppPath = app;
+  return cachedHelperBinaryPath;
 }
 
-function materialiseHelper(embedded: string): string {
-  if (!embedded.startsWith("/$bunfs/") && existsSync(embedded)) {
-    // Dev mode — vendored file lives at a real path on disk. The
-    // file is already executable from the build script's `chmod +x`,
-    // so we can run it in place.
-    return embedded;
+/**
+ * Returns the absolute path to the materialised `swrag-helper.app/`
+ * directory. In dev mode this is `vendor/swrag-helper.app`; at
+ * runtime it's the extracted cache directory. The `notify`
+ * subcommand needs this (rather than the inner binary path) when
+ * we want to launch the bundle via `open` instead of executing the
+ * inner binary directly — running through `open` gives the helper a
+ * fresh app activation context which `UNUserNotificationCenter`
+ * relies on. Today we still spawn the inner binary directly (it
+ * works because Foundation walks up to find the .app context) but
+ * we expose the path here for future flexibility.
+ */
+export function helperAppPath(): string {
+  if (cachedHelperAppPath) return cachedHelperAppPath;
+  // Force resolution.
+  helperBinaryPath();
+  if (cachedHelperAppPath == null) {
+    throw new Error("swrag-helper: app path resolution failed");
   }
+  return cachedHelperAppPath;
+}
+
+function resolveOverridePath(override: string): string {
+  // Override may be either a .app directory or a raw binary path. If
+  // it's a directory and looks like a bundle, peek inside.
+  try {
+    const stat = statSync(override);
+    if (stat.isDirectory()) {
+      const inner = join(override, "Contents", "MacOS", "swrag-helper");
+      if (existsSync(inner)) {
+        cachedHelperAppPath = override;
+        return inner;
+      }
+    } else {
+      // Raw-binary override: try to infer the enclosing .app from
+      // path conventions; otherwise leave the app path unset and
+      // hope the caller doesn't ask for it.
+      const maybeApp = inferAppFromBinaryPath(override);
+      if (maybeApp != null) cachedHelperAppPath = maybeApp;
+      return override;
+    }
+  } catch {
+    // fall through
+  }
+  return override;
+}
+
+function inferAppFromBinaryPath(binPath: string): string | null {
+  // `…/swrag-helper.app/Contents/MacOS/swrag-helper` → `…/swrag-helper.app`
+  const macosDir = dirname(binPath);
+  const contentsDir = dirname(macosDir);
+  const appDir = dirname(contentsDir);
+  if (appDir.endsWith(".app") && existsSync(appDir)) return appDir;
+  return null;
+}
+
+interface MaterialisedHelper {
+  /** Absolute path to the inner Mach-O. */
+  binary: string;
+  /** Absolute path to the .app directory. */
+  app: string;
+}
+
+function materialiseHelper(embedded: string): MaterialisedHelper {
+  // Dev path: when running under `bun src/cli.ts`, the embedded
+  // reference is a real fs path to `vendor/swrag-helper.app.tar`.
+  // The sibling `swrag-helper.app/` is already on disk from
+  // `scripts/build-swift-helper.sh`; run it in place without paying
+  // the extract cost.
+  if (!embedded.startsWith("/$bunfs/")) {
+    const sibling = embedded.replace(/\.tar$/, "");
+    const innerBin = join(sibling, "Contents", "MacOS", "swrag-helper");
+    if (existsSync(innerBin)) {
+      return { binary: innerBin, app: sibling };
+    }
+    // No sibling — fall through to tarball extraction. Happens when
+    // the dev only has the tarball checked in (rare) or when the
+    // build script removed the .app for some reason.
+  }
+
   const data = readFileSync(embedded);
   const size = data.byteLength;
-  // Mirror `vec-loader.ts`'s per-user cache layout for symmetry.
   const cacheDir = join(tmpdir(), `swrag-helper-${safeUid()}-${safeUsername()}`);
   try {
     mkdirSync(cacheDir, { recursive: true, mode: 0o700 });
@@ -187,25 +299,114 @@ function materialiseHelper(embedded: string): string {
   } catch {
     // ignore — pre-existing dirs from other invocations are fine.
   }
-  const target = join(cacheDir, `swrag-helper-universal-${size}`);
-  if (existsSync(target) && statSync(target).size === size) {
-    return target;
-  }
-  const tmp = `${target}.${process.pid}.tmp`;
-  writeFileSync(tmp, data, { mode: 0o700 });
+  // Clean up v0.8.x leftovers: the previous materialiser wrote a
+  // single-file `swrag-helper-universal-<size>` per-tarball-size into
+  // the same cache directory. Those raw binaries are dead weight in
+  // v0.9.0 — silently remove them so cache dirs stay slim across the
+  // upgrade. Best-effort: a failure here doesn't affect correctness.
   try {
-    renameSync(tmp, target);
+    const Bun_ = (globalThis as { Bun?: { Glob: new (s: string) => { scanSync(opts: { cwd: string }): Iterable<string> } } }).Bun;
+    if (Bun_?.Glob) {
+      const matches = new Bun_.Glob("swrag-helper-universal-*").scanSync({ cwd: cacheDir });
+      for (const name of matches) {
+        try {
+          rmSync(join(cacheDir, name), { force: true });
+        } catch {
+          // best-effort
+        }
+      }
+    }
   } catch {
-    if (!existsSync(target) || statSync(target).size !== size) {
-      throw new Error("swrag-helper: materialisation failed");
+    // best-effort
+  }
+  const appPath = join(cacheDir, "swrag-helper.app");
+  const innerBin = join(appPath, "Contents", "MacOS", "swrag-helper");
+  const sizeMarker = join(cacheDir, `.tar-size-${size}`);
+
+  // Fast path: the marker for THIS tarball size exists AND the
+  // inner binary exists. Reuse the extracted bundle.
+  if (existsSync(sizeMarker) && existsSync(innerBin)) {
+    return { binary: innerBin, app: appPath };
+  }
+
+  // Stage in a per-pid tmp dir, then atomically swap. This avoids
+  // tearing down an in-use bundle while another swrag invocation
+  // might be reading from it.
+  const stagingTarFile = join(cacheDir, `swrag-helper.app.${process.pid}.tar.tmp`);
+  const stagingExtractDir = join(cacheDir, `swrag-helper.app.${process.pid}.staging`);
+  try {
+    writeFileSync(stagingTarFile, data, { mode: 0o600 });
+    try {
+      rmSync(stagingExtractDir, { recursive: true, force: true });
+    } catch {
+      // best-effort
+    }
+    mkdirSync(stagingExtractDir, { recursive: true, mode: 0o700 });
+    // Extract via system `tar`. macOS ships BSD tar; we built the
+    // archive with that same `tar`, so quirks (resource forks etc.)
+    // round-trip cleanly. `--no-xattrs` skips the noisy extended-
+    // attribute restoration which we don't rely on.
+    const r = Bun.spawnSync({
+      cmd: ["tar", "-xf", stagingTarFile, "-C", stagingExtractDir],
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    if (r.exitCode !== 0) {
+      const stderr = new TextDecoder().decode(r.stderr);
+      throw new Error(`tar extract failed: ${stderr.trim() || `exit ${r.exitCode}`}`);
+    }
+    const stagedApp = join(stagingExtractDir, "swrag-helper.app");
+    if (!existsSync(join(stagedApp, "Contents", "MacOS", "swrag-helper"))) {
+      throw new Error(
+        `tar extract produced no inner binary at ${stagedApp}/Contents/MacOS/swrag-helper`,
+      );
+    }
+    // Swap the new bundle into place. We rm the old target first
+    // (rename(2) refuses to overwrite a non-empty directory on
+    // every common filesystem). Two concurrent extractors will
+    // race here — the loser's rename will throw EEXIST or ENOTEMPTY
+    // and we fall through to the existsSync recheck.
+    try {
+      rmSync(appPath, { recursive: true, force: true });
+    } catch {
+      // best-effort
+    }
+    try {
+      renameSync(stagedApp, appPath);
+    } catch (e) {
+      if (!existsSync(innerBin)) {
+        throw new Error(
+          `swrag-helper: bundle materialisation failed: ${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
+      // Lost the race — the parallel extractor finished first.
+    }
+    // Drop the size marker last so a half-finished extract isn't
+    // mistakenly reused on the next call.
+    try {
+      writeFileSync(sizeMarker, "", { mode: 0o600 });
+    } catch {
+      // best-effort
+    }
+  } finally {
+    try {
+      rmSync(stagingTarFile, { force: true });
+    } catch {
+      // best-effort
+    }
+    try {
+      rmSync(stagingExtractDir, { recursive: true, force: true });
+    } catch {
+      // best-effort
     }
   }
-  try {
-    chmodSync(target, 0o700);
-  } catch {
-    // best-effort; the write above already opened with 0o700.
+
+  if (!existsSync(innerBin)) {
+    throw new Error(
+      `swrag-helper: bundle materialisation produced no inner binary at ${innerBin}`,
+    );
   }
-  return target;
+  return { binary: innerBin, app: appPath };
 }
 
 function safeUsername(): string {
@@ -878,4 +1079,150 @@ export function spawnRecorder(opts: RecorderOptions): RecorderHandle {
     pid: proc.pid,
     stderrTail: () => stderrTail.trim(),
   };
+}
+
+/* -------------------------------------------------------------------------- */
+/* notify — UNUserNotificationCenter banner with action buttons              */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Result of a `notify` invocation, validated through a literal union.
+ * Anything outside the union — and any helper-side failure — is
+ * surfaced as `"timeout"` by the caller so the daemon never blocks
+ * a meeting on a notification path failure.
+ */
+const NotifyResultSchema = z.union([
+  z.literal("record"),
+  z.literal("skip"),
+  z.literal("timeout"),
+]);
+export type NotifyResult = z.infer<typeof NotifyResultSchema>;
+
+export interface FireStartRecordingNotificationOptions {
+  /** Body text of the banner; the title is fixed. */
+  reason: string;
+  /** Auto-dismiss the banner after this many seconds. Defaults to 90. */
+  timeoutSeconds?: number;
+  /** Override helper path for tests. */
+  helperPath?: string;
+  /** Per-call exec stub for tests. */
+  exec?: NotifyExecFn;
+}
+
+export interface NotifyExecResult {
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+}
+
+export type NotifyExecFn = (cmd: string[]) => Promise<NotifyExecResult>;
+
+const DEFAULT_NOTIFY_TIMEOUT_SEC = 90;
+// Buffer above the helper-side timeout so we never SIGKILL the helper
+// in the middle of its own timeout-cleanup path. The helper sets up
+// a DispatchSource timer that calls CFRunLoopStop on the main loop;
+// give that ~3 s to drain after the deadline.
+const NOTIFY_PROCESS_BUFFER_MS = 3_000;
+
+/**
+ * Fire a native UNUserNotificationCenter banner with Record / Skip
+ * action buttons. Returns the chosen action lowercased, or
+ * `"timeout"` on banner expiry / dismiss.
+ *
+ * This is the v0.9.0 replacement for `askStartRecording`'s modal
+ * `osascript display dialog`. The banner is non-modal — it slides
+ * down from the top-right and the user can ignore it without
+ * stealing focus from whatever meeting tool they're already in.
+ *
+ * Failure modes (all return `"timeout"` rather than throwing, so the
+ * daemon never crashes on a notification path):
+ *   - Helper binary missing or exits non-zero (e.g. auth denied)
+ *   - Helper output doesn't match the schema
+ *   - Spawn-level error
+ * A warning is logged in every failure case so SWRAG_VERBOSE surfaces
+ * the underlying reason.
+ */
+export async function fireStartRecordingNotification(
+  opts: FireStartRecordingNotificationOptions,
+): Promise<NotifyResult> {
+  const timeoutSec = opts.timeoutSeconds ?? DEFAULT_NOTIFY_TIMEOUT_SEC;
+  const exec = opts.exec ?? defaultNotifyExec;
+  let bin: string;
+  try {
+    bin = opts.helperPath ?? helperBinaryPath();
+  } catch (e) {
+    warn(`fireStartRecordingNotification: helper unresolved: ${errToString(e)}`);
+    return "timeout";
+  }
+  const args = [
+    bin,
+    "notify",
+    "--title",
+    "Meeting detected",
+    "--body",
+    opts.reason,
+    "--actions",
+    "Record,Skip",
+    "--default-action",
+    "Record",
+    "--timeout",
+    String(timeoutSec),
+  ];
+  let result: NotifyExecResult;
+  try {
+    result = await exec(args);
+  } catch (e) {
+    warn(`fireStartRecordingNotification: spawn failed: ${errToString(e)}`);
+    return "timeout";
+  }
+  if (result.exitCode !== 0) {
+    warn(
+      `fireStartRecordingNotification: helper exit=${result.exitCode}: ${result.stderr.trim() || result.stdout.trim()}`,
+    );
+    return "timeout";
+  }
+  const raw = result.stdout.trim().split("\n").pop()?.trim() ?? "";
+  const parsed = NotifyResultSchema.safeParse(raw);
+  if (!parsed.success) {
+    warn(`fireStartRecordingNotification: unexpected stdout ${JSON.stringify(raw)}`);
+    return "timeout";
+  }
+  return parsed.data;
+}
+
+const defaultNotifyExec: NotifyExecFn = async (cmd: string[]): Promise<NotifyExecResult> => {
+  const timeoutSec = parseTimeoutFromArgs(cmd) ?? DEFAULT_NOTIFY_TIMEOUT_SEC;
+  const [bin, ...rest] = cmd;
+  if (bin == null) {
+    return { exitCode: -1, stdout: "", stderr: "fireStartRecordingNotification: empty cmd" };
+  }
+  const proc = Bun.spawn([bin, ...rest], {
+    stdout: "pipe",
+    stderr: "pipe",
+    stdin: "ignore",
+    // Kill the helper if it overruns its own timeout by a wide margin.
+    // The helper's main.swift drives a DispatchSource timer to stop
+    // the run loop at the configured `--timeout`; this acts as a
+    // belt-and-braces safety net.
+    timeout: timeoutSec * 1000 + NOTIFY_PROCESS_BUFFER_MS,
+  });
+  const [stdout, stderr] = await Promise.all([
+    Bun.readableStreamToText(proc.stdout),
+    Bun.readableStreamToText(proc.stderr),
+  ]);
+  const exitCode = await proc.exited;
+  verbose(`swrag-helper notify exit=${exitCode} stdout=${stdout.trim()}`);
+  return { exitCode, stdout, stderr };
+};
+
+function parseTimeoutFromArgs(cmd: string[]): number | null {
+  const idx = cmd.indexOf("--timeout");
+  if (idx === -1 || idx === cmd.length - 1) return null;
+  const value = Number(cmd[idx + 1]);
+  if (!Number.isFinite(value) || value <= 0) return null;
+  return value;
+}
+
+function errToString(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
 }

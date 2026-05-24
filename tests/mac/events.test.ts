@@ -26,7 +26,21 @@ import {
   spawnEventsHelper,
 } from "../../src/mac/helper.ts";
 
-const REAL_HELPER = join(import.meta.dir, "..", "..", "vendor", "swrag-helper-darwin-universal");
+// v0.9.0+: helper ships inside a `.app` bundle. We spawn the inner
+// binary directly — `spawnEventsHelper` doesn't care whether the
+// path lives inside a bundle, but the Swift side's bundle context
+// is preserved by Foundation when the binary lives at
+// `<bundle>/Contents/MacOS/swrag-helper`.
+const REAL_HELPER = join(
+  import.meta.dir,
+  "..",
+  "..",
+  "vendor",
+  "swrag-helper.app",
+  "Contents",
+  "MacOS",
+  "swrag-helper",
+);
 const REAL_HELPER_PRESENT = existsSync(REAL_HELPER);
 
 /* -------------------------------------------------------------------------- */

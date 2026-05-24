@@ -162,11 +162,21 @@ export interface DaemonDeps {
     opts: { discard: boolean },
     deps: RecordDeps,
   ) => Promise<StoppedRecording>;
-  /** Replace osascript popup (tests pass a recording stub). */
+  /**
+   * Replace the start-recording prompt (tests pass a recording stub).
+   * Defaults to the v0.9.0 `UNUserNotificationCenter` banner via
+   * `swrag-helper notify`.
+   */
   askStartRecording?: typeof defaultAskStartRecording;
-  /** Replace osascript notification. */
+  /** Replace `osascript display notification` for auto-stop banners. */
   notifyAutoStopped?: typeof defaultNotifyAutoStopped;
-  /** Override the shared exec used by popup defaults. */
+  /**
+   * Override the osascript exec used by `notifyAutoStopped` (the
+   * auto-stop banner still uses osascript — no action buttons needed
+   * there). The start-recording path is on the native notification
+   * stack and ignores this; tests should stub `askStartRecording`
+   * directly when they want to control that flow.
+   */
   popupExec?: ExecFn;
 }
 
@@ -488,7 +498,6 @@ export class MeetingDaemon {
       choice = await ask({
         reason: `Meeting detected: ${edge.signal.reason}.`,
         giveUpAfterSec: POPUP_GIVE_UP_SEC,
-        exec: this.deps.popupExec,
       });
     } catch (e) {
       warn(`meeting daemon: popup failed: ${errMsg(e)}`);

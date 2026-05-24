@@ -45,7 +45,9 @@ async function main() {
 
   // The Swift helper is built locally (no npm package to fetch from).
   // We always run the build script — it's idempotent and SPM's cache
-  // makes a no-source-change rebuild near-instant.
+  // makes a no-source-change rebuild near-instant. Starting in v0.9.0
+  // the script produces a code-signed .app bundle plus a tarball; the
+  // tarball is what gets embedded into the swrag CLI binary.
   console.log("[build] building swift helper");
   const helper = Bun.spawnSync({
     cmd: ["bash", "scripts/build-swift-helper.sh"],
@@ -61,9 +63,13 @@ async function main() {
         "`xcode-select --install`.",
     );
   }
-  const helperPath = join(ROOT, "vendor", "swrag-helper-darwin-universal");
-  if (!existsSync(helperPath)) {
-    throw new Error(`swift helper missing after build: ${helperPath}`);
+  const helperTar = join(ROOT, "vendor", "swrag-helper.app.tar");
+  const helperApp = join(ROOT, "vendor", "swrag-helper.app");
+  if (!existsSync(helperTar)) {
+    throw new Error(`swift helper tarball missing after build: ${helperTar}`);
+  }
+  if (!existsSync(helperApp)) {
+    throw new Error(`swift helper bundle missing after build: ${helperApp}`);
   }
 
   if (existsSync(DIST)) rmSync(DIST, { recursive: true, force: true });

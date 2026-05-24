@@ -25,6 +25,7 @@ function grantedPermissions(): Permissions {
   return {
     microphone: "granted",
     screen_recording: "granted",
+    notifications: "granted",
     automation: {
       "com.apple.Safari": "granted",
       "com.google.Chrome": "granted",
@@ -89,6 +90,7 @@ describe("runDoctor — macOS permissions", () => {
       checkPermissions: async () => ({
         microphone: "granted",
         screen_recording: "denied",
+        notifications: "granted",
         automation: {
           "com.apple.Safari": "granted",
           "com.google.Chrome": "denied",
@@ -108,12 +110,43 @@ describe("runDoctor — macOS permissions", () => {
       checkPermissions: async () => ({
         microphone: "not_determined",
         screen_recording: "granted",
+        notifications: "granted",
         automation: {},
       }),
     });
     expect(r.output).toContain("mic=not_determined");
     expect(r.output).toContain("hint: swrag meeting permissions-check --prompt");
     expect(r.exitCode).not.toBe(0);
+  });
+
+  test("notifications=denied is reported and triggers the system-settings hint", async () => {
+    const r = await runDoctor({
+      ...baseOpts,
+      listLaunchAgents: async () => ({ watch: true, menubar: true }),
+      checkPermissions: async () => ({
+        microphone: "granted",
+        screen_recording: "granted",
+        notifications: "denied",
+        automation: {},
+      }),
+    });
+    expect(r.output).toContain("notifications=DENIED");
+    expect(r.output).toContain("hint: Grant the denied permissions in System Settings");
+    expect(r.exitCode).not.toBe(0);
+  });
+
+  test("notifications=provisional is surfaced verbatim and treated as ok", async () => {
+    const r = await runDoctor({
+      ...baseOpts,
+      listLaunchAgents: async () => ({ watch: true, menubar: true }),
+      checkPermissions: async () => ({
+        microphone: "granted",
+        screen_recording: "granted",
+        notifications: "provisional",
+        automation: { "com.apple.Safari": "granted" },
+      }),
+    });
+    expect(r.output).toContain("notifications=provisional");
   });
 
   test("probe returning null is surfaced as a clear error", async () => {

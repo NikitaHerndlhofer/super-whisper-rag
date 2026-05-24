@@ -20,10 +20,15 @@ func usage() {
     events                       long-running, emits NDJSON state events
     frontmost-app                one-shot, prints the current frontmost app
     mic-in-use                   one-shot, prints mic-in-use across all inputs
-    permissions-check [--prompt] one-shot, probes mic / screen-recording / automation
+    permissions-check [--prompt] one-shot, probes mic / screen-recording /
+                                   automation / notifications
     record --output <path>       long-running, mic+optional system audio recorder
            [--system-audio]      (off by default; opt-in for legal reasons)
     menubar [--socket <path>]    long-running, NSStatusItem menu bar subscriber
+    notify --title <s> --body <s> [--actions a,b,...] [--default-action a]
+           [--timeout N]         one-shot, UNUserNotificationCenter banner
+                                   with action buttons; prints chosen
+                                   action lowercased (or "timeout")
   """
   FileHandle.standardError.write(Data(msg.utf8))
   FileHandle.standardError.write(Data("\n".utf8))
@@ -51,6 +56,8 @@ case "record":
   runRecord(args: rest)
 case "menubar":
   runMenuBar(args: rest)
+case "notify":
+  runNotify(args: rest)
 case "-h", "--help", "help":
   usage()
   exit(0)

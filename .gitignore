@@ -60,6 +60,13 @@ typings/
 # lives in `swift-helper/`; the binary is rebuilt fresh on every release
 # by `scripts/build-swift-helper.sh` (called from `scripts/build.ts`).
 /swift-helper/.build/
+# The Swift helper .app bundle + its tarball are build artifacts.
+# Build via `bash scripts/build-swift-helper.sh`.
+/vendor/swrag-helper.app/
+/vendor/swrag-helper.app.tar
+# Legacy raw-binary path from v0.8.x — the build script removes it
+# automatically, but list it here so a stale checkout doesn't leak
+# the artifact back into commits.
 /vendor/swrag-helper-darwin-universal
 
 # Local-only Homebrew formula used for testing the build pipeline against

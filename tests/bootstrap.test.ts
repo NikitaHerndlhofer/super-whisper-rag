@@ -30,6 +30,7 @@ function grantedPermissions(): Permissions {
   return {
     microphone: "granted",
     screen_recording: "granted",
+    notifications: "granted",
     automation: {
       "com.apple.Safari": "granted",
       "com.google.Chrome": "granted",

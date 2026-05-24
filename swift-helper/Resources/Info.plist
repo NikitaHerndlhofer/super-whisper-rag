@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Info.plist for the swrag-helper .app bundle.
+
+  The helper ships as a real .app (not a raw Mach-O) so macOS TCC
+  identifies it by `CFBundleIdentifier` + ad-hoc signature checksum
+  rather than by absolute path + binary checksum. With the raw-binary
+  approach, every `brew upgrade` materialised the helper to a new
+  per-size cache path, which TCC saw as a brand-new app and asked the
+  user to re-grant Screen Recording / Microphone every release. With
+  this bundle, permission grants survive upgrades.
+
+  Bundling is also a prerequisite for `UNUserNotificationCenter`,
+  which refuses to register a delegate or post alerts from an
+  un-bundled binary. The `notify` subcommand uses that API to display
+  the start-recording banner with Record / Skip action buttons.
+
+  LSUIElement=true keeps the helper out of the Dock and the
+  Cmd-Tab list (it's a daemon-style background process).
+
+  The Usage Description keys are mandatory: macOS prompts the user
+  to grant Microphone / Screen Recording permission with the body
+  text from these strings. Without them, TCC refuses to even show
+  the consent dialog.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>ai.swrag.helper</string>
+    <key>CFBundleName</key>
+    <string>swrag-helper</string>
+    <key>CFBundleDisplayName</key>
+    <string>swrag Helper</string>
+    <key>CFBundleVersion</key>
+    <string>0.9.0</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.9.0</string>
+    <key>CFBundleExecutable</key>
+    <string>swrag-helper</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>13.0</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>swrag records meetings to a local audio file for transcription.</string>
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>swrag records system audio during meetings so both sides of the call are captured.</string>
+</dict>
+</plist>

@@ -3,12 +3,12 @@
  *
  * Two functions, both reachable from `daemon.ts`:
  *
- *   - `askStartRecording({ reason })` — `osascript display dialog` with
- *     `giving up after 90`. Buttons: {"Skip","Record"}, default
- *     "Record". Fires on debounce-confirmed NONE → HIGH while we're
- *     not already recording. The 90 s timeout comes from the Phase 4
- *     design review (bumped from the initial 30 s for ergonomics —
- *     longer ramp-up time on slow-starting calls is forgiving).
+ *   - `askStartRecording({ reason })` — fires a native banner via
+ *     `swrag-helper notify` (UNUserNotificationCenter), buttons:
+ *     {Record, Skip}, auto-dismiss after 90 s. Returns
+ *     `"record" | "skip" | "timeout"`. The banner is non-modal: it
+ *     slides in from the top-right and the user can ignore it without
+ *     losing focus on whatever meeting tool they're already in.
  *
  *   - `notifyAutoStopped({ wavPath, queueRowId })` — `osascript
  *     display notification`, non-modal banner. The undo window itself
@@ -16,19 +16,28 @@
  *     just nudges the user that the wav was saved and points them at
  *     the menu bar.
  *
- * Both run an external command (`osascript`) but the actual exec is
- * an injectable dependency so tests don't fire real dialogs.
+ * v0.9.0 swapped the start-recording prompt from `osascript display
+ * dialog` (modal, focus-stealing) to a UNUserNotificationCenter
+ * banner. The native banner has affordances osascript doesn't:
+ *   - Honors macOS Focus / Do Not Disturb settings.
+ *   - Persists in Notification Center if missed.
+ *   - Doesn't steal focus from the current meeting tool.
+ *   - Shows the same way regardless of which Space the user is on.
  *
- * Output parsing for `display dialog`:
- *   Normal click   → exit 0, stdout `button returned:Record, gave up:false`
- *   Timeout        → exit 0, stdout `button returned:, gave up:true`
- *   `Cancel` press → exit 1, stderr `User canceled.`
+ * notifyAutoStopped stays on `osascript display notification` for
+ * symmetry with the previous behaviour — it's a fire-and-forget
+ * single-line notice with no action buttons, where the only real
+ * difference (no FocusManager support in osascript) is a non-issue
+ * because auto-stop is itself an end-of-meeting event.
  *
- * We avoid a Cancel button on purpose — "Skip" reads cleaner and
- * keeps the result vocabulary to record / skip / timeout. If the
- * user closes the dialog window (cmd-W on the standby) we treat it
- * as a skip (the dialog returns no button and gave_up:false).
+ * Both run external commands, but the actual exec / spawn is an
+ * injectable dependency so tests don't fire real banners or dialogs.
  */
+import {
+  fireStartRecordingNotification as defaultFireStartRecording,
+  type FireStartRecordingNotificationOptions,
+  type NotifyResult,
+} from "../mac/helper.ts";
 import { verbose, warn } from "../log.ts";
 
 /* -------------------------------------------------------------------------- */
@@ -45,7 +54,18 @@ export interface AskStartOptions {
    * review). Tests use a sub-second value so they don't actually wait.
    */
   giveUpAfterSec?: number;
-  /** Inject an exec for tests; defaults to the real `osascript`. */
+  /**
+   * Inject a notification firing function for tests. Defaults to
+   * `fireStartRecordingNotification` from `src/mac/helper.ts` which
+   * spawns the Swift helper's `notify` subcommand.
+   */
+  fireNotification?: typeof defaultFireStartRecording;
+  /**
+   * @deprecated — Pre-v0.9.0 hook for the `osascript display dialog`
+   * exec. Still accepted for backwards-compatible test scaffolds, but
+   * unused on the new banner code path. New tests should pass
+   * `fireNotification` instead.
+   */
   exec?: ExecFn;
 }
 
@@ -77,46 +97,37 @@ export type ExecFn = (cmd: string[]) => Promise<ExecResult>;
 const DEFAULT_GIVE_UP_AFTER_SEC = 90;
 
 /**
- * Fire a modal start-recording prompt. Returns:
- *   - `"record"` if the user clicked "Record"
- *   - `"skip"` if the user clicked "Skip" or dismissed the dialog
- *   - `"timeout"` if the dialog gave up after the timeout
+ * Fire a native banner notification asking the user whether to start
+ * recording the current meeting. Returns:
+ *   - `"record"` if the user clicked the Record action button (or
+ *     the banner body, which defaults to Record).
+ *   - `"skip"` if the user clicked Skip.
+ *   - `"timeout"` if the banner auto-dismissed or the user swiped
+ *     it away.
  *
- * Errors from osascript (other than `User canceled.`) are surfaced
- * via `warn()` and treated as `"skip"` — we never want a popup
- * failure to take the daemon down or accidentally record without
- * consent.
+ * Errors from the helper (auth denied, spawn failure, schema mismatch
+ * on stdout) are surfaced via `warn()` and degraded to `"timeout"`
+ * — we never want a notification failure to take the daemon down or
+ * accidentally start recording without consent.
  */
 export async function askStartRecording(opts: AskStartOptions): Promise<StartChoice> {
   const giveUpAfter = opts.giveUpAfterSec ?? DEFAULT_GIVE_UP_AFTER_SEC;
-  const exec = opts.exec ?? defaultExec;
-  const reason = escapeForAppleScript(opts.reason);
-  // We intentionally drop the dialog title (the default `osascript`
-  // title is fine) and rely on the "Record" default-button visual
-  // for affordance. `with icon caution` is loud — keep it as the
-  // default informational icon.
-  const script =
-    `display dialog "${reason}" buttons {"Skip","Record"} default button "Record" ` +
-    `giving up after ${giveUpAfter}`;
-  const r = await exec(["osascript", "-e", script]);
-  if (r.exitCode !== 0) {
-    // User pressed escape / closed the window without a button (rare —
-    // there's no cancel button — but possible via cmd-period on some
-    // configurations). Surface as a skip rather than an exception.
-    const stderr = r.stderr.trim();
-    if (stderr.includes("User canceled")) {
-      return "skip";
-    }
-    warn(`askStartRecording: osascript exit=${r.exitCode} stderr=${stderr}`);
-    return "skip";
+  const fire = opts.fireNotification ?? defaultFireStartRecording;
+  const fireOpts: FireStartRecordingNotificationOptions = {
+    reason: opts.reason,
+    timeoutSeconds: giveUpAfter,
+  };
+  let result: NotifyResult;
+  try {
+    result = await fire(fireOpts);
+  } catch (e) {
+    warn(
+      `askStartRecording: notification failed: ${e instanceof Error ? e.message : String(e)}`,
+    );
+    return "timeout";
   }
-  const parsed = parseDialogOutput(r.stdout);
-  verbose(`askStartRecording: ${JSON.stringify(parsed)}`);
-  if (parsed.gaveUp) return "timeout";
-  if (parsed.button === "Record") return "record";
-  // Empty button + gaveUp:false means the dialog was dismissed without
-  // a button (cmd-W) — treat as skip for safety.
-  return "skip";
+  verbose(`askStartRecording: notify result=${result}`);
+  return result;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -158,21 +169,6 @@ export async function notifyAutoStopped(opts: NotifyOptions): Promise<void> {
 /* -------------------------------------------------------------------------- */
 /* Internals                                                                  */
 /* -------------------------------------------------------------------------- */
-
-/**
- * `display dialog` stdout shape: `button returned:Record, gave up:false`.
- * Some macOS versions may swap the order of fields, so we don't rely
- * on positional parsing — both fields are matched by regex.
- *
- * Exposed for testing.
- */
-export function parseDialogOutput(stdout: string): { button: string; gaveUp: boolean } {
-  const buttonMatch = stdout.match(/button returned:([^,\n]*)/);
-  const gaveUpMatch = stdout.match(/gave up:(true|false)/);
-  const button = buttonMatch ? (buttonMatch[1] ?? "").trim() : "";
-  const gaveUp = gaveUpMatch ? gaveUpMatch[1] === "true" : false;
-  return { button, gaveUp };
-}
 
 /**
  * Defensively escape characters that would break out of the inner

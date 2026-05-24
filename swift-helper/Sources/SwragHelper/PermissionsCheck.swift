@@ -32,11 +32,13 @@ struct PermissionsPayload: Codable {
   let microphone: String
   let screenRecording: String
   let automation: [String: String]
+  let notifications: String
 
   enum CodingKeys: String, CodingKey {
     case microphone
     case screenRecording = "screen_recording"
     case automation
+    case notifications
   }
 }
 
@@ -44,10 +46,16 @@ func runPermissionsCheck(prompt: Bool) {
   let mic = checkMicrophone(prompt: prompt)
   let scr = checkScreenRecording(prompt: prompt)
   let automation = checkAutomation(prompt: prompt)
+  // Notifications: the .app bundle is a prerequisite for
+  // UNUserNotificationCenter to function at all; with the v0.9.0
+  // bundle the probe is meaningful. `--prompt` fires the system
+  // dialog (one-time per .app identity, persisted via TCC).
+  let notif = prompt ? promptNotificationAuthorization() : probeNotificationAuthorization()
   let payload = PermissionsPayload(
     microphone: mic,
     screenRecording: scr,
-    automation: automation
+    automation: automation,
+    notifications: notif
   )
   printJSON(payload)
   exit(0)

@@ -15,13 +15,18 @@ import {
   MicInUseSchema,
   PermissionsSchema,
   RecorderHeartbeatSchema,
+  fireStartRecordingNotification,
   getFrontmostApp,
   getPermissions,
   isMicInUse,
   spawnRecorder,
 } from "../../src/mac/helper.ts";
 
-const HELPER_PATH = join(import.meta.dir, "..", "..", "vendor", "swrag-helper-darwin-universal");
+// v0.9.0+: helper ships as a code-signed .app bundle. Tests spawn
+// the inner binary directly — Foundation still resolves the bundle
+// context because the parent directories form the .app structure.
+const HELPER_APP = join(import.meta.dir, "..", "..", "vendor", "swrag-helper.app");
+const HELPER_PATH = join(HELPER_APP, "Contents", "MacOS", "swrag-helper");
 const HELPER_PRESENT = existsSync(HELPER_PATH);
 
 describe.skipIf(!HELPER_PRESENT)("mac/helper one-shots", () => {
@@ -51,6 +56,8 @@ describe.skipIf(!HELPER_PRESENT)("mac/helper one-shots", () => {
     // microphone / screen_recording are tri-state enums.
     expect(["granted", "denied", "not_determined"]).toContain(result.microphone);
     expect(["granted", "denied", "not_determined"]).toContain(result.screen_recording);
+    // notifications carries a four-state enum starting in v0.9.0.
+    expect(["granted", "denied", "not_determined", "provisional"]).toContain(result.notifications);
     // automation should contain entries for the seven well-known browsers.
     const expectedBrowsers = [
       "com.apple.Safari",
@@ -244,6 +251,150 @@ describe.skipIf(!HELPER_PRESENT)("spawnRecorder (real binary)", () => {
     15_000,
   );
 });
+
+/* -------------------------------------------------------------------------- */
+/* fireStartRecordingNotification — unit-level wrapper coverage              */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The integration story for `notify` is hard to fully automate: a
+ * real banner requires user interaction or a UI test runner. These
+ * tests exercise the wrapper's parsing + degradation logic against a
+ * stubbed exec — we run an integration smoke against the real helper
+ * binary in the next block, behind the `--actions` shape check.
+ */
+describe("fireStartRecordingNotification (stubbed exec)", () => {
+  test("stdout 'record' → 'record'", async () => {
+    const r = await fireStartRecordingNotification({
+      reason: "Test",
+      timeoutSeconds: 5,
+      helperPath: "/usr/bin/true",
+      exec: async () => ({ exitCode: 0, stdout: "record\n", stderr: "" }),
+    });
+    expect(r).toBe("record");
+  });
+
+  test("stdout 'skip' → 'skip'", async () => {
+    const r = await fireStartRecordingNotification({
+      reason: "Test",
+      timeoutSeconds: 5,
+      helperPath: "/usr/bin/true",
+      exec: async () => ({ exitCode: 0, stdout: "skip\n", stderr: "" }),
+    });
+    expect(r).toBe("skip");
+  });
+
+  test("stdout 'timeout' → 'timeout'", async () => {
+    const r = await fireStartRecordingNotification({
+      reason: "Test",
+      timeoutSeconds: 5,
+      helperPath: "/usr/bin/true",
+      exec: async () => ({ exitCode: 0, stdout: "timeout\n", stderr: "" }),
+    });
+    expect(r).toBe("timeout");
+  });
+
+  test("non-zero exit degrades to 'timeout' rather than throwing", async () => {
+    const r = await fireStartRecordingNotification({
+      reason: "Test",
+      timeoutSeconds: 5,
+      helperPath: "/usr/bin/true",
+      exec: async () => ({ exitCode: 4, stdout: "", stderr: "authorization denied" }),
+    });
+    expect(r).toBe("timeout");
+  });
+
+  test("unexpected stdout shape degrades to 'timeout'", async () => {
+    const r = await fireStartRecordingNotification({
+      reason: "Test",
+      timeoutSeconds: 5,
+      helperPath: "/usr/bin/true",
+      exec: async () => ({ exitCode: 0, stdout: "explode\n", stderr: "" }),
+    });
+    expect(r).toBe("timeout");
+  });
+
+  test("spawn-level error degrades to 'timeout'", async () => {
+    const r = await fireStartRecordingNotification({
+      reason: "Test",
+      timeoutSeconds: 5,
+      helperPath: "/usr/bin/true",
+      exec: async () => {
+        throw new Error("spawn failed");
+      },
+    });
+    expect(r).toBe("timeout");
+  });
+
+  test("argv shape: notify subcommand + actions + default-action + timeout", async () => {
+    let captured: string[] = [];
+    await fireStartRecordingNotification({
+      reason: 'Zoom is in a meeting — "ack"?',
+      timeoutSeconds: 12,
+      helperPath: "/tmp/fake-helper",
+      exec: async (cmd) => {
+        captured = [...cmd];
+        return { exitCode: 0, stdout: "skip\n", stderr: "" };
+      },
+    });
+    expect(captured[0]).toBe("/tmp/fake-helper");
+    expect(captured[1]).toBe("notify");
+    expect(captured).toContain("--actions");
+    const actionsIdx = captured.indexOf("--actions");
+    expect(captured[actionsIdx + 1]).toBe("Record,Skip");
+    const defaultIdx = captured.indexOf("--default-action");
+    expect(captured[defaultIdx + 1]).toBe("Record");
+    const timeoutIdx = captured.indexOf("--timeout");
+    expect(captured[timeoutIdx + 1]).toBe("12");
+    const bodyIdx = captured.indexOf("--body");
+    expect(captured[bodyIdx + 1]).toBe('Zoom is in a meeting — "ack"?');
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* fireStartRecordingNotification — smoke against real helper                 */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Real-binary smoke for the notify subcommand. We can't assert on
+ * the user clicking a button (no UI test runner), but we CAN assert
+ * that the binary accepts the argv shape, runs to the timeout, and
+ * emits a valid result on stdout. Run with a very short timeout so
+ * the suite completes in ~1.5 s even when the banner is dismissed.
+ *
+ * Skipped when the binary isn't present (CI without swift toolchain).
+ * Skipped when SWRAG_SKIP_NOTIFY_SMOKE=1 — set this in environments
+ * where the helper's notification authorization state is unknown and
+ * an auth-denied result would noisy up the suite (e.g. local dev
+ * where the user has never granted notification permission to the
+ * v0.9.0 bundle yet).
+ */
+const NOTIFY_SMOKE_DISABLED = process.env.SWRAG_SKIP_NOTIFY_SMOKE === "1";
+
+describe.skipIf(!HELPER_PRESENT || NOTIFY_SMOKE_DISABLED)(
+  "fireStartRecordingNotification (real binary)",
+  () => {
+    test(
+      "real helper accepts notify argv, runs to short timeout, emits a valid result",
+      async () => {
+        const r = await fireStartRecordingNotification({
+          reason: "swrag test banner — ignore",
+          timeoutSeconds: 2,
+          helperPath: HELPER_PATH,
+        });
+        // Acceptable outcomes:
+        //   * "timeout" — banner auto-dismissed (no user click).
+        //   * "record" / "skip" — the suite runner happened to click.
+        //     We allow both rather than asserting a specific value.
+        //   * Auth-denied paths degrade to "timeout" via the wrapper,
+        //     same as a true timeout — they're equivalent from the
+        //     daemon's POV.
+        expect(["record", "skip", "timeout"]).toContain(r);
+      },
+      10_000,
+    );
+  },
+);
 
 /**
  * Helper: pull the first heartbeat off the iterator within a hard

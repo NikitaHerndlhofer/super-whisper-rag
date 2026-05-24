@@ -193,10 +193,11 @@ const PERM_LABELS = {
   granted: "granted",
   denied: "DENIED",
   not_determined: "not_determined",
+  provisional: "provisional",
 } as const;
 
 function buildPermissionsCheck(perms: Permissions | null): Check {
-  const name = "macOS permissions (mic + screen + automation)";
+  const name = "macOS permissions (mic + screen + automation + notifications)";
   if (perms == null) {
     return {
       name,
@@ -207,6 +208,11 @@ function buildPermissionsCheck(perms: Permissions | null): Check {
   }
   const mic = PERM_LABELS[perms.microphone];
   const screen = PERM_LABELS[perms.screen_recording];
+  // Notifications: `provisional` is treated as "ok-ish" — it's
+  // Apple's silent-opt-in mode where alerts go straight to
+  // Notification Center without prompting. We still display the
+  // status verbatim so the user knows where they're at.
+  const notif = PERM_LABELS[perms.notifications];
   const automationEntries = Object.entries(perms.automation);
   const automationGranted = automationEntries.filter(([, v]) => v === "granted").length;
   const automationDenied = automationEntries
@@ -218,15 +224,20 @@ function buildPermissionsCheck(perms: Permissions | null): Check {
       : automationDenied.length > 0
         ? `automation=${automationGranted}/${automationEntries.length} granted (denied: ${automationDenied.join(", ")})`
         : `automation=${automationGranted}/${automationEntries.length} granted`;
-  const detail = `mic=${mic}, screen=${screen}, ${automationDetail}`;
+  const detail = `mic=${mic}, screen=${screen}, notifications=${notif}, ${automationDetail}`;
   const anyDenied =
-    perms.microphone === "denied" || perms.screen_recording === "denied" || automationDenied.length > 0;
+    perms.microphone === "denied" ||
+    perms.screen_recording === "denied" ||
+    perms.notifications === "denied" ||
+    automationDenied.length > 0;
   // Treat `not_determined` as soft-fail: the user hasn't been
   // prompted yet; the watcher will prompt on first use. We surface
-  // it so the user knows they can warm them eagerly.
+  // it so the user knows they can warm them eagerly. `provisional`
+  // is the OS's silent-opt-in mode and doesn't need a prompt.
   const anyUndecided =
     perms.microphone === "not_determined" ||
     perms.screen_recording === "not_determined" ||
+    perms.notifications === "not_determined" ||
     automationEntries.some(([, v]) => v === "not_determined");
   const ok = !anyDenied && !anyUndecided;
   return {
