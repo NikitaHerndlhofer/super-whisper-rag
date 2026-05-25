@@ -120,6 +120,38 @@ const ORPHAN_RECOVERY_MIN_AGE_MS = 10 * 60 * 1000;
 const POPUP_GIVE_UP_SEC = 60;
 const SHUTDOWN_PROCESSOR_WAIT_MS = 30_000;
 const EVENTS_HELPER_BACKOFF_MS = [1_000, 5_000, 30_000] as const;
+/**
+ * Grace window for the v0.9.10 HIGH → MEDIUM stop-popup trigger.
+ *
+ * When a recording is active and the detector commits a HIGH → MEDIUM
+ * edge, we lost call-evidence (frontmost call app gone, browser URL no
+ * longer matches a meeting room, etc.) while still seeing mic activity.
+ * Two plausible interpretations:
+ *
+ *   1. Meeting truly ended but our recorder is still holding the mic,
+ *      so the device-level `mic_in_use` bit stays raw-true and the
+ *      detector never reaches NONE on its own. This is the canonical
+ *      v0.9.9-degraded-mode bug — `kAudioProcessProperty*` returns an
+ *      empty owners list on this user's macOS Tahoe 26 setup, so the
+ *      recorder-PID-mask filter degrades to "trust raw mic_in_use",
+ *      and the HIGH → NONE edge that the v0.9.6 stop-popup logic
+ *      depends on never fires.
+ *
+ *   2. Brief context switch during a real ongoing meeting — user
+ *      clicks an adjacent browser tab or a non-call app for a few
+ *      seconds. State recovers to HIGH once they return.
+ *
+ * We can't distinguish the two on the first edge alone, so we arm a
+ * grace window. If MEDIUM (or NONE) holds for the full window, we
+ * commit to "meeting ended" and fire the stop banner. If the edge
+ * recovers to HIGH inside the window, we cancel — same outcome as if
+ * the edge had never fired.
+ *
+ * 30 s is short enough that the user sees the banner soon after a
+ * real meeting end, long enough to absorb tab/app switches that
+ * happen every few seconds during a long meeting.
+ */
+const STOP_DOWNGRADE_GRACE_MS = 30_000;
 
 /** Config keys consumed by the daemon. */
 export const CONFIG_SYSTEM_AUDIO_DEFAULT = "meeting_system_audio_default";
@@ -207,6 +239,12 @@ export interface DaemonOptions {
   deps?: DaemonDeps;
   /** Override the events helper backoff schedule (tests run fast). */
   eventsBackoffMs?: readonly number[];
+  /**
+   * Override the HIGH → MEDIUM stop-popup grace window (tests run
+   * with 0 so the banner fires synchronously without a real-time
+   * wait). Production uses `STOP_DOWNGRADE_GRACE_MS` (30 s).
+   */
+  stopDowngradeGraceMs?: number;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -266,6 +304,7 @@ export class MeetingDaemon {
   > &
     Pick<DaemonDeps, "askStartRecording" | "askStopRecording">;
   private readonly eventsBackoffMs: readonly number[];
+  private readonly stopDowngradeGraceMs: number;
 
   private processor: MeetingProcessor;
   private detector: MeetingDetector | null = null;
@@ -277,6 +316,18 @@ export class MeetingDaemon {
   private recording: RecordingState | null = null;
   /** Monotonic id assigned to each recording session for stale-popup detection. */
   private nextRecordingId = 1;
+  /**
+   * Active grace-window timer for the v0.9.10 HIGH → MEDIUM stop
+   * trigger. See `STOP_DOWNGRADE_GRACE_MS` for the trigger semantics.
+   *
+   * Lifecycle: armed on HIGH → MEDIUM (or HIGH → NONE — but the
+   * existing `edge.to === "NONE"` branch fires the popup immediately
+   * there, so the timer is only useful for the HIGH → MEDIUM case in
+   * practice). Cancelled when the detector recovers to HIGH, the
+   * recording stops (manual / popup-save / shutdown), or the popup
+   * actually fires.
+   */
+  private stopDowngradeTimer: ReturnType<typeof setTimeout> | null = null;
 
   private listener: SocketListener | null = null;
   private subscribers: Set<SocketHandle> = new Set();
@@ -309,6 +360,7 @@ export class MeetingDaemon {
       askStopRecording: opts.deps?.askStopRecording,
     };
     this.eventsBackoffMs = opts.eventsBackoffMs ?? EVENTS_HELPER_BACKOFF_MS;
+    this.stopDowngradeGraceMs = opts.stopDowngradeGraceMs ?? STOP_DOWNGRADE_GRACE_MS;
     this.processor = new MeetingProcessor(this.buildProcessorOptions());
   }
 
@@ -375,6 +427,11 @@ export class MeetingDaemon {
       clearTimeout(this.eventsRestartTimer);
       this.eventsRestartTimer = null;
     }
+    // Cancel the v0.9.10 stop-downgrade grace timer if armed —
+    // recording will be finalised below regardless, and we don't
+    // want a stray timer surfacing a banner after the daemon has
+    // shut down.
+    this.cancelStopDowngradeTimer();
     if (this.eventsHandle) {
       try {
         await this.eventsHandle.stop();
@@ -451,23 +508,37 @@ export class MeetingDaemon {
   /**
    * Detection edge handler. NONE → HIGH (or → MEDIUM, when the
    * user configured `threshold=MEDIUM`) fires the start popup if
-   * we aren't already recording; HIGH → NONE while recording
-   * fires the stop popup (symmetric with start). Both paths push
-   * `detect_changed` to subscribers.
+   * we aren't already recording. Any edge that downgrades
+   * confidence while recording is a candidate for the stop popup:
    *
-   * The popup gate is configurable via `decidePopup`:
-   * allow/blocklists, schedule windows, and a confidence threshold
-   * all funnel through that one pure function. The detector itself
-   * only cares about HIGH/MEDIUM/NONE edges; everything user-facing
-   * lives in the config.
+   *   - `→ NONE`: fires immediately. The mic is no longer in use
+   *     (or has degraded to "only swrag holds it" via the v0.9.8
+   *     recorder-mask filter). This is the canonical clean
+   *     meeting-end signal — same behaviour as v0.9.6 through v0.9.9.
    *
-   * v0.9.6: the stop side no longer auto-stops + opens an undo
-   * window. Instead, `firePopupForStopEdge` shows a native banner
-   * with a single `Stop & save` action; dismiss/timeout is treated
-   * as `"keep"` (recording continues). The next debounce-confirmed
-   * `HIGH → NONE` edge re-fires the banner if the user is still
-   * recording — so a user who walked away and came back won't be
-   * stuck with a recorder that auto-saved while they were gone.
+   *   - `HIGH → MEDIUM`: arms a grace-window timer
+   *     (`STOP_DOWNGRADE_GRACE_MS`). If the state stays at
+   *     MEDIUM-or-NONE through the window, the popup fires; if
+   *     it recovers to HIGH (user returns to the meeting tab /
+   *     refocuses the call app), the timer is cancelled. New in
+   *     v0.9.10 — covers the case where the v0.9.9 per-process
+   *     owners list comes back empty in production (CoreAudio's
+   *     `kAudioProcessProperty*` query degrades on macOS Tahoe 26
+   *     under some configurations, leaving us unable to subtract
+   *     our recorder from the mic-owner set; without owners the
+   *     detector falls back to raw `mic_in_use`, which our recorder
+   *     pins at `true`, and the HIGH → NONE edge that the v0.9.6
+   *     stop popup logic relied on never fires).
+   *
+   * Both paths push `detect_changed` to subscribers.
+   *
+   * v0.9.6 design that's still in effect: the stop side shows a
+   * native banner with a single `Stop & save` action; dismiss /
+   * timeout maps to `"keep"` (recording continues). False
+   * positives from brief context switches during a long meeting
+   * cost the user one dismiss; missing a real stop costs them
+   * minutes of unused recording. That tradeoff motivates the
+   * broader v0.9.10 trigger.
    */
   private async onDetectionEdge(edge: MeetingEdge): Promise<void> {
     this.lastEdgeSignal = edge.signal;
@@ -485,8 +556,89 @@ export class MeetingDaemon {
       // Don't block the detector tick on the popup; run it on the
       // microtask queue.
       void this.firePopupForEdge(edge);
-    } else if (edge.to === "NONE" && this.recording) {
+      return;
+    }
+    if (!this.recording) {
+      // Not recording → no stop-side processing. Cancel any stale
+      // grace timer (defensive — should already be cleared by the
+      // recording-stop path).
+      this.cancelStopDowngradeTimer();
+      return;
+    }
+    if (edge.to === "NONE") {
+      // Clean HIGH/MEDIUM → NONE. Fire immediately. Any pending
+      // grace timer is now redundant; cancel before firing so the
+      // timer can't double-fire the popup if it lands milliseconds
+      // later.
+      this.cancelStopDowngradeTimer();
       void this.firePopupForStopEdge();
+      return;
+    }
+    if (edge.from === "HIGH" && edge.to === "MEDIUM") {
+      // v0.9.10: we lost call evidence while still seeing mic
+      // activity. Arm the grace window. The timer's tick checks
+      // the live confidence — only fires the popup if we're still
+      // not back to HIGH.
+      this.scheduleStopDowngradeFire();
+      return;
+    }
+    if (edge.to === "HIGH") {
+      // Recovered to HIGH (e.g., user returned to the meeting tab
+      // after a brief context switch). Cancel any pending grace
+      // timer so we don't pop up a stop banner during an active
+      // meeting.
+      this.cancelStopDowngradeTimer();
+      return;
+    }
+  }
+
+  /**
+   * Arm the v0.9.10 HIGH → MEDIUM stop-popup grace window. Idempotent
+   * within an active arming — calling twice resets the timer (the
+   * later edge wins). If `stopDowngradeGraceMs` is 0 (tests inject
+   * this), the popup fires on the next microtask tick instead of
+   * `setTimeout(0)` so test assertions don't have to await an extra
+   * event-loop turn.
+   */
+  private scheduleStopDowngradeFire(): void {
+    this.cancelStopDowngradeTimer();
+    if (!this.recording) return;
+    const fire = (): void => {
+      this.stopDowngradeTimer = null;
+      if (!this.recording) return;
+      // Live re-check: if the state has recovered to HIGH by the
+      // time the timer fires, the user is back in the meeting —
+      // skip the popup. (The HIGH-recovery branch in
+      // `onDetectionEdge` should have cancelled this timer already,
+      // but a race between the timer landing and the edge handler
+      // applying is possible; this is the belt-and-braces guard.)
+      if (this.lastEdgeSignal?.confidence === "HIGH") {
+        verbose(
+          "meeting daemon: stop-downgrade timer fired but state is HIGH; skipping popup",
+        );
+        return;
+      }
+      void this.firePopupForStopEdge();
+    };
+    if (this.stopDowngradeGraceMs === 0) {
+      // Synchronous fast-path for tests. queueMicrotask preserves
+      // the "async" shape (firePopupForStopEdge is async) without
+      // forcing a setTimeout(0) round-trip.
+      queueMicrotask(fire);
+      return;
+    }
+    this.stopDowngradeTimer = setTimeout(fire, this.stopDowngradeGraceMs);
+    // Allow process exit even if the timer is pending — the events
+    // helper subprocess is what holds us open, not the timer.
+    if (typeof (this.stopDowngradeTimer as { unref?: () => void }).unref === "function") {
+      (this.stopDowngradeTimer as { unref: () => void }).unref();
+    }
+  }
+
+  private cancelStopDowngradeTimer(): void {
+    if (this.stopDowngradeTimer != null) {
+      clearTimeout(this.stopDowngradeTimer);
+      this.stopDowngradeTimer = null;
     }
   }
 
@@ -600,10 +752,12 @@ export class MeetingDaemon {
     } catch (e) {
       warn(`meeting daemon: stop-popup-driven stop failed: ${errMsg(e)}`);
       this.recording = null;
+      this.cancelStopDowngradeTimer();
       this.pushEvent({ event: "status_changed", reason: "stop_popup_save_failed" });
       return;
     }
     this.recording = null;
+    this.cancelStopDowngradeTimer();
     if (stopped.queueRow) {
       this.pushEvent({ event: "queue_changed", reason: "stop_popup_save" });
     }
@@ -867,10 +1021,12 @@ export class MeetingDaemon {
       );
     } catch (e) {
       this.recording = null;
+      this.cancelStopDowngradeTimer();
       this.pushEvent({ event: "status_changed", reason: "record_stop_error" });
       return { error: `recorder stop failed: ${errMsg(e)}` };
     }
     this.recording = null;
+    this.cancelStopDowngradeTimer();
     this.pushEvent({ event: "status_changed", reason: "record_stopped" });
     if (result.queueRow != null) {
       this.pushEvent({ event: "queue_changed", reason: "record_save" });

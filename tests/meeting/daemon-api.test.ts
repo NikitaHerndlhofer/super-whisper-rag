@@ -1453,6 +1453,233 @@ describe("daemon: stop-recording popup on HIGH → NONE edge (v0.9.6)", () => {
 });
 
 /* -------------------------------------------------------------------------- */
+/* v0.9.10 — HIGH → MEDIUM debounced stop popup                               */
+/* -------------------------------------------------------------------------- */
+
+describe("daemon: stop-recording popup on HIGH → MEDIUM edge (v0.9.10)", () => {
+  // Re-use the edge-access cast from the HIGH → NONE describe block.
+  type DaemonEdgeAccess = {
+    onDetectionEdge: (edge: {
+      from: "NONE" | "MEDIUM" | "HIGH";
+      to: "NONE" | "MEDIUM" | "HIGH";
+      signal: {
+        confidence: "NONE" | "MEDIUM" | "HIGH";
+        reason: string;
+        evidence: {
+          mic_in_use: boolean;
+          frontmost_bundle_id: string | null;
+          running_call_apps_strict: string[];
+          running_call_apps_soft: string[];
+          browser_url: string | null;
+          browser_url_matches: boolean;
+        };
+      };
+    }) => Promise<void>;
+  };
+
+  function makeEdge(
+    from: "NONE" | "MEDIUM" | "HIGH",
+    to: "NONE" | "MEDIUM" | "HIGH",
+  ): Parameters<DaemonEdgeAccess["onDetectionEdge"]>[0] {
+    return {
+      from,
+      to,
+      signal: {
+        confidence: to,
+        reason: `${from} -> ${to}`,
+        evidence: {
+          // The v0.9.10 trigger doesn't read evidence — it acts on
+          // the (from, to) pair. Synthetic flat-true keeps the
+          // schema happy.
+          mic_in_use: to !== "NONE",
+          frontmost_bundle_id: null,
+          running_call_apps_strict: [],
+          running_call_apps_soft: [],
+          browser_url: null,
+          browser_url_matches: false,
+        },
+      },
+    };
+  }
+
+  test("HIGH → MEDIUM while recording fires the stop popup after the grace window", async () => {
+    const rec = makeFakeRecorder();
+    let popupCalls = 0;
+    const daemon = new MeetingDaemon(
+      baseOptions({
+        // Zero grace → fires on the next microtask. Tests don't
+        // care about real-time debouncing here, only that the new
+        // edge wires through to the popup at all.
+        stopDowngradeGraceMs: 0,
+        deps: {
+          spawnEventsHelper: silentEventsHandle,
+          startRecording: rec.startRecording,
+          stopRecording: rec.stopRecording,
+          askStopRecording: async () => {
+            popupCalls += 1;
+            return "save";
+          },
+        },
+      }),
+    );
+    await daemon.start();
+    try {
+      await callSocket({ op: "record_start" });
+      await (daemon as unknown as DaemonEdgeAccess).onDetectionEdge(
+        makeEdge("HIGH", "MEDIUM"),
+      );
+      // Microtask + popup resolution + state-cleanup.
+      await sleep(20);
+      expect(popupCalls).toBe(1);
+      const status = await callSocket<{ recording: boolean }>({ op: "status" });
+      expect(status.recording).toBe(false);
+    } finally {
+      await daemon.stop();
+    }
+  });
+
+  test("HIGH → MEDIUM → HIGH (user returns to meeting) cancels the timer; no popup", async () => {
+    const rec = makeFakeRecorder();
+    let popupCalls = 0;
+    const daemon = new MeetingDaemon(
+      baseOptions({
+        // Non-zero so the timer is genuinely armed (not microtask-fired)
+        // and we can observe the cancel landing before fire.
+        stopDowngradeGraceMs: 200,
+        deps: {
+          spawnEventsHelper: silentEventsHandle,
+          startRecording: rec.startRecording,
+          stopRecording: rec.stopRecording,
+          askStopRecording: async () => {
+            popupCalls += 1;
+            return "save";
+          },
+        },
+      }),
+    );
+    await daemon.start();
+    try {
+      await callSocket({ op: "record_start" });
+      // Arm the grace window.
+      await (daemon as unknown as DaemonEdgeAccess).onDetectionEdge(
+        makeEdge("HIGH", "MEDIUM"),
+      );
+      // Recovery edge inside the window cancels.
+      await (daemon as unknown as DaemonEdgeAccess).onDetectionEdge(
+        makeEdge("MEDIUM", "HIGH"),
+      );
+      // Wait past the full grace window to prove the timer can't
+      // fire after cancel.
+      await sleep(300);
+      expect(popupCalls).toBe(0);
+      const status = await callSocket<{ recording: boolean }>({ op: "status" });
+      expect(status.recording).toBe(true);
+      await callSocket({ op: "record_stop", discard: true });
+    } finally {
+      await daemon.stop();
+    }
+  });
+
+  test("HIGH → MEDIUM with no active recording is a no-op (no popup)", async () => {
+    let popupCalls = 0;
+    const daemon = new MeetingDaemon(
+      baseOptions({
+        stopDowngradeGraceMs: 0,
+        deps: {
+          spawnEventsHelper: silentEventsHandle,
+          askStopRecording: async () => {
+            popupCalls += 1;
+            return "save";
+          },
+        },
+      }),
+    );
+    await daemon.start();
+    try {
+      await (daemon as unknown as DaemonEdgeAccess).onDetectionEdge(
+        makeEdge("HIGH", "MEDIUM"),
+      );
+      await sleep(20);
+      expect(popupCalls).toBe(0);
+    } finally {
+      await daemon.stop();
+    }
+  });
+
+  test("HIGH → MEDIUM → NONE: NONE edge fires immediately and supersedes the pending timer", async () => {
+    const rec = makeFakeRecorder();
+    let popupCalls = 0;
+    const daemon = new MeetingDaemon(
+      baseOptions({
+        stopDowngradeGraceMs: 200,
+        deps: {
+          spawnEventsHelper: silentEventsHandle,
+          startRecording: rec.startRecording,
+          stopRecording: rec.stopRecording,
+          askStopRecording: async () => {
+            popupCalls += 1;
+            return "save";
+          },
+        },
+      }),
+    );
+    await daemon.start();
+    try {
+      await callSocket({ op: "record_start" });
+      // Arm the grace window.
+      await (daemon as unknown as DaemonEdgeAccess).onDetectionEdge(
+        makeEdge("HIGH", "MEDIUM"),
+      );
+      // NONE edge before the timer fires: should pop up immediately
+      // and the pending timer should be cancelled (no duplicate
+      // popup once the timer's would-have-been deadline elapses).
+      await (daemon as unknown as DaemonEdgeAccess).onDetectionEdge(
+        makeEdge("MEDIUM", "NONE"),
+      );
+      await sleep(20);
+      expect(popupCalls).toBe(1);
+      // Wait past the grace window to confirm no double-fire.
+      await sleep(250);
+      expect(popupCalls).toBe(1);
+    } finally {
+      await daemon.stop();
+    }
+  });
+
+  test("record_stop cancels a pending grace timer (no banner after manual stop)", async () => {
+    const rec = makeFakeRecorder();
+    let popupCalls = 0;
+    const daemon = new MeetingDaemon(
+      baseOptions({
+        stopDowngradeGraceMs: 200,
+        deps: {
+          spawnEventsHelper: silentEventsHandle,
+          startRecording: rec.startRecording,
+          stopRecording: rec.stopRecording,
+          askStopRecording: async () => {
+            popupCalls += 1;
+            return "save";
+          },
+        },
+      }),
+    );
+    await daemon.start();
+    try {
+      await callSocket({ op: "record_start" });
+      await (daemon as unknown as DaemonEdgeAccess).onDetectionEdge(
+        makeEdge("HIGH", "MEDIUM"),
+      );
+      // Manual stop before the grace window elapses.
+      await callSocket({ op: "record_stop", discard: true });
+      await sleep(300);
+      expect(popupCalls).toBe(0);
+    } finally {
+      await daemon.stop();
+    }
+  });
+});
+
+/* -------------------------------------------------------------------------- */
 /* v0.8.0 — configurable popup triggers                                       */
 /* -------------------------------------------------------------------------- */
 
