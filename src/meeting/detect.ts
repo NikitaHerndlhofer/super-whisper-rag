@@ -13,6 +13,17 @@
  *   - MEDIUM: mic in use alone (probably dictation — logged, no popup later)
  *   - NONE:   otherwise
  *
+ * "Mic in use" is EFFECTIVE: the helper's raw `mic.in_use` bit is the
+ * floor, but if the helper also reports `mic.owners`, we filter out
+ * our own recorder subprocess (bundle id `ai.swrag.helper`) before
+ * deciding. Without this filter, the moment our `swrag-helper record`
+ * subprocess starts capturing the mic, every other audio client could
+ * close the device and the device-level `kAudioDevicePropertyDevice
+ * IsRunningSomewhere` would still report true (because we're holding
+ * it) — masking the "meeting ended" HIGH → NONE transition and
+ * preventing the stop-recording banner from firing. See v0.9.8
+ * notes for the full story.
+ *
  * Debounce, not hysteresis: an edge (NONE→HIGH or HIGH→NONE) is held
  * for 1500 ms before being committed to subscribers. Mid-call device
  * switches that flicker the mic-in-use bit for <1.5 s are filtered
@@ -23,16 +34,40 @@
  * (mic in use, frontmost is a browser, and we don't already have
  * HIGH evidence from a running call app). The query is async on the
  * detector's side — `handleEvent` returns a Promise so callers must
- * await it. We never poll the URL on a timer.
+ * await it. We NEVER poll the URL on a timer.
+ *
+ * The "stale browser URL" concern (user closes Meet tab without
+ * changing frontmost) is handled by the mic-release event, not by
+ * URL polling: when the meeting app releases the mic, CoreAudio
+ * fires a `mic_changed` event whose new owners list no longer
+ * includes the meeting app; after the recorder-PID filter, effective
+ * mic_in_use becomes false and the detector transitions HIGH → NONE.
+ * The cached browser_url is cosmetic on the diagnostic side and
+ * non-load-bearing for the decision; the next snapshot or frontmost
+ * change re-queries it. Event-driven, no setInterval.
  */
 import { z } from "zod";
-import { verbose } from "../log.ts";
+import { verbose, warn } from "../log.ts";
 import { getBrowserUrl, isKnownBrowser } from "../mac/browser-url.ts";
 import type { EventLine } from "../mac/helper.ts";
 
 /* -------------------------------------------------------------------------- */
 /* Constants                                                                  */
 /* -------------------------------------------------------------------------- */
+
+/**
+ * Bundle identifiers belonging to swrag itself. When the mic owners
+ * list from CoreAudio includes any of these, we filter them out
+ * before evaluating the effective `mic_in_use` bit — otherwise our
+ * own recorder subprocess masks the meeting-end transition. The
+ * recorder, the long-running events helper, the menubar's
+ * notification, and any one-shot probes all share the same bundle
+ * id (`ai.swrag.helper`), so a single-string filter covers every
+ * swrag process that might hold the mic.
+ */
+export const SWRAG_OWNER_BUNDLE_IDS: ReadonlySet<string> = new Set([
+  "ai.swrag.helper",
+]);
 
 export const STRICT_CALL_APPS: ReadonlySet<string> = new Set([
   "us.zoom.xos",
@@ -140,10 +175,20 @@ interface InternalState {
  * (and ad-hoc CLI diagnostics) can pass in a snapshot and read out the
  * signal. The instance method `MeetingDetector.signal()` calls into
  * this with its accumulated state.
+ *
+ * `micOwners` is optional. If omitted (e.g. legacy test fixtures
+ * built before v0.9.8), we degrade to treating `micInUse` as the
+ * truth. If present and empty (older macOS or CoreAudio query
+ * failure), we also degrade — the mic-in-use bit alone has to do
+ * the work. If present and non-empty, we filter out our own bundle
+ * ids and use the external-owner count as the gate: zero external
+ * owners → effective mic-in-use is false, regardless of the raw bit
+ * (which our recorder process is holding open).
  */
 export function computeSignal(state: {
   frontmostBundleId: string | null;
   micInUse: boolean;
+  micOwners?: readonly string[];
   runningCallAppsStrict: ReadonlySet<string> | string[];
   runningCallAppsSoft: ReadonlySet<string> | string[];
   browserUrl: string | null;
@@ -152,11 +197,12 @@ export function computeSignal(state: {
   const softRunning = toArray(state.runningCallAppsSoft);
   const browserUrlMatches =
     state.browserUrl != null && MEETING_URL_PATTERNS.some((re) => re.test(state.browserUrl ?? ""));
+  const effectiveMicInUse = computeEffectiveMicInUse(state.micInUse, state.micOwners);
 
-  if (!state.micInUse) {
+  if (!effectiveMicInUse) {
     return {
       confidence: "NONE",
-      reason: "mic not in use",
+      reason: state.micInUse ? "mic held only by swrag (no external owner)" : "mic not in use",
       evidence: {
         mic_in_use: false,
         frontmost_bundle_id: state.frontmostBundleId,
@@ -208,6 +254,33 @@ export function computeSignal(state: {
   };
 }
 
+/**
+ * Effective `mic_in_use` after subtracting our own bundle ids from
+ * the owners list. Three branches:
+ *   1. `rawInUse` is false → effective is false.
+ *   2. `micOwners` is undefined or empty → degraded mode: trust the
+ *      raw bit alone. This covers macOS < 14.4 (where the helper
+ *      returns []) and any pre-v0.9.8 fixture that doesn't carry
+ *      owners.
+ *   3. `micOwners` is non-empty → external owners drive the answer.
+ *      `[ai.swrag.helper]` → false (only us). `[us.zoom.xos]` →
+ *      true. `[us.zoom.xos, ai.swrag.helper]` → true.
+ *
+ * Exported for tests + ad-hoc diagnostics. `computeSignal` is the
+ * one production caller.
+ */
+export function computeEffectiveMicInUse(
+  rawInUse: boolean,
+  micOwners: readonly string[] | undefined,
+): boolean {
+  if (!rawInUse) return false;
+  if (micOwners == null || micOwners.length === 0) return true;
+  for (const owner of micOwners) {
+    if (!SWRAG_OWNER_BUNDLE_IDS.has(owner)) return true;
+  }
+  return false;
+}
+
 function toArray(s: ReadonlySet<string> | string[]): string[] {
   return Array.isArray(s) ? [...s] : [...s.values()];
 }
@@ -235,6 +308,14 @@ export class MeetingDetector {
     target: MeetingConfidence;
     timer: ReturnType<typeof setTimeout>;
   } | null = null;
+  /**
+   * One-shot guard for the "degraded mode" warning. We log it once
+   * per detector lifetime the first time we see `mic_in_use=true`
+   * without any owners — that's diagnostic for "running on macOS <
+   * 14.4 or our CoreAudio query is failing, the recorder-mask fix
+   * isn't available, fall back to raw mic_in_use".
+   */
+  private degradedModeWarned = false;
   private readonly debounceMs: number;
   private readonly resolveBrowserUrl: (bundleId: string) => Promise<string | null>;
   private readonly onEdge: ((edge: MeetingEdge) => void) | undefined;
@@ -250,6 +331,7 @@ export class MeetingDetector {
     return computeSignal({
       frontmostBundleId: this.state.frontmostBundleId,
       micInUse: this.state.micInUse,
+      micOwners: this.state.micOwners,
       runningCallAppsStrict: this.state.runningCallAppsStrict,
       runningCallAppsSoft: this.state.runningCallAppsSoft,
       browserUrl: this.state.browserUrl,
@@ -347,6 +429,31 @@ export class MeetingDetector {
         this.state.micOwners = [...ev.owners];
         break;
     }
+    this.maybeWarnDegradedMode();
+  }
+
+  /**
+   * Log a one-shot warning the first time we observe `mic_in_use=true`
+   * without any owners. On macOS 14.4+ with a healthy CoreAudio query
+   * this should never happen — the moment any process opens the mic,
+   * the helper resolves at least one bundle id. An empty list at
+   * `in_use=true` means we're in degraded mode (older OS or a query
+   * failure) and the recorder-PID-mask fix is unavailable. The
+   * detector still works in this branch, but the HIGH → NONE
+   * transition relies entirely on the meeting app voluntarily
+   * releasing the mic before our recorder does — same as v0.9.7
+   * behaviour.
+   */
+  private maybeWarnDegradedMode(): void {
+    if (this.degradedModeWarned) return;
+    if (!this.state.micInUse) return;
+    if (this.state.micOwners.length > 0) return;
+    this.degradedModeWarned = true;
+    warn(
+      "detect: mic in use with empty owners list — degraded mode " +
+        "(macOS < 14.4 or CoreAudio query failed); recorder PID mask " +
+        "unavailable, falling back to raw mic_in_use",
+    );
   }
 
   /**

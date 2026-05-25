@@ -51,6 +51,46 @@ describe.skipIf(!HELPER_PRESENT)("mac/helper one-shots", () => {
     expect(Array.isArray(result.owners)).toBe(true);
   });
 
+  test(
+    "mic-in-use reports owners including ai.swrag.helper while recorder is running (v0.9.8)",
+    async () => {
+      // Regression for the v0.9.7 silent failure: owners were always
+      // empty on this machine because the bundle-id resolution went
+      // through NSRunningApplication(processIdentifier:), which
+      // returns nil for daemon-style processes. v0.9.8 resolves bundle
+      // ids directly via kAudioProcessPropertyBundleID. With the fix,
+      // any process that opens the mic shows up in owners — including
+      // our own recorder, which is what enables the
+      // recorder-PID-masking filter in detect.ts.
+      const tmp = mkdtempSync(join(tmpdir(), "swrag-rec-"));
+      const outputPath = join(tmp, "owners-probe.wav");
+      const handle = spawnRecorder({
+        outputPath,
+        captureSystemAudio: false,
+        helperPath: HELPER_PATH,
+      });
+      try {
+        // Wait for the first heartbeat so we know the mic is open.
+        const ev = await firstHeartbeat(handle.events, 2_500);
+        expect(ev).not.toBeNull();
+        const probe = await isMicInUse();
+        expect(probe.inUse).toBe(true);
+        // On macOS 14.4+, owners MUST include ai.swrag.helper while
+        // our recorder is active. Below 14.4 the helper documents
+        // owners as best-effort (empty), but our LSMinimumSystemVersion
+        // is 13.0 — so older OSes are out of scope for the test
+        // assertion. If `owners` is empty here, either we're running
+        // on macOS < 14.4 (the entire fix is N/A) or the bundle-id
+        // query regressed.
+        expect(probe.owners).toContain("ai.swrag.helper");
+      } finally {
+        await handle.stop({ discard: true });
+      }
+      rmSync(tmp, { recursive: true, force: true });
+    },
+    10_000,
+  );
+
   test("permissions-check (no --prompt) returns the nested permission report", async () => {
     const result = await getPermissions({ prompt: false });
     expect(PermissionsSchema.safeParse(result).success).toBe(true);

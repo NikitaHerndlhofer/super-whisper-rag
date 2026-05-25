@@ -62,10 +62,21 @@ func deviceIsRunningSomewhere(_ device: AudioDeviceID) -> Bool {
   return status == noErr && value != 0
 }
 
-/// macOS 14.4+ exposes a process-list audio object and per-process PID,
-/// giving us a credible "which app has the mic open right now" view.
-/// Below 14.4 we return [] — the rest of the pipeline treats the list
-/// as diagnostic, never as a confidence input.
+/// macOS 14.4+ exposes a process-list audio object, per-process PID,
+/// per-process running-input flag, and per-process bundle identifier.
+/// Together they give us a credible "which app has the mic open right
+/// now" view. Below 14.4 we return [] — the rest of the pipeline
+/// treats the list as diagnostic, never as a confidence input.
+///
+/// v0.9.8: bundle ID is resolved via `kAudioProcessPropertyBundleID`
+/// instead of `NSRunningApplication(processIdentifier:)`. The former
+/// is what CoreAudio knows about the process directly; the latter
+/// returns `nil` for any process that isn't a GUI app, which on this
+/// machine includes the swrag-helper recorder subprocess itself.
+/// That `nil` was the root cause of v0.9.7's empty owners list even
+/// though the recorder was the active mic client — leading the
+/// detector to never see a HIGH → NONE edge once we started recording,
+/// and the stop-recording banner never firing.
 func currentAudioClientBundleIDs() -> [String] {
   guard #available(macOS 14.4, *) else { return [] }
 
@@ -94,11 +105,9 @@ func currentAudioClientBundleIDs() -> [String] {
 
   var bundleIds: [String] = []
   for obj in objects {
-    guard let pid = processObjectPID(obj) else { continue }
-    // Filter to processes actually running audio right now.
-    if !processObjectIsRunning(obj) { continue }
-    if let app = NSRunningApplication(processIdentifier: pid),
-       let bid = app.bundleIdentifier {
+    // Filter to processes actually running audio input right now.
+    if !processObjectIsRunningInput(obj) { continue }
+    if let bid = processObjectBundleID(obj), !bid.isEmpty {
       bundleIds.append(bid)
     }
   }
@@ -106,20 +115,7 @@ func currentAudioClientBundleIDs() -> [String] {
 }
 
 @available(macOS 14.4, *)
-private func processObjectPID(_ obj: AudioObjectID) -> pid_t? {
-  var addr = AudioObjectPropertyAddress(
-    mSelector: kAudioProcessPropertyPID,
-    mScope: kAudioObjectPropertyScopeGlobal,
-    mElement: kAudioObjectPropertyElementMain
-  )
-  var pid: pid_t = 0
-  var size = UInt32(MemoryLayout<pid_t>.size)
-  let status = AudioObjectGetPropertyData(obj, &addr, 0, nil, &size, &pid)
-  return status == noErr ? pid : nil
-}
-
-@available(macOS 14.4, *)
-private func processObjectIsRunning(_ obj: AudioObjectID) -> Bool {
+private func processObjectIsRunningInput(_ obj: AudioObjectID) -> Bool {
   var addr = AudioObjectPropertyAddress(
     mSelector: kAudioProcessPropertyIsRunningInput,
     mScope: kAudioObjectPropertyScopeGlobal,
@@ -128,9 +124,30 @@ private func processObjectIsRunning(_ obj: AudioObjectID) -> Bool {
   var value: UInt32 = 0
   var size = UInt32(MemoryLayout<UInt32>.size)
   let status = AudioObjectGetPropertyData(obj, &addr, 0, nil, &size, &value)
-  // If `isRunningInput` isn't supported on this version, fall back to
-  // including the process — the device-level OR is still authoritative.
-  return status != noErr || value != 0
+  return status == noErr && value != 0
+}
+
+/// Resolve the process object's bundle identifier directly from
+/// CoreAudio via `kAudioProcessPropertyBundleID`. The property returns
+/// a retained CFString; we bridge into Swift's `String` and release
+/// via `takeRetainedValue()`.
+///
+/// Returns `nil` on any error or when the property is empty. An empty
+/// bundle id is real (some daemon processes have no bundle); we treat
+/// those as anonymous and exclude them from the owners list.
+@available(macOS 14.4, *)
+private func processObjectBundleID(_ obj: AudioObjectID) -> String? {
+  var addr = AudioObjectPropertyAddress(
+    mSelector: kAudioProcessPropertyBundleID,
+    mScope: kAudioObjectPropertyScopeGlobal,
+    mElement: kAudioObjectPropertyElementMain
+  )
+  var bidPtr: Unmanaged<CFString>?
+  var size = UInt32(MemoryLayout<Unmanaged<CFString>>.size)
+  let status = AudioObjectGetPropertyData(obj, &addr, 0, nil, &size, &bidPtr)
+  guard status == noErr, let unmanaged = bidPtr else { return nil }
+  let cf = unmanaged.takeRetainedValue()
+  return cf as String
 }
 
 /// One-shot mic snapshot. Used by both the `mic-in-use` subcommand and

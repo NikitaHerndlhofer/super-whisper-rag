@@ -21,6 +21,8 @@ import {
   MeetingDetector,
   MEETING_URL_PATTERNS,
   type MeetingEdge,
+  SWRAG_OWNER_BUNDLE_IDS,
+  computeEffectiveMicInUse,
   computeSignal,
 } from "../../src/meeting/detect.ts";
 
@@ -31,6 +33,7 @@ import {
 function snapshot(opts: {
   bundleId?: string | null;
   micInUse?: boolean;
+  micOwners?: string[];
   strict?: string[];
   soft?: string[];
 }): EventLine {
@@ -43,7 +46,7 @@ function snapshot(opts: {
     },
     mic: {
       in_use: opts.micInUse ?? false,
-      owners: [],
+      owners: opts.micOwners ?? [],
     },
     running_call_apps: {
       strict: opts.strict ?? [],
@@ -56,8 +59,8 @@ function frontmost(bundleId: string | null): EventLine {
   return { event: "frontmost_changed", bundle_id: bundleId, name: null, pid: null };
 }
 
-function micChanged(inUse: boolean): EventLine {
-  return { event: "mic_changed", in_use: inUse, owners: [] };
+function micChanged(inUse: boolean, owners: string[] = []): EventLine {
+  return { event: "mic_changed", in_use: inUse, owners };
 }
 
 function launched(bundleId: string): EventLine {
@@ -272,6 +275,157 @@ describe("computeSignal — confidence rules", () => {
 describe("BROWSERS set", () => {
   test("includes Perplexity Comet (ai.perplexity.comet)", () => {
     expect(BROWSERS.has("ai.perplexity.comet")).toBe(true);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* v0.9.8 — mic owners filter (recorder PID masking fix)                      */
+/* -------------------------------------------------------------------------- */
+
+describe("computeEffectiveMicInUse — owners filter", () => {
+  test("rawInUse=false short-circuits regardless of owners", () => {
+    expect(computeEffectiveMicInUse(false, undefined)).toBe(false);
+    expect(computeEffectiveMicInUse(false, [])).toBe(false);
+    expect(computeEffectiveMicInUse(false, ["us.zoom.xos"])).toBe(false);
+  });
+
+  test("owners=undefined falls back to raw (legacy fixtures + pre-v0.9.8)", () => {
+    expect(computeEffectiveMicInUse(true, undefined)).toBe(true);
+  });
+
+  test("owners=[] is degraded mode (older macOS / query failure) — trust raw", () => {
+    expect(computeEffectiveMicInUse(true, [])).toBe(true);
+  });
+
+  test("owners only contains swrag helper → no external owner → effective false", () => {
+    expect(computeEffectiveMicInUse(true, ["ai.swrag.helper"])).toBe(false);
+  });
+
+  test("owners contains an external (e.g. Zoom) → effective true", () => {
+    expect(computeEffectiveMicInUse(true, ["us.zoom.xos"])).toBe(true);
+  });
+
+  test("owners contains Zoom + swrag helper (during active recording) → effective true", () => {
+    expect(computeEffectiveMicInUse(true, ["us.zoom.xos", "ai.swrag.helper"])).toBe(true);
+  });
+
+  test("SWRAG_OWNER_BUNDLE_IDS exposes the helper bundle id used for filtering", () => {
+    expect(SWRAG_OWNER_BUNDLE_IDS.has("ai.swrag.helper")).toBe(true);
+  });
+});
+
+describe("computeSignal — owners filter integration", () => {
+  test("mic + Zoom frontmost + owners=[swrag helper only] → NONE (mic ours-only)", () => {
+    // The canonical "user closed Meet tab while we were recording"
+    // scenario: raw mic in use (we hold it), but no external owner.
+    // Confidence drops to NONE so the daemon's stop banner can fire.
+    const sig = computeSignal({
+      frontmostBundleId: "us.zoom.xos",
+      micInUse: true,
+      micOwners: ["ai.swrag.helper"],
+      runningCallAppsStrict: ["us.zoom.xos"],
+      runningCallAppsSoft: [],
+      browserUrl: null,
+    });
+    expect(sig.confidence).toBe("NONE");
+    expect(sig.evidence.mic_in_use).toBe(false);
+    expect(sig.reason).toMatch(/swrag/i);
+  });
+
+  test("mic + Zoom frontmost + owners=[Zoom, swrag helper] → HIGH (external still present)", () => {
+    const sig = computeSignal({
+      frontmostBundleId: "us.zoom.xos",
+      micInUse: true,
+      micOwners: ["us.zoom.xos", "ai.swrag.helper"],
+      runningCallAppsStrict: ["us.zoom.xos"],
+      runningCallAppsSoft: [],
+      browserUrl: null,
+    });
+    expect(sig.confidence).toBe("HIGH");
+    expect(sig.evidence.mic_in_use).toBe(true);
+  });
+
+  test("mic + browser meeting URL + owners=[swrag helper only] → NONE", () => {
+    // The Comet + Meet scenario from the v0.9.8 bug report. User
+    // closes the Meet tab; Comet releases the mic; our recorder is
+    // the last holder. Confidence drops, stop banner fires.
+    const sig = computeSignal({
+      frontmostBundleId: "ai.perplexity.comet",
+      micInUse: true,
+      micOwners: ["ai.swrag.helper"],
+      runningCallAppsStrict: [],
+      runningCallAppsSoft: [],
+      browserUrl: "https://meet.google.com/abc-defg-hij",
+    });
+    expect(sig.confidence).toBe("NONE");
+  });
+
+  test("owners=undefined keeps pre-v0.9.8 behaviour (raw mic_in_use wins)", () => {
+    const sig = computeSignal({
+      frontmostBundleId: "us.zoom.xos",
+      micInUse: true,
+      // micOwners omitted — legacy fixture / pre-v0.9.8 caller
+      runningCallAppsStrict: ["us.zoom.xos"],
+      runningCallAppsSoft: [],
+      browserUrl: null,
+    });
+    expect(sig.confidence).toBe("HIGH");
+  });
+});
+
+describe("MeetingDetector — mic owners drive HIGH → NONE transition", () => {
+  test("scripted: meeting starts, we record, meeting ends → HIGH → NONE fires", async () => {
+    // Mirrors the real Comet + Meet flow that motivated v0.9.8:
+    //   1. Mic flips on with Comet as external owner; URL matches → HIGH.
+    //   2. We start recording (helper joins owners). External owner still
+    //      present (Comet) → stays HIGH.
+    //   3. User closes the Meet tab; Comet releases the mic. Our
+    //      recorder is the only owner left → confidence drops to NONE.
+    //      Before v0.9.8 this transition never fired because the
+    //      device-level mic-in-use bit stayed true.
+    const edges: MeetingEdge[] = [];
+    const det = new MeetingDetector({
+      debounceMs: 50,
+      resolveBrowserUrl: async () => "https://meet.google.com/abc-defg-hij",
+      onEdge: (e) => edges.push(e),
+    });
+    await det.handleEvent(snapshot({ bundleId: "ai.perplexity.comet", micInUse: false }));
+    // Comet picks up the mic.
+    await det.handleEvent(micChanged(true, ["ai.perplexity.comet"]));
+    await Bun.sleep(70);
+    expect(edges.map((e) => e.to)).toEqual(["HIGH"]);
+
+    // We start recording — helper joins the owners list.
+    await det.handleEvent(micChanged(true, ["ai.perplexity.comet", "ai.swrag.helper"]));
+    await Bun.sleep(70);
+    // Still HIGH (no new edge).
+    expect(edges.map((e) => e.to)).toEqual(["HIGH"]);
+
+    // User closes Meet tab; Comet releases the mic. We're the last holder.
+    await det.handleEvent(micChanged(true, ["ai.swrag.helper"]));
+    await Bun.sleep(70);
+    expect(edges.map((e) => e.to)).toEqual(["HIGH", "NONE"]);
+    expect(edges[1]?.signal.evidence.mic_in_use).toBe(false);
+    det.dispose();
+  });
+
+  test("degraded mode (no owners) keeps the v0.9.7 path: HIGH stays HIGH until raw mic_in_use flips", async () => {
+    // Older macOS where the CoreAudio query returns no owners. The
+    // detector falls back to the raw mic_in_use bit, same as v0.9.7.
+    const edges: MeetingEdge[] = [];
+    const det = new MeetingDetector({ debounceMs: 50, onEdge: (e) => edges.push(e) });
+    await det.handleEvent(snapshot({ bundleId: "us.zoom.xos", micInUse: false }));
+    await det.handleEvent(micChanged(true)); // no owners — degraded
+    await Bun.sleep(70);
+    expect(edges.map((e) => e.to)).toEqual(["HIGH"]);
+    // Without an owners signal, we can only see HIGH → NONE when the
+    // raw bit goes low. In production this lands when the meeting app
+    // releases the mic and the recorder hasn't started yet, or when
+    // the user stops recording manually (releasing our hold).
+    await det.handleEvent(micChanged(false));
+    await Bun.sleep(70);
+    expect(edges.map((e) => e.to)).toEqual(["HIGH", "NONE"]);
+    det.dispose();
   });
 });
 
