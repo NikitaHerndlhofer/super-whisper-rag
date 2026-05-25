@@ -6,16 +6,37 @@ import UserNotifications
 /// `UNUserNotificationCenter` with optional action buttons.
 ///
 /// Stdout protocol:
-///   * On action click  → print the action identifier lowercased, exit 0.
-///   * On body click    → print the `--default-action` value lowercased, exit 0.
+///   * On action click  → print the action title verbatim, exit 0.
+///   * On body click    → print the `--default-action` value verbatim, exit 0.
 ///   * On timer expiry  → print `timeout`, exit 0.
 ///   * On auth denied   → write diagnostic to stderr, exit non-zero.
 ///   * On post failure  → write diagnostic to stderr, exit non-zero.
+///
+/// Each `--actions` piece is a single string used as BOTH the
+/// `UNNotificationAction.title` (what the user sees on the banner)
+/// AND the `UNNotificationAction.identifier` (what comes back on
+/// `response.actionIdentifier`). Identifiers accept arbitrary unicode,
+/// so callers can pass labels like `Stop & save` directly — there's
+/// no shell-escaping concern because the TS wrapper invokes the
+/// helper via `Bun.spawn` (argv array, no shell interpretation).
+///
+/// v0.9.6 introduced an `id=Display Label` parsing syntax to separate
+/// the wire-side identifier from the display label. v0.9.7 dropped it
+/// after macOS surfaced the raw `id=Label` string in the button on
+/// some systems — see CHANGELOG for the full story.
 ///
 /// We DO NOT request `.customDismissAction`, so swiping the banner
 /// away doesn't fire a delegate callback — the only way to reach
 /// the "timeout" branch is for the timer to expire (which also
 /// covers banner auto-dismiss; both look like "user didn't choose").
+///
+/// On EVERY exit path (action click, body click, dismiss, timer
+/// expiry) the helper yanks the notification from Notification
+/// Center via `removeDeliveredNotifications` + `removePendingNotification
+/// Requests` keyed by the request's UUID. v0.9.7 added this so the
+/// banner doesn't linger in the tray after the user has already
+/// responded — the helper-side intent is "one-shot prompt", not
+/// "persistent inbox item".
 ///
 /// `UNUserNotificationCenter` requires the executable to live inside
 /// a code-signed .app bundle so the system can resolve a stable
@@ -51,43 +72,12 @@ private final class NotifyDelegate: NSObject, UNUserNotificationCenterDelegate {
   }
 }
 
-private struct NotifyAction {
-  var identifier: String
-  var title: String
-}
-
 private struct NotifyArgs {
   var title: String = ""
   var body: String = ""
-  var actions: [NotifyAction] = []
+  var actions: [String] = []
   var defaultAction: String = ""
   var timeoutSec: Double = 90
-}
-
-/// Parse one piece of the `--actions` argument. Supports two shapes:
-///   * `Plain`              → identifier = title = "Plain"
-///   * `id=Display Label`   → identifier = "id", title = "Display Label"
-///
-/// The `id=title` form was introduced in v0.9.6 to support the stop-
-/// recording banner whose user-facing labels contain `&` (e.g. `Stop &
-/// save`). Using the raw label as an identifier risks future macOS
-/// changes mangling action-id matching on response, and the `&` glyph
-/// in particular has historically been a problem character for various
-/// system identifier registries. The `id=` prefix lets callers keep the
-/// wire-side identifier clean (`save`, `discard`) without losing the
-/// human-readable display label.
-private func parseNotifyAction(_ piece: String) -> NotifyAction? {
-  let trimmed = piece.trimmingCharacters(in: .whitespaces)
-  if trimmed.isEmpty { return nil }
-  if let eq = trimmed.firstIndex(of: "=") {
-    let id = String(trimmed[..<eq]).trimmingCharacters(in: .whitespaces)
-    let title = String(trimmed[trimmed.index(after: eq)...]).trimmingCharacters(in: .whitespaces)
-    let safeId = id.isEmpty ? title : id
-    let safeTitle = title.isEmpty ? id : title
-    if safeId.isEmpty { return nil }
-    return NotifyAction(identifier: safeId, title: safeTitle)
-  }
-  return NotifyAction(identifier: trimmed, title: trimmed)
 }
 
 private func parseNotifyArgs(_ args: [String]) -> NotifyArgs {
@@ -105,7 +95,8 @@ private func parseNotifyArgs(_ args: [String]) -> NotifyArgs {
       if let v = next {
         out.actions = v
           .split(separator: ",", omittingEmptySubsequences: true)
-          .compactMap { parseNotifyAction(String($0)) }
+          .map { $0.trimmingCharacters(in: .whitespaces) }
+          .filter { !$0.isEmpty }
         i += 2
       } else {
         i += 1
@@ -187,17 +178,18 @@ func runNotify(args: [String]) {
     exit(4)
   }
 
-  // Build category with action buttons. Identifiers double as
-  // stdout payloads — we want them readable downstream, so we keep
-  // the caller's casing and lowercase on the way out. Titles are
-  // independent from identifiers (v0.9.6) so callers can use safe
-  // ASCII ids on the wire while showing arbitrary display labels in
-  // the banner — see `parseNotifyAction` for the syntax.
-  let categoryId = "ai.swrag.helper.notify"
-  let unActions: [UNNotificationAction] = parsed.actions.map { action in
+  // Build category with action buttons. Each `--actions` piece
+  // doubles as both the button title (what the user sees) and the
+  // identifier (what we get back on `response.actionIdentifier`).
+  // The category id is versioned with the action shape so a macOS-
+  // side cached category from an older helper version can't poison
+  // the rendered title — v0.9.7 bumped the suffix when dropping the
+  // v0.9.6 `id=Display Label` parsing syntax.
+  let categoryId = "ai.swrag.helper.notify.v2"
+  let unActions: [UNNotificationAction] = parsed.actions.map { name in
     UNNotificationAction(
-      identifier: action.identifier,
-      title: action.title,
+      identifier: name,
+      title: name,
       options: [.foreground]
     )
   }
@@ -216,8 +208,9 @@ func runNotify(args: [String]) {
   content.categoryIdentifier = categoryId
   content.sound = .default
 
+  let requestIdentifier = UUID().uuidString
   let request = UNNotificationRequest(
-    identifier: UUID().uuidString,
+    identifier: requestIdentifier,
     content: content,
     trigger: nil
   )
@@ -247,24 +240,48 @@ func runNotify(args: [String]) {
   CFRunLoopRun()
   timer.cancel()
 
+  // Ephemeral cleanup (v0.9.7): yank the notification from Notification
+  // Center before we exit, on EVERY exit path — action click, body
+  // click, dismiss, timer expiry. Without this, the banner persists in
+  // Notification Center after the user has either acted on it or let
+  // it time out, forcing them to dismiss it again from the tray. The
+  // helper-side intent is "one-shot prompt"; the system's persistence
+  // model is the wrong fit for that. Two calls, both keyed by the
+  // identifier we stamped on the request:
+  //   * removeDeliveredNotifications — clears the banner if the system
+  //     already routed it to the user.
+  //   * removePendingNotificationRequests — clears the scheduled
+  //     request if a very short --timeout fires before delivery. Both
+  //     calls are no-ops when their respective slot is empty, so it's
+  //     safe to fire both unconditionally.
+  // These calls are best-effort and async on the system side; we don't
+  // wait for them because the helper is about to exit anyway and the
+  // removal completes inside the daemon backing UNUserNotificationCenter
+  // regardless of whether our process is still alive.
+  center.removeDeliveredNotifications(withIdentifiers: [requestIdentifier])
+  center.removePendingNotificationRequests(withIdentifiers: [requestIdentifier])
+
   // Decide what to print. We map:
-  //   - explicit action button click → its identifier (lowercased)
+  //   - explicit action button click → its identifier verbatim
   //   - body click (UNNotificationDefaultActionIdentifier) → the
-  //     caller's --default-action (lowercased)
+  //     caller's --default-action verbatim
   //   - dismiss / no callback → "timeout"
+  //
+  // v0.9.7 dropped the historical `.lowercased()` normalisation: the
+  // helper now echoes the action label exactly as the caller passed
+  // it, so the TS-side schema literals match the user-visible button
+  // text and there's no hidden casefolding step on the wire.
   let chosen = delegate.chosenActionIdentifier
   let payload: String
   switch chosen {
   case nil:
     payload = "timeout"
   case let value? where value == UNNotificationDefaultActionIdentifier:
-    payload = parsed.defaultAction.isEmpty
-      ? "timeout"
-      : parsed.defaultAction.lowercased()
+    payload = parsed.defaultAction.isEmpty ? "timeout" : parsed.defaultAction
   case let value? where value == UNNotificationDismissActionIdentifier:
     payload = "timeout"
   case let value?:
-    payload = value.lowercased()
+    payload = value
   }
   print(payload)
   exit(0)

@@ -58,7 +58,7 @@ import { verbose, warn } from "../log.ts";
 
 /**
  * Daemon-facing outcomes. `"skip"` is the implicit dismiss/timeout
- * branch — the wire-side helper only ever emits `"record"` or
+ * branch — the wire-side helper only ever emits `"Record"` or
  * `"timeout"`, and `askStartRecording` maps `"timeout"` to `"skip"`
  * before returning.
  */
@@ -66,7 +66,7 @@ export type StartChoice = "record" | "skip";
 
 /**
  * Daemon-facing outcomes. `"keep"` is the implicit dismiss/timeout
- * branch — the wire-side helper only ever emits `"save"` or
+ * branch — the wire-side helper only ever emits `"Stop & save"` or
  * `"timeout"`, and `askStopRecording` maps `"timeout"` to `"keep"`
  * before returning. The discard path moved out of the banner in
  * v0.9.6 — users discard via the menu bar or
@@ -142,7 +142,7 @@ const DEFAULT_GIVE_UP_AFTER_SEC = 60;
 /**
  * Fire a native banner notification asking the user whether to start
  * recording the current meeting. Wire-level outcomes:
- *   - helper prints `record` → user clicked Record (or the banner
+ *   - helper prints `Record` → user clicked Record (or the banner
  *     body, which defaults to Record).
  *   - helper prints `timeout` → banner auto-dismissed or the user
  *     swiped it away. We map this to `"skip"`.
@@ -169,7 +169,7 @@ export async function askStartRecording(opts: AskStartOptions): Promise<StartCho
     return "skip";
   }
   verbose(`askStartRecording: notify result=${result}`);
-  return result === "record" ? "record" : "skip";
+  return result === "Record" ? "record" : "skip";
 }
 
 /* -------------------------------------------------------------------------- */
@@ -180,9 +180,9 @@ export async function askStartRecording(opts: AskStartOptions): Promise<StartCho
  * Fire a native banner notification asking the user whether to stop
  * the current recording after a debounce-confirmed `HIGH → NONE`
  * mic edge. Wire-level outcomes:
- *   - helper prints `save` → user clicked Stop & save (or the
- *     banner body, which defaults to save). Caller stops the
- *     recorder and enqueues the wav.
+ *   - helper prints `Stop & save` → user clicked Stop & save (or
+ *     the banner body, which defaults to that action). Caller stops
+ *     the recorder and enqueues the wav.
  *   - helper prints `timeout` → banner auto-dismissed or the user
  *     swiped it away. We map this to `"keep"`. Caller does nothing;
  *     recording continues. The next `HIGH → NONE` debounce edge
@@ -209,7 +209,7 @@ export async function askStopRecording(opts: AskStopOptions): Promise<StopChoice
     return "keep";
   }
   verbose(`askStopRecording: notify result=${result}`);
-  return result === "save" ? "save" : "keep";
+  return result === "Stop & save" ? "save" : "keep";
 }
 
 /* -------------------------------------------------------------------------- */

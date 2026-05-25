@@ -2,13 +2,15 @@
  * Popup module tests.
  *
  * v0.9.6 collapsed both banners to a single action button each — see
- * the module header in `src/meeting/popup.ts` for the rationale. The
- * two functions under test:
+ * the module header in `src/meeting/popup.ts` for the rationale.
+ * v0.9.7 dropped the `id=Display Label` parsing in the Swift helper,
+ * so the wire literals now match the user-visible button labels
+ * exactly. The two functions under test:
  *
- *   - `askStartRecording` — wire result `record` / `timeout`. Maps
+ *   - `askStartRecording` — wire result `Record` / `timeout`. Maps
  *     `timeout` → `"skip"`.
- *   - `askStopRecording` — wire result `save` / `timeout`. Maps
- *     `timeout` → `"keep"`.
+ *   - `askStopRecording` — wire result `Stop & save` / `timeout`.
+ *     Maps `timeout` → `"keep"`.
  *
  * Both real Swift-helper paths are dependency-injected via the
  * `fireNotification` option, so the suite never fires a real banner.
@@ -34,11 +36,11 @@ describe("escapeForAppleScript", () => {
 });
 
 describe("askStartRecording (v0.9.6 single-action banner)", () => {
-  test("notify returning 'record' propagates as 'record'", async () => {
+  test("notify returning 'Record' propagates as 'record' (wire literal → daemon-facing)", async () => {
     const r = await askStartRecording({
       reason: "Test",
       giveUpAfterSec: 1,
-      fireNotification: async () => "record",
+      fireNotification: async () => "Record",
     });
     expect(r).toBe("record");
   });
@@ -94,11 +96,11 @@ describe("askStartRecording (v0.9.6 single-action banner)", () => {
 });
 
 describe("askStopRecording (v0.9.6 single-action banner)", () => {
-  test("notify returning 'save' propagates as 'save'", async () => {
+  test("notify returning 'Stop & save' propagates as 'save' (wire literal → daemon-facing)", async () => {
     const r = await askStopRecording({
       elapsedSec: 120,
       giveUpAfterSec: 1,
-      fireNotification: async () => "save",
+      fireNotification: async () => "Stop & save",
     });
     expect(r).toBe("save");
   });
@@ -131,7 +133,7 @@ describe("askStopRecording (v0.9.6 single-action banner)", () => {
       giveUpAfterSec: 45,
       fireNotification: async (opts: FireStopRecordingNotificationOptions) => {
         captured = { elapsedSec: opts.elapsedSec, timeoutSeconds: opts.timeoutSeconds };
-        return "save";
+        return "Stop & save";
       },
     });
     expect(captured).not.toBeNull();

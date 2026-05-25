@@ -1121,8 +1121,12 @@ export function spawnRecorder(opts: RecorderOptions): RecorderHandle {
  * the module header in `popup.ts` for the rationale. The "Skip"
  * literal that used to live here is gone; dismiss/timeout IS the
  * skip path.
+ *
+ * v0.9.7 dropped the `id=Display Label` parsing syntax: the helper
+ * now echoes the action label verbatim on the wire, so this literal
+ * matches the user-visible button text exactly (`Record`).
  */
-const StartNotifyResultSchema = z.union([z.literal("record"), z.literal("timeout")]);
+const StartNotifyResultSchema = z.union([z.literal("Record"), z.literal("timeout")]);
 export type StartNotifyResult = z.infer<typeof StartNotifyResultSchema>;
 
 export interface FireStartRecordingNotificationOptions {
@@ -1153,7 +1157,7 @@ const NOTIFY_PROCESS_BUFFER_MS = 3_000;
 
 /**
  * Fire a native UNUserNotificationCenter banner with a single
- * `Record` action button. Returns `"record"` if the user clicked
+ * `Record` action button. Returns `"Record"` if the user clicked
  * the button (or the banner body, which defaults to Record), or
  * `"timeout"` on banner expiry / dismiss.
  *
@@ -1185,9 +1189,16 @@ export async function fireStartRecordingNotification(
     warn(`fireStartRecordingNotification: helper unresolved: ${errToString(e)}`);
     return "timeout";
   }
-  // Single-action banner (v0.9.6): use the `id=Display Label` syntax
-  // so the wire-side identifier stays safe ASCII even if a future
-  // localised label slips a special character in.
+  // Single-action banner. The label `Record` doubles as the wire-
+  // side identifier — the helper echoes whichever label the user
+  // clicked on stdout (or the --default-action value, also `Record`,
+  // on a body click), see `Notify.swift` for the protocol. v0.9.7
+  // dropped the v0.9.6 `id=Label` syntax: macOS surfaced the raw
+  // `record=Record` string in the button on some systems, and the
+  // separation between wire id and display label wasn't worth the
+  // failure surface (identifiers accept arbitrary unicode, and
+  // `Bun.spawn` passes argv as an array so there's no shell to
+  // escape against).
   const args = [
     bin,
     "notify",
@@ -1196,9 +1207,9 @@ export async function fireStartRecordingNotification(
     "--body",
     opts.reason,
     "--actions",
-    "record=Record",
+    "Record",
     "--default-action",
-    "record",
+    "Record",
     "--timeout",
     String(timeoutSec),
   ];
@@ -1230,9 +1241,9 @@ export async function fireStartRecordingNotification(
 
 /**
  * Wire-level result of the stop-recording `notify` invocation. The
- * Swift helper lowercases identifiers before printing them, so on a
- * button click stdout reads `save`; `timeout` comes from the
- * helper's own timer expiry / dismiss path.
+ * Swift helper echoes the action label verbatim on a button click,
+ * so stdout reads `Stop & save`; `timeout` comes from the helper's
+ * own timer expiry / dismiss path.
  *
  * v0.9.6 collapsed the stop banner to a single action for the same
  * reason the start banner did — see `fireStartRecordingNotification`'s
@@ -1240,8 +1251,14 @@ export async function fireStartRecordingNotification(
  * user discards via the menu bar or the
  * `swrag meeting queue discard <id>` CLI after the recording has
  * been saved to the queue.
+ *
+ * v0.9.7 dropped the `id=Display Label` parsing syntax: the literal
+ * here matches the user-visible button text exactly. The `&` glyph
+ * round-trips fine because the TS wrapper spawns the helper via
+ * `Bun.spawn` (argv array, no shell) and `UNNotificationAction`
+ * accepts arbitrary unicode for both `identifier` and `title`.
  */
-const StopNotifyResultSchema = z.union([z.literal("save"), z.literal("timeout")]);
+const StopNotifyResultSchema = z.union([z.literal("Stop & save"), z.literal("timeout")]);
 export type StopNotifyResult = z.infer<typeof StopNotifyResultSchema>;
 
 export interface FireStopRecordingNotificationOptions {
@@ -1263,9 +1280,9 @@ export interface FireStopRecordingNotificationOptions {
  * Fire a native UNUserNotificationCenter banner asking the user
  * whether to stop the current recording after a debounce-confirmed
  * `HIGH → NONE` mic edge. Single action: `Stop & save`. Returns
- * `"save"` on click (or body click — default action is also `save`),
- * or `"timeout"` on banner expiry / dismiss / any helper-side
- * failure.
+ * `"Stop & save"` on click (or body click — default action is also
+ * `Stop & save`), or `"timeout"` on banner expiry / dismiss / any
+ * helper-side failure.
  *
  * Failure modes (all return `"timeout"` rather than throwing, so the
  * daemon never crashes on a notification path):
@@ -1291,9 +1308,11 @@ export async function fireStopRecordingNotification(
     warn(`fireStopRecordingNotification: helper unresolved: ${errToString(e)}`);
     return "timeout";
   }
-  // Use `id=title` syntax (v0.9.6) so the wire-side identifier stays
-  // safe ASCII even though the display label contains `&` — see the
-  // Swift `parseNotifyAction` doc for the reasoning.
+  // Single-action banner. The label `Stop & save` doubles as the
+  // wire-side identifier — the helper echoes whichever label the
+  // user clicked on stdout (or the --default-action value, also
+  // `Stop & save`, on a body click). See the schema doc above for
+  // why v0.9.7 collapsed the wire-id / display-label split.
   const args = [
     bin,
     "notify",
@@ -1302,9 +1321,9 @@ export async function fireStopRecordingNotification(
     "--body",
     `Stop recording? (elapsed ${formatElapsedForBody(opts.elapsedSec)})`,
     "--actions",
-    "save=Stop & save",
+    "Stop & save",
     "--default-action",
-    "save",
+    "Stop & save",
     "--timeout",
     String(timeoutSec),
   ];

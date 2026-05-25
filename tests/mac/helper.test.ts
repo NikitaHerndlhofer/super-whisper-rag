@@ -265,19 +265,19 @@ describe.skipIf(!HELPER_PRESENT)("spawnRecorder (real binary)", () => {
  * binary in the next block, behind the `--actions` shape check.
  */
 describe("fireStartRecordingNotification (stubbed exec)", () => {
-  test("stdout 'record' → 'record'", async () => {
+  test("stdout 'Record' → 'Record'", async () => {
     const r = await fireStartRecordingNotification({
       reason: "Test",
       timeoutSeconds: 5,
       helperPath: "/usr/bin/true",
-      exec: async () => ({ exitCode: 0, stdout: "record\n", stderr: "" }),
+      exec: async () => ({ exitCode: 0, stdout: "Record\n", stderr: "" }),
     });
-    expect(r).toBe("record");
+    expect(r).toBe("Record");
   });
 
   // v0.9.6 dropped the explicit "skip" action button — the start
   // banner is now single-action (Record). Anything other than
-  // "record" or "timeout" degrades to "timeout" via the schema
+  // "Record" or "timeout" degrades to "timeout" via the schema
   // validator; we assert that fallback here using the legacy literal
   // so a future regression that re-introduces a "skip" wire payload
   // can't accidentally pass through unmapped.
@@ -287,6 +287,23 @@ describe("fireStartRecordingNotification (stubbed exec)", () => {
       timeoutSeconds: 5,
       helperPath: "/usr/bin/true",
       exec: async () => ({ exitCode: 0, stdout: "skip\n", stderr: "" }),
+    });
+    expect(r).toBe("timeout");
+  });
+
+  // v0.9.7 dropped the helper-side `.lowercased()` normalisation on
+  // the wire payload. The schema literal is now case-sensitive: an
+  // accidental lowercase `record` (e.g. from a stale v0.9.6 helper
+  // binary that's still in the user's temp cache) must degrade to
+  // "timeout" rather than be silently accepted as the affirmative
+  // path — otherwise we'd start recording without the user actually
+  // clicking the button.
+  test("stdout 'record' (legacy lowercased) → 'timeout' (v0.9.7 wire literal is case-sensitive)", async () => {
+    const r = await fireStartRecordingNotification({
+      reason: "Test",
+      timeoutSeconds: 5,
+      helperPath: "/usr/bin/true",
+      exec: async () => ({ exitCode: 0, stdout: "record\n", stderr: "" }),
     });
     expect(r).toBe("timeout");
   });
@@ -341,19 +358,21 @@ describe("fireStartRecordingNotification (stubbed exec)", () => {
       helperPath: "/tmp/fake-helper",
       exec: async (cmd) => {
         captured = [...cmd];
-        return { exitCode: 0, stdout: "record\n", stderr: "" };
+        return { exitCode: 0, stdout: "Record\n", stderr: "" };
       },
     });
     expect(captured[0]).toBe("/tmp/fake-helper");
     expect(captured[1]).toBe("notify");
     expect(captured).toContain("--actions");
     const actionsIdx = captured.indexOf("--actions");
-    // v0.9.6: single-action banner using the `id=Display Label`
-    // syntax. Wire-side id stays safe ASCII; display label is what
-    // the user sees in the banner.
-    expect(captured[actionsIdx + 1]).toBe("record=Record");
+    // v0.9.7: single-action banner. The action label `Record`
+    // doubles as the wire-side identifier — helper echoes it
+    // verbatim on click. (v0.9.6 used `id=Display Label` parsing;
+    // macOS surfaced the raw `id=Label` string in the button on
+    // some systems, so we collapsed back to a single string.)
+    expect(captured[actionsIdx + 1]).toBe("Record");
     const defaultIdx = captured.indexOf("--default-action");
-    expect(captured[defaultIdx + 1]).toBe("record");
+    expect(captured[defaultIdx + 1]).toBe("Record");
     const timeoutIdx = captured.indexOf("--timeout");
     expect(captured[timeoutIdx + 1]).toBe("12");
     const bodyIdx = captured.indexOf("--body");
@@ -394,12 +413,14 @@ describe.skipIf(!HELPER_PRESENT || NOTIFY_SMOKE_DISABLED)(
         });
         // Acceptable outcomes:
         //   * "timeout" — banner auto-dismissed (no user click).
-        //   * "record" — the suite runner happened to click.
+        //   * "Record" — the suite runner happened to click.
         //   * Auth-denied paths degrade to "timeout" via the wrapper,
         //     same as a true timeout — they're equivalent from the
         //     daemon's POV.
-        // (v0.9.6 dropped the legacy "skip" wire payload.)
-        expect(["record", "timeout"]).toContain(r);
+        // (v0.9.6 dropped the legacy "skip" wire payload; v0.9.7
+        // dropped the helper-side lowercasing, so the affirmative
+        // wire literal is now case-sensitive `Record`.)
+        expect(["Record", "timeout"]).toContain(r);
       },
       10_000,
     );
@@ -412,20 +433,20 @@ describe.skipIf(!HELPER_PRESENT || NOTIFY_SMOKE_DISABLED)(
 
 /**
  * Symmetric with the start-notification block. The stop banner is
- * single-action (`Stop & save`) — anything other than `save` /
- * `timeout` on stdout degrades to `"timeout"`. The daemon's
+ * single-action (`Stop & save`) — anything other than `Stop & save`
+ * / `timeout` on stdout degrades to `"timeout"`. The daemon's
  * `popup.ts::askStopRecording` then maps `"timeout"` to the
  * user-facing `"keep"`.
  */
 describe("fireStopRecordingNotification (stubbed exec)", () => {
-  test("stdout 'save' → 'save'", async () => {
+  test("stdout 'Stop & save' → 'Stop & save'", async () => {
     const r = await fireStopRecordingNotification({
       elapsedSec: 65,
       timeoutSeconds: 5,
       helperPath: "/usr/bin/true",
-      exec: async () => ({ exitCode: 0, stdout: "save\n", stderr: "" }),
+      exec: async () => ({ exitCode: 0, stdout: "Stop & save\n", stderr: "" }),
     });
-    expect(r).toBe("save");
+    expect(r).toBe("Stop & save");
   });
 
   test("stdout 'timeout' → 'timeout'", async () => {
@@ -452,6 +473,22 @@ describe("fireStopRecordingNotification (stubbed exec)", () => {
     expect(r).toBe("timeout");
   });
 
+  test("legacy 'save' (v0.9.6 lowercased wire id) degrades to 'timeout'", async () => {
+    // v0.9.7 dropped the helper-side `.lowercased()` normalisation
+    // and the `id=Display Label` parsing — the wire literal is now
+    // the exact action label (`Stop & save`). A stale helper binary
+    // emitting the v0.9.6 lowercased id `save` must NOT slip through
+    // as the affirmative path: degrade to "timeout" so the daemon
+    // keeps recording (the next mic edge will re-fire the banner).
+    const r = await fireStopRecordingNotification({
+      elapsedSec: 65,
+      timeoutSeconds: 5,
+      helperPath: "/usr/bin/true",
+      exec: async () => ({ exitCode: 0, stdout: "save\n", stderr: "" }),
+    });
+    expect(r).toBe("timeout");
+  });
+
   test("non-zero exit degrades to 'timeout' rather than throwing", async () => {
     const r = await fireStopRecordingNotification({
       elapsedSec: 65,
@@ -474,7 +511,7 @@ describe("fireStopRecordingNotification (stubbed exec)", () => {
     expect(r).toBe("timeout");
   });
 
-  test("argv shape: single action `save=Stop & save`, default-action `save`, elapsed in body", async () => {
+  test("argv shape: single action `Stop & save`, default-action `Stop & save`, elapsed in body", async () => {
     let captured: string[] = [];
     await fireStopRecordingNotification({
       elapsedSec: 125, // 2:05
@@ -482,15 +519,18 @@ describe("fireStopRecordingNotification (stubbed exec)", () => {
       helperPath: "/tmp/fake-helper",
       exec: async (cmd) => {
         captured = [...cmd];
-        return { exitCode: 0, stdout: "save\n", stderr: "" };
+        return { exitCode: 0, stdout: "Stop & save\n", stderr: "" };
       },
     });
     expect(captured[0]).toBe("/tmp/fake-helper");
     expect(captured[1]).toBe("notify");
     const actionsIdx = captured.indexOf("--actions");
-    expect(captured[actionsIdx + 1]).toBe("save=Stop & save");
+    // v0.9.7: action label doubles as wire identifier (no `=` split).
+    // `Bun.spawn` passes argv as an array, so `&` and spaces in
+    // `Stop & save` round-trip cleanly without shell escaping.
+    expect(captured[actionsIdx + 1]).toBe("Stop & save");
     const defaultIdx = captured.indexOf("--default-action");
-    expect(captured[defaultIdx + 1]).toBe("save");
+    expect(captured[defaultIdx + 1]).toBe("Stop & save");
     const timeoutIdx = captured.indexOf("--timeout");
     expect(captured[timeoutIdx + 1]).toBe("7");
     const bodyIdx = captured.indexOf("--body");
