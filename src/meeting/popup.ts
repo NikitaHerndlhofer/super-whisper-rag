@@ -1,20 +1,29 @@
 /**
  * macOS popup + notification surface for the meeting capture daemon.
  *
- * Two functions, both reachable from `daemon.ts`:
+ * Two functions, both reachable from `daemon.ts`. Both fire native
+ * UNUserNotificationCenter banners via `swrag-helper notify`. v0.9.6
+ * collapsed each banner to a single action button — see the README's
+ * "About the meeting watcher" section for the user-facing rationale,
+ * and the inline comment on each function for the wire mapping.
  *
- *   - `askStartRecording({ reason })` — fires a native banner via
- *     `swrag-helper notify` (UNUserNotificationCenter), buttons:
- *     {Record, Skip}, auto-dismiss after 90 s. Returns
- *     `"record" | "skip" | "timeout"`. The banner is non-modal: it
- *     slides in from the top-right and the user can ignore it without
- *     losing focus on whatever meeting tool they're already in.
+ *   - `askStartRecording({ reason })` — banner with one action,
+ *     `Record`. Dismiss / timeout (60 s default) maps to `"skip"` —
+ *     the user expressed no interest in this meeting, so don't
+ *     record. Returns `"record" | "skip"`.
  *
- *   - `notifyAutoStopped({ wavPath, queueRowId })` — `osascript
- *     display notification`, non-modal banner. The undo window itself
- *     (5 s) is tracked in the daemon's status state — this function
- *     just nudges the user that the wav was saved and points them at
- *     the menu bar.
+ *   - `askStopRecording({ elapsedSec })` — banner with one action,
+ *     `Stop & save`. Dismiss / timeout (60 s default) maps to
+ *     `"keep"` — the user is still in the conversation, keep the
+ *     recorder running. Returns `"save" | "keep"`.
+ *
+ * Why a single action? macOS Tahoe (and earlier) only renders inline
+ * action buttons on the banner when the notification has one action;
+ * two or more actions are hidden behind the "Options" dropdown unless
+ * the user has notification style set to "Alerts" (which most people
+ * don't). One action keeps the affirmative path one click away
+ * regardless of style. The negative path (skip / keep) is implicit:
+ * dismiss the notification, or let it time out.
  *
  * v0.9.0 swapped the start-recording prompt from `osascript display
  * dialog` (modal, focus-stealing) to a UNUserNotificationCenter
@@ -24,19 +33,22 @@
  *   - Doesn't steal focus from the current meeting tool.
  *   - Shows the same way regardless of which Space the user is on.
  *
- * notifyAutoStopped stays on `osascript display notification` for
- * symmetry with the previous behaviour — it's a fire-and-forget
- * single-line notice with no action buttons, where the only real
- * difference (no FocusManager support in osascript) is a non-issue
- * because auto-stop is itself an end-of-meeting event.
+ * v0.9.6 promoted the stop path onto the same native-banner stack so
+ * the two surfaces stay symmetric. The pre-v0.9.6 `notifyAutoStopped`
+ * osascript banner is gone — it had no action buttons, and the
+ * menu-bar `Undo` window was unintuitive (decision lived three clicks
+ * away, in a different UI surface, with a five-second timer).
  *
  * Both run external commands, but the actual exec / spawn is an
- * injectable dependency so tests don't fire real banners or dialogs.
+ * injectable dependency so tests don't fire real banners.
  */
 import {
   fireStartRecordingNotification as defaultFireStartRecording,
+  fireStopRecordingNotification as defaultFireStopRecording,
   type FireStartRecordingNotificationOptions,
-  type NotifyResult,
+  type FireStopRecordingNotificationOptions,
+  type StartNotifyResult,
+  type StopNotifyResult,
 } from "../mac/helper.ts";
 import { verbose, warn } from "../log.ts";
 
@@ -44,14 +56,33 @@ import { verbose, warn } from "../log.ts";
 /* Public API                                                                 */
 /* -------------------------------------------------------------------------- */
 
-export type StartChoice = "record" | "skip" | "timeout";
+/**
+ * Daemon-facing outcomes. `"skip"` is the implicit dismiss/timeout
+ * branch — the wire-side helper only ever emits `"record"` or
+ * `"timeout"`, and `askStartRecording` maps `"timeout"` to `"skip"`
+ * before returning.
+ */
+export type StartChoice = "record" | "skip";
+
+/**
+ * Daemon-facing outcomes. `"keep"` is the implicit dismiss/timeout
+ * branch — the wire-side helper only ever emits `"save"` or
+ * `"timeout"`, and `askStopRecording` maps `"timeout"` to `"keep"`
+ * before returning. The discard path moved out of the banner in
+ * v0.9.6 — users discard via the menu bar or
+ * `swrag meeting queue discard <id>` after the recording has been
+ * saved to the queue.
+ */
+export type StopChoice = "save" | "keep";
 
 export interface AskStartOptions {
   /** Reason shown to the user; e.g. "Meeting detected — Zoom is frontmost…". */
   reason: string;
   /**
-   * Override the timeout in seconds. Defaults to 90 (per the design
-   * review). Tests use a sub-second value so they don't actually wait.
+   * Override the timeout in seconds. Defaults to 60. Tests use a
+   * sub-second value so they don't actually wait. v0.9.6 dropped
+   * this from 90 → 60: dismiss/timeout no longer triggers an
+   * action, so a long deadline only delays the implicit skip.
    */
   giveUpAfterSec?: number;
   /**
@@ -69,11 +100,23 @@ export interface AskStartOptions {
   exec?: ExecFn;
 }
 
-export interface NotifyOptions {
-  wavPath: string;
-  queueRowId: number;
-  /** Inject an exec for tests; defaults to the real `osascript`. */
-  exec?: ExecFn;
+export interface AskStopOptions {
+  /**
+   * Elapsed recording time at the moment the daemon asks; rendered
+   * into the body as "(elapsed M:SS)" so the user has context for
+   * which recording is being asked about.
+   */
+  elapsedSec: number;
+  /**
+   * Override the timeout in seconds. Defaults to 60. On timeout the
+   * caller treats the outcome as "keep" — see the module header.
+   */
+  giveUpAfterSec?: number;
+  /**
+   * Inject a notification firing function for tests. Defaults to
+   * `fireStopRecordingNotification` from `src/mac/helper.ts`.
+   */
+  fireNotification?: typeof defaultFireStopRecording;
 }
 
 export interface ExecResult {
@@ -85,8 +128,8 @@ export interface ExecResult {
 /**
  * Minimal exec-like contract. Production passes a thin `Bun.spawn`
  * wrapper; tests pass a stub that records calls and returns canned
- * results. Returns the unparsed stdout/stderr exactly as macOS's
- * osascript emits them — the parsing happens in this module.
+ * results. Unused on the post-v0.9.0 banner code path; retained as
+ * a type so legacy test scaffolds still compile.
  */
 export type ExecFn = (cmd: string[]) => Promise<ExecResult>;
 
@@ -94,21 +137,20 @@ export type ExecFn = (cmd: string[]) => Promise<ExecResult>;
 /* askStartRecording                                                          */
 /* -------------------------------------------------------------------------- */
 
-const DEFAULT_GIVE_UP_AFTER_SEC = 90;
+const DEFAULT_GIVE_UP_AFTER_SEC = 60;
 
 /**
  * Fire a native banner notification asking the user whether to start
- * recording the current meeting. Returns:
- *   - `"record"` if the user clicked the Record action button (or
- *     the banner body, which defaults to Record).
- *   - `"skip"` if the user clicked Skip.
- *   - `"timeout"` if the banner auto-dismissed or the user swiped
- *     it away.
+ * recording the current meeting. Wire-level outcomes:
+ *   - helper prints `record` → user clicked Record (or the banner
+ *     body, which defaults to Record).
+ *   - helper prints `timeout` → banner auto-dismissed or the user
+ *     swiped it away. We map this to `"skip"`.
  *
- * Errors from the helper (auth denied, spawn failure, schema mismatch
- * on stdout) are surfaced via `warn()` and degraded to `"timeout"`
- * — we never want a notification failure to take the daemon down or
- * accidentally start recording without consent.
+ * Any error (auth denied, spawn failure, schema mismatch on stdout)
+ * is surfaced via `warn()` and degraded to `"skip"`. We never want a
+ * notification failure to take the daemon down or accidentally start
+ * recording without consent.
  */
 export async function askStartRecording(opts: AskStartOptions): Promise<StartChoice> {
   const giveUpAfter = opts.giveUpAfterSec ?? DEFAULT_GIVE_UP_AFTER_SEC;
@@ -117,53 +159,57 @@ export async function askStartRecording(opts: AskStartOptions): Promise<StartCho
     reason: opts.reason,
     timeoutSeconds: giveUpAfter,
   };
-  let result: NotifyResult;
+  let result: StartNotifyResult;
   try {
     result = await fire(fireOpts);
   } catch (e) {
     warn(
       `askStartRecording: notification failed: ${e instanceof Error ? e.message : String(e)}`,
     );
-    return "timeout";
+    return "skip";
   }
   verbose(`askStartRecording: notify result=${result}`);
-  return result;
+  return result === "record" ? "record" : "skip";
 }
 
 /* -------------------------------------------------------------------------- */
-/* notifyAutoStopped                                                          */
+/* askStopRecording                                                           */
 /* -------------------------------------------------------------------------- */
 
 /**
- * Fire a non-modal notification banner announcing the auto-stop.
- * Body mentions "saved" and "undo via menu bar within 5 s" — the
- * actual undo window is owned by the daemon, this function only
- * informs the user.
+ * Fire a native banner notification asking the user whether to stop
+ * the current recording after a debounce-confirmed `HIGH → NONE`
+ * mic edge. Wire-level outcomes:
+ *   - helper prints `save` → user clicked Stop & save (or the
+ *     banner body, which defaults to save). Caller stops the
+ *     recorder and enqueues the wav.
+ *   - helper prints `timeout` → banner auto-dismissed or the user
+ *     swiped it away. We map this to `"keep"`. Caller does nothing;
+ *     recording continues. The next `HIGH → NONE` debounce edge
+ *     will re-fire the banner if the user has actually stopped.
  *
- * Errors are logged but never thrown — losing a notification is
- * cosmetic; losing the daemon over a notification failure is not.
+ * Same failure semantics as `askStartRecording`: any error
+ * (auth denied, spawn failure, malformed stdout) degrades to
+ * `"keep"`. Losing data is worse than asking again.
  */
-export async function notifyAutoStopped(opts: NotifyOptions): Promise<void> {
-  const exec = opts.exec ?? defaultExec;
-  const title = "Meeting recording saved";
-  const subtitle = "Auto-stopped — undo via menu bar within 5 s";
-  // Embed the wav basename in the message so multiple stacked
-  // notifications stay distinguishable. Path is wrapped in
-  // escapeForAppleScript to defang quotes / backslashes in
-  // unexpected filenames.
-  const basename = opts.wavPath.split("/").pop() ?? opts.wavPath;
-  const body = `Saved ${escapeForAppleScript(basename)} (queue id ${opts.queueRowId})`;
-  const script =
-    `display notification "${body}" with title "${escapeForAppleScript(title)}" ` +
-    `subtitle "${escapeForAppleScript(subtitle)}"`;
+export async function askStopRecording(opts: AskStopOptions): Promise<StopChoice> {
+  const giveUpAfter = opts.giveUpAfterSec ?? DEFAULT_GIVE_UP_AFTER_SEC;
+  const fire = opts.fireNotification ?? defaultFireStopRecording;
+  const fireOpts: FireStopRecordingNotificationOptions = {
+    elapsedSec: opts.elapsedSec,
+    timeoutSeconds: giveUpAfter,
+  };
+  let result: StopNotifyResult;
   try {
-    const r = await exec(["osascript", "-e", script]);
-    if (r.exitCode !== 0) {
-      warn(`notifyAutoStopped: osascript exit=${r.exitCode} stderr=${r.stderr.trim()}`);
-    }
+    result = await fire(fireOpts);
   } catch (e) {
-    warn(`notifyAutoStopped failed: ${e instanceof Error ? e.message : String(e)}`);
+    warn(
+      `askStopRecording: notification failed: ${e instanceof Error ? e.message : String(e)}`,
+    );
+    return "keep";
   }
+  verbose(`askStopRecording: notify result=${result}`);
+  return result === "save" ? "save" : "keep";
 }
 
 /* -------------------------------------------------------------------------- */
@@ -171,29 +217,11 @@ export async function notifyAutoStopped(opts: NotifyOptions): Promise<void> {
 /* -------------------------------------------------------------------------- */
 
 /**
- * Defensively escape characters that would break out of the inner
- * double-quoted AppleScript string. We only call this for strings the
- * daemon constructs from app names / paths / our own reason text — but
- * defending against backslashes and quotes here is cheap insurance.
- *
- * Exposed for testing.
+ * Defensively escape characters that would break out of an inner
+ * double-quoted AppleScript string. Unused on the post-v0.9.0 banner
+ * code path; retained as an exported helper for tests + any
+ * downstream consumer that still builds AppleScript strings.
  */
 export function escapeForAppleScript(s: string): string {
   return s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 }
-
-const DEFAULT_EXEC: ExecFn = async (cmd: string[]): Promise<ExecResult> => {
-  const proc = Bun.spawn(cmd, {
-    stdout: "pipe",
-    stderr: "pipe",
-    stdin: "ignore",
-  });
-  const [stdout, stderr] = await Promise.all([
-    Bun.readableStreamToText(proc.stdout),
-    Bun.readableStreamToText(proc.stderr),
-  ]);
-  const exitCode = await proc.exited;
-  return { exitCode, stdout, stderr };
-};
-
-const defaultExec = DEFAULT_EXEC;

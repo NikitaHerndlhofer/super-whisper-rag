@@ -9,11 +9,14 @@
  *     `queue_list` / `queue_discard` socket ops.
  *   - Phase 2 detector: consumes the events-helper stdout pipe and
  *     emits MeetingEdge transitions. NONE → HIGH triggers the start
- *     popup; HIGH → NONE while recording triggers the auto-stop with
- *     a 5 s undo window.
+ *     popup; HIGH → NONE while recording fires the stop popup
+ *     (`askStopRecording`). The stop popup is symmetric with the
+ *     start popup: native banner, single action, 60 s timeout,
+ *     dismiss = "no, keep recording".
  *   - Phase 3 recorder: spawned on `record_start`; SIGTERMed on
- *     `record_stop` or auto-stop. The recorder's own SIGPIPE-resilience
- *     means if the daemon dies the wav still flushes cleanly.
+ *     `record_stop` or after the user confirms the stop popup. The
+ *     recorder's own SIGPIPE-resilience means if the daemon dies the
+ *     wav still flushes cleanly.
  *
  * Surface: a unix socket at
  * `~/Library/Application Support/superwhisper-rag/meeting.sock` with
@@ -75,8 +78,7 @@ import {
 import * as queue from "./queue.ts";
 import {
   askStartRecording as defaultAskStartRecording,
-  type ExecFn,
-  notifyAutoStopped as defaultNotifyAutoStopped,
+  askStopRecording as defaultAskStopRecording,
 } from "./popup.ts";
 import {
   afinfoDurationMs,
@@ -111,8 +113,11 @@ export const DEFAULT_QUARANTINE_DIR = join(
 );
 
 const ORPHAN_RECOVERY_MIN_AGE_MS = 10 * 60 * 1000;
-const UNDO_WINDOW_MS = 5_000;
-const POPUP_GIVE_UP_SEC = 90;
+// Single deadline for both notification banners. 60 s matches the
+// "dismiss = no" implicit-skip / implicit-keep semantics — there's
+// no auto-action on timeout, so a longer wait only delays the
+// implicit answer.
+const POPUP_GIVE_UP_SEC = 60;
 const SHUTDOWN_PROCESSOR_WAIT_MS = 30_000;
 const EVENTS_HELPER_BACKOFF_MS = [1_000, 5_000, 30_000] as const;
 
@@ -136,7 +141,6 @@ export const SocketRequestSchema = z.discriminatedUnion("op", [
     op: z.literal("record_stop"),
     discard: z.boolean().optional(),
   }),
-  z.object({ op: z.literal("undo_last") }),
   z.object({ op: z.literal("queue_list") }),
   z.object({ op: z.literal("queue_state") }),
   z.object({ op: z.literal("queue_start") }),
@@ -170,16 +174,13 @@ export interface DaemonDeps {
    * `swrag-helper notify`.
    */
   askStartRecording?: typeof defaultAskStartRecording;
-  /** Replace `osascript display notification` for auto-stop banners. */
-  notifyAutoStopped?: typeof defaultNotifyAutoStopped;
   /**
-   * Override the osascript exec used by `notifyAutoStopped` (the
-   * auto-stop banner still uses osascript — no action buttons needed
-   * there). The start-recording path is on the native notification
-   * stack and ignores this; tests should stub `askStartRecording`
-   * directly when they want to control that flow.
+   * Replace the stop-recording prompt (tests pass a recording stub).
+   * Defaults to the v0.9.6 `UNUserNotificationCenter` banner. The
+   * banner has a single `Stop & save` action; dismiss/timeout maps
+   * to `"keep"` (no-op, recording continues).
    */
-  popupExec?: ExecFn;
+  askStopRecording?: typeof defaultAskStopRecording;
 }
 
 export interface DaemonOptions {
@@ -206,8 +207,6 @@ export interface DaemonOptions {
   deps?: DaemonDeps;
   /** Override the events helper backoff schedule (tests run fast). */
   eventsBackoffMs?: readonly number[];
-  /** Override the undo window in ms (tests use short values). */
-  undoWindowMs?: number;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -219,17 +218,21 @@ interface RecordingState {
   since: string; // ISO
   label: string | null;
   captureSystemAudio: boolean;
-}
-
-interface UndoState {
-  /** Queue row id that was just auto-stopped. */
-  queueRowId: number;
-  /** Absolute wav path so we can unlink on undo. */
-  wavPath: string;
-  /** When the undo window expires (epoch ms). */
-  until: number;
-  /** Timer that clears the undo window once `until` passes. */
-  timer: ReturnType<typeof setTimeout>;
+  /**
+   * Sequence counter for the stop-popup gate. Each time we fire a
+   * stop popup we capture the current id; if the recording state
+   * has been replaced (recorder restarted, or stopped + started
+   * again) by the time the popup resolves, we drop the outcome
+   * rather than acting on a stale answer.
+   */
+  id: number;
+  /**
+   * True while a stop popup is in-flight for this recording. Guards
+   * us from firing two banners on top of each other if the detector
+   * emits multiple `HIGH → NONE` edges (the debouncer should
+   * prevent this, but the daemon shouldn't rely on it).
+   */
+  stopPopupInFlight: boolean;
 }
 
 interface ConnectionState {
@@ -261,8 +264,7 @@ export class MeetingDaemon {
   private readonly deps: Required<
     Pick<DaemonDeps, "spawnEventsHelper" | "startRecording" | "stopRecording">
   > &
-    Pick<DaemonDeps, "askStartRecording" | "notifyAutoStopped" | "popupExec">;
-  private readonly undoWindowMs: number;
+    Pick<DaemonDeps, "askStartRecording" | "askStopRecording">;
   private readonly eventsBackoffMs: readonly number[];
 
   private processor: MeetingProcessor;
@@ -273,7 +275,8 @@ export class MeetingDaemon {
   private eventsRestartFailures = 0;
 
   private recording: RecordingState | null = null;
-  private undo: UndoState | null = null;
+  /** Monotonic id assigned to each recording session for stale-popup detection. */
+  private nextRecordingId = 1;
 
   private listener: SocketListener | null = null;
   private subscribers: Set<SocketHandle> = new Set();
@@ -303,10 +306,8 @@ export class MeetingDaemon {
       startRecording: opts.deps?.startRecording ?? defaultStartRecording,
       stopRecording: opts.deps?.stopRecording ?? defaultStopRecording,
       askStartRecording: opts.deps?.askStartRecording,
-      notifyAutoStopped: opts.deps?.notifyAutoStopped,
-      popupExec: opts.deps?.popupExec,
+      askStopRecording: opts.deps?.askStopRecording,
     };
-    this.undoWindowMs = opts.undoWindowMs ?? UNDO_WINDOW_MS;
     this.eventsBackoffMs = opts.eventsBackoffMs ?? EVENTS_HELPER_BACKOFF_MS;
     this.processor = new MeetingProcessor(this.buildProcessorOptions());
   }
@@ -394,7 +395,7 @@ export class MeetingDaemon {
     this.detector = null;
 
     // 3. In-flight recording → save, don't discard. Same code path the
-    //    auto-stop uses minus the notification / undo plumbing.
+    //    stop-popup-confirmed path uses minus the popup itself.
     if (this.recording) {
       try {
         await this.deps.stopRecording(
@@ -408,13 +409,7 @@ export class MeetingDaemon {
       this.recording = null;
     }
 
-    // 4. Clear undo state.
-    if (this.undo) {
-      clearTimeout(this.undo.timer);
-      this.undo = null;
-    }
-
-    // 5. Push shutdown to every subscriber, then close.
+    // 4. Push shutdown to every subscriber, then close.
     const shutdownLine = `${JSON.stringify({ event: "shutdown" })}\n`;
     for (const sub of this.subscribers) {
       try {
@@ -434,7 +429,7 @@ export class MeetingDaemon {
     }
     this.connections.clear();
 
-    // 6. Stop listening + unlink the socket file.
+    // 5. Stop listening + unlink the socket file.
     if (this.listener) {
       try {
         await this.listener.stop(true);
@@ -457,14 +452,22 @@ export class MeetingDaemon {
    * Detection edge handler. NONE → HIGH (or → MEDIUM, when the
    * user configured `threshold=MEDIUM`) fires the start popup if
    * we aren't already recording; HIGH → NONE while recording
-   * fires the auto-stop with notification + 5 s undo window. Both
-   * paths push `detect_changed` to subscribers.
+   * fires the stop popup (symmetric with start). Both paths push
+   * `detect_changed` to subscribers.
    *
-   * The popup gate is now configurable via `decidePopup`:
+   * The popup gate is configurable via `decidePopup`:
    * allow/blocklists, schedule windows, and a confidence threshold
    * all funnel through that one pure function. The detector itself
    * only cares about HIGH/MEDIUM/NONE edges; everything user-facing
    * lives in the config.
+   *
+   * v0.9.6: the stop side no longer auto-stops + opens an undo
+   * window. Instead, `firePopupForStopEdge` shows a native banner
+   * with a single `Stop & save` action; dismiss/timeout is treated
+   * as `"keep"` (recording continues). The next debounce-confirmed
+   * `HIGH → NONE` edge re-fires the banner if the user is still
+   * recording — so a user who walked away and came back won't be
+   * stuck with a recorder that auto-saved while they were gone.
    */
   private async onDetectionEdge(edge: MeetingEdge): Promise<void> {
     this.lastEdgeSignal = edge.signal;
@@ -483,7 +486,7 @@ export class MeetingDaemon {
       // microtask queue.
       void this.firePopupForEdge(edge);
     } else if (edge.to === "NONE" && this.recording) {
-      await this.fireAutoStopForEdge();
+      void this.firePopupForStopEdge();
     }
   }
 
@@ -529,38 +532,82 @@ export class MeetingDaemon {
     }
   }
 
-  private async fireAutoStopForEdge(): Promise<void> {
-    if (!this.recording) return;
+  /**
+   * Fire the stop-recording banner. The banner has a single
+   * `Stop & save` action; dismiss/timeout maps to `"keep"`
+   * (no-op, recording continues).
+   *
+   * Race handling:
+   *   1. While a banner is open we set `stopPopupInFlight = true`
+   *      on the recording. Subsequent debounce-confirmed
+   *      `HIGH → NONE` edges no-op so we don't pile up notification
+   *      banners. The detector's debouncer should prevent this but
+   *      the daemon shouldn't rely on it.
+   *   2. We capture the recording's monotonic `id` before the popup
+   *      and re-verify on resolve. If the user manually stopped +
+   *      restarted while the banner was open (e.g. they used the
+   *      menu bar, then closed the banner), the captured id won't
+   *      match the live one and we drop the outcome — no acting on
+   *      a stale answer.
+   */
+  private async firePopupForStopEdge(): Promise<void> {
     const rec = this.recording;
+    if (!rec) return;
+    if (rec.stopPopupInFlight) {
+      verbose("meeting daemon: stop popup already in-flight; skipping duplicate edge");
+      return;
+    }
+    rec.stopPopupInFlight = true;
+    const capturedId = rec.id;
+    const ask = this.deps.askStopRecording ?? defaultAskStopRecording;
+    const elapsedSec = Math.max(
+      0,
+      Math.floor((Date.now() - new Date(rec.since).getTime()) / 1000),
+    );
+    let choice: "save" | "keep";
+    try {
+      choice = await ask({ elapsedSec, giveUpAfterSec: POPUP_GIVE_UP_SEC });
+    } catch (e) {
+      warn(`meeting daemon: stop popup failed: ${errMsg(e)}`);
+      choice = "keep";
+    }
+    // Reconcile: the recording state we're operating on must still
+    // be the one we asked about. If the user stopped + restarted
+    // (or stopped manually) while the banner was open, the live
+    // recording.id won't match capturedId.
+    const live = this.recording;
+    if (live && live.id === capturedId) {
+      live.stopPopupInFlight = false;
+    }
+    if (!live || live.id !== capturedId) {
+      info(
+        `meeting daemon: stop popup → ${choice}; recording state changed in-flight, dropping outcome`,
+      );
+      return;
+    }
+    if (choice === "keep") {
+      info("meeting daemon: stop popup → keep; recording continues");
+      return;
+    }
+    // choice === "save": stop the recorder + enqueue.
     let stopped: StoppedRecording;
     try {
       stopped = await this.deps.stopRecording(
-        rec.handle,
+        live.handle,
         { discard: false },
         { archive: this.opts.archive, incomingDir: this.incomingDir },
       );
     } catch (e) {
-      warn(`meeting daemon: auto-stop failed: ${errMsg(e)}`);
+      warn(`meeting daemon: stop-popup-driven stop failed: ${errMsg(e)}`);
       this.recording = null;
-      this.pushEvent({ event: "status_changed", reason: "auto_stop_failed" });
+      this.pushEvent({ event: "status_changed", reason: "stop_popup_save_failed" });
       return;
     }
     this.recording = null;
     if (stopped.queueRow) {
-      this.openUndoWindow(stopped.queueRow.id, stopped.audioPath ?? rec.handle.audioPath);
-      const notify = this.deps.notifyAutoStopped ?? defaultNotifyAutoStopped;
-      try {
-        await notify({
-          wavPath: rec.handle.audioPath,
-          queueRowId: stopped.queueRow.id,
-          exec: this.deps.popupExec,
-        });
-      } catch (e) {
-        verbose(`meeting daemon: notification failed: ${errMsg(e)}`);
-      }
-      this.pushEvent({ event: "queue_changed", reason: "auto_stop" });
+      this.pushEvent({ event: "queue_changed", reason: "stop_popup_save" });
     }
-    this.pushEvent({ event: "status_changed", reason: "auto_stopped" });
+    this.pushEvent({ event: "status_changed", reason: "stop_popup_saved" });
   }
 
   /* ----------------------------- socket I/O ------------------------------ */
@@ -665,11 +712,6 @@ export class MeetingDaemon {
       }
       case "record_stop": {
         const r = await this.handleRecordStop({ discard: op.discard === true });
-        this.writeJson(socket, r);
-        return;
-      }
-      case "undo_last": {
-        const r = this.handleUndoLast();
         this.writeJson(socket, r);
         return;
       }
@@ -797,6 +839,8 @@ export class MeetingDaemon {
       since: handle.startedAt,
       label: handle.label,
       captureSystemAudio: handle.captureSystemAudio,
+      id: this.nextRecordingId++,
+      stopPopupInFlight: false,
     };
     this.pushEvent({ event: "status_changed", reason: `record_start:${args.source}` });
     info(
@@ -832,69 +876,6 @@ export class MeetingDaemon {
       this.pushEvent({ event: "queue_changed", reason: "record_save" });
     }
     return { ok: true };
-  }
-
-  private handleUndoLast(): { ok: true } | { error: string } {
-    if (!this.undo) return { error: "no_undo_available" };
-    if (this.undo.until < Date.now()) {
-      this.clearUndo();
-      return { error: "no_undo_available" };
-    }
-    const undo = this.undo;
-    // Verify the row still exists; user may have already discarded it
-    // via the queue_discard op or the wav may have been processed.
-    const db = openArchive(this.opts.archive, {});
-    let row: queue.MeetingQueueRow | null;
-    try {
-      row = queue.getById(db, undo.queueRowId);
-    } finally {
-      db.close();
-    }
-    if (!row || row.status !== "pending") {
-      this.clearUndo();
-      return { error: "no_undo_available" };
-    }
-    const db2 = openArchive(this.opts.archive, {});
-    try {
-      // v0.9.1 policy: undo == discard == DELETE the queue row. The
-      // sentinel-error `failed` row we used pre-v0.9.1 was clutter
-      // for users who never look at the failed lane.
-      queue.removeRow(db2, undo.queueRowId);
-    } finally {
-      db2.close();
-    }
-    // Unlink the wav (best-effort).
-    try {
-      if (existsSync(undo.wavPath)) {
-        Bun.spawnSync(["rm", "-f", undo.wavPath]);
-      }
-    } catch {
-      // best-effort
-    }
-    this.clearUndo();
-    this.pushEvent({ event: "queue_changed", reason: "undo_last", id: undo.queueRowId });
-    this.pushEvent({ event: "status_changed", reason: "undo_last" });
-    return { ok: true };
-  }
-
-  private openUndoWindow(queueRowId: number, wavPath: string): void {
-    if (this.undo) clearTimeout(this.undo.timer);
-    const until = Date.now() + this.undoWindowMs;
-    const timer = setTimeout(() => {
-      this.clearUndo();
-      this.pushEvent({ event: "status_changed", reason: "undo_window_expired" });
-    }, this.undoWindowMs);
-    if (typeof (timer as { unref?: () => void }).unref === "function") {
-      (timer as { unref: () => void }).unref();
-    }
-    this.undo = { queueRowId, wavPath, until, timer };
-  }
-
-  private clearUndo(): void {
-    if (this.undo) {
-      clearTimeout(this.undo.timer);
-      this.undo = null;
-    }
   }
 
   /* --------------------------- events helper ----------------------------- */
@@ -1128,7 +1109,6 @@ export class MeetingDaemon {
       audio_path: this.recording?.handle.audioPath ?? null,
       queue_pending: queuePending,
       last_detect: lastDetect,
-      undo_window_until: this.undo ? new Date(this.undo.until).toISOString() : null,
     };
   }
 

@@ -1,26 +1,28 @@
 /**
  * Popup module tests.
  *
- * v0.9.0 split the popup into two code paths:
- *   - `askStartRecording` — now a thin wrapper around
- *     `fireStartRecordingNotification` (UNUserNotificationCenter via
- *     the Swift helper's `notify` subcommand). Tests inject a fake
- *     `fireNotification` and assert the daemon-visible contract:
- *     map any of the helper-side outputs to the right `StartChoice`.
- *   - `notifyAutoStopped` — still uses `osascript display
- *     notification` (single-line, no action buttons). Tests inject
- *     an exec stub and assert the AppleScript command shape +
- *     escaping behaviour.
+ * v0.9.6 collapsed both banners to a single action button each — see
+ * the module header in `src/meeting/popup.ts` for the rationale. The
+ * two functions under test:
  *
- * The real Swift helper / osascript are never invoked from this
- * suite — both are dependency-injected.
+ *   - `askStartRecording` — wire result `record` / `timeout`. Maps
+ *     `timeout` → `"skip"`.
+ *   - `askStopRecording` — wire result `save` / `timeout`. Maps
+ *     `timeout` → `"keep"`.
+ *
+ * Both real Swift-helper paths are dependency-injected via the
+ * `fireNotification` option, so the suite never fires a real banner.
  */
 import { describe, expect, test } from "bun:test";
 import {
   askStartRecording,
+  askStopRecording,
   escapeForAppleScript,
-  notifyAutoStopped,
 } from "../../src/meeting/popup.ts";
+import type {
+  FireStartRecordingNotificationOptions,
+  FireStopRecordingNotificationOptions,
+} from "../../src/mac/helper.ts";
 
 describe("escapeForAppleScript", () => {
   test("escapes double-quotes", () => {
@@ -31,7 +33,7 @@ describe("escapeForAppleScript", () => {
   });
 });
 
-describe("askStartRecording (v0.9.0 banner)", () => {
+describe("askStartRecording (v0.9.6 single-action banner)", () => {
   test("notify returning 'record' propagates as 'record'", async () => {
     const r = await askStartRecording({
       reason: "Test",
@@ -41,25 +43,16 @@ describe("askStartRecording (v0.9.0 banner)", () => {
     expect(r).toBe("record");
   });
 
-  test("notify returning 'skip' propagates as 'skip'", async () => {
-    const r = await askStartRecording({
-      reason: "Test",
-      giveUpAfterSec: 1,
-      fireNotification: async () => "skip",
-    });
-    expect(r).toBe("skip");
-  });
-
-  test("notify returning 'timeout' propagates as 'timeout'", async () => {
+  test("notify returning 'timeout' maps to 'skip' (dismiss = skip)", async () => {
     const r = await askStartRecording({
       reason: "Test",
       giveUpAfterSec: 1,
       fireNotification: async () => "timeout",
     });
-    expect(r).toBe("timeout");
+    expect(r).toBe("skip");
   });
 
-  test("notify throwing degrades to 'timeout' (never crashes the daemon)", async () => {
+  test("notify throwing degrades to 'skip' (never crashes the daemon)", async () => {
     const r = await askStartRecording({
       reason: "Test",
       giveUpAfterSec: 1,
@@ -67,7 +60,7 @@ describe("askStartRecording (v0.9.0 banner)", () => {
         throw new Error("helper missing");
       },
     });
-    expect(r).toBe("timeout");
+    expect(r).toBe("skip");
   });
 
   test("reason text is forwarded verbatim to the notification firer", async () => {
@@ -76,9 +69,9 @@ describe("askStartRecording (v0.9.0 banner)", () => {
     await askStartRecording({
       reason: 'Meeting "detected": go?',
       giveUpAfterSec: 30,
-      fireNotification: async (opts) => {
+      fireNotification: async (opts: FireStartRecordingNotificationOptions) => {
         captured = { reason: opts.reason, timeoutSeconds: opts.timeoutSeconds };
-        return "skip";
+        return "timeout";
       },
     });
     expect(captured).not.toBeNull();
@@ -87,78 +80,75 @@ describe("askStartRecording (v0.9.0 banner)", () => {
     expect(c?.timeoutSeconds).toBe(30);
   });
 
-  test("default giveUpAfterSec is 90", async () => {
+  test("default giveUpAfterSec is 60 (v0.9.6 — dismiss = skip, no action on timeout)", async () => {
     let capturedTimeout: number | undefined;
     await askStartRecording({
       reason: "Test",
-      fireNotification: async (opts) => {
+      fireNotification: async (opts: FireStartRecordingNotificationOptions) => {
         capturedTimeout = opts.timeoutSeconds;
-        return "skip";
+        return "timeout";
       },
     });
-    expect(capturedTimeout).toBe(90);
+    expect(capturedTimeout).toBe(60);
   });
 });
 
-describe("notifyAutoStopped", () => {
-  test("emits a display notification osascript call", async () => {
-    const calls: string[][] = [];
-    await notifyAutoStopped({
-      wavPath: "/tmp/x.wav",
-      queueRowId: 42,
-      exec: async (cmd) => {
-        calls.push([...cmd]);
-        return { exitCode: 0, stdout: "", stderr: "" };
+describe("askStopRecording (v0.9.6 single-action banner)", () => {
+  test("notify returning 'save' propagates as 'save'", async () => {
+    const r = await askStopRecording({
+      elapsedSec: 120,
+      giveUpAfterSec: 1,
+      fireNotification: async () => "save",
+    });
+    expect(r).toBe("save");
+  });
+
+  test("notify returning 'timeout' maps to 'keep' (dismiss = keep recording)", async () => {
+    const r = await askStopRecording({
+      elapsedSec: 120,
+      giveUpAfterSec: 1,
+      fireNotification: async () => "timeout",
+    });
+    expect(r).toBe("keep");
+  });
+
+  test("notify throwing degrades to 'keep' (don't lose data on failure)", async () => {
+    const r = await askStopRecording({
+      elapsedSec: 120,
+      giveUpAfterSec: 1,
+      fireNotification: async () => {
+        throw new Error("helper missing");
       },
     });
-    expect(calls.length).toBe(1);
-    expect(calls[0]?.[0]).toBe("osascript");
-    const script = calls[0]?.[calls[0]?.length - 1] ?? "";
-    expect(script).toContain("display notification");
-    expect(script).toContain("queue id 42");
-    expect(script).toContain("x.wav");
+    expect(r).toBe("keep");
   });
 
-  test("non-zero exit is swallowed, not thrown", async () => {
-    let caught: Error | null = null;
-    try {
-      await notifyAutoStopped({
-        wavPath: "/tmp/x.wav",
-        queueRowId: 1,
-        exec: async () => ({ exitCode: 1, stdout: "", stderr: "boom" }),
-      });
-    } catch (e) {
-      caught = e instanceof Error ? e : new Error(String(e));
-    }
-    expect(caught).toBeNull();
-  });
-
-  test("exec throwing is swallowed, not propagated", async () => {
-    let caught: Error | null = null;
-    try {
-      await notifyAutoStopped({
-        wavPath: "/tmp/x.wav",
-        queueRowId: 1,
-        exec: async () => {
-          throw new Error("exec failure");
-        },
-      });
-    } catch (e) {
-      caught = e instanceof Error ? e : new Error(String(e));
-    }
-    expect(caught).toBeNull();
-  });
-
-  test("wavPath basename is rendered with escaped quotes if necessary", async () => {
-    let script = "";
-    await notifyAutoStopped({
-      wavPath: '/tmp/strange "quoted".wav',
-      queueRowId: 7,
-      exec: async (cmd) => {
-        script = cmd[cmd.length - 1] ?? "";
-        return { exitCode: 0, stdout: "", stderr: "" };
+  test("elapsedSec is forwarded verbatim to the notification firer", async () => {
+    type Captured = { elapsedSec: number; timeoutSeconds?: number };
+    let captured: Captured | null = null;
+    await askStopRecording({
+      elapsedSec: 305,
+      giveUpAfterSec: 45,
+      fireNotification: async (opts: FireStopRecordingNotificationOptions) => {
+        captured = { elapsedSec: opts.elapsedSec, timeoutSeconds: opts.timeoutSeconds };
+        return "save";
       },
     });
-    expect(script).toContain('strange \\"quoted\\".wav');
+    expect(captured).not.toBeNull();
+    const c = captured as Captured | null;
+    expect(c?.elapsedSec).toBe(305);
+    expect(c?.timeoutSeconds).toBe(45);
+  });
+
+  test("default giveUpAfterSec is 60 (symmetric with start)", async () => {
+    let capturedTimeout: number | undefined;
+    await askStopRecording({
+      elapsedSec: 10,
+      fireNotification: async (opts: FireStopRecordingNotificationOptions) => {
+        capturedTimeout = opts.timeoutSeconds;
+        return "timeout";
+      },
+    });
+    expect(capturedTimeout).toBe(60);
   });
 });

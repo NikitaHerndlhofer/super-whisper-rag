@@ -149,6 +149,23 @@ Manage them with `swrag meeting enable-watcher` / `swrag meeting
 disable-watcher`. The bootstrap step is just a thin wrapper around
 `enable-watcher`.
 
+#### Notifications
+
+swrag asks two questions over native macOS notifications:
+
+- **Meeting detected** (a meeting just started) — banner with a
+  single `Record` action.
+- **Meeting ended** (mic released after a meeting) — banner with a
+  single `Stop & save` action.
+
+Each banner has exactly one action button so it renders inline on
+both notification styles ("Banners" and "Alerts" — see
+System Settings → Notifications → swrag-helper). To dismiss without
+acting — to skip the start, or keep recording on stop — click the
+notification's `×` or let it time out (60 s). To discard a recording
+after stopping, use the menu bar's per-item Discard action or
+`swrag meeting queue discard <id>` (id from `swrag meeting queue list`).
+
 Prior versions of swrag installed an hourly `swrag index` launchd
 cron. That cron is gone — the watcher's processor calls a targeted
 ingest after every recording completes, and every `swrag sql` runs a

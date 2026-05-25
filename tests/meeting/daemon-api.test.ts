@@ -430,11 +430,14 @@ describe("daemon: request/response ops", () => {
       const r = await callSocket<{
         recording: boolean;
         queue_pending: number;
-        undo_window_until: string | null;
+        undo_window_until?: string | null;
       }>({ op: "status" });
       expect(r.recording).toBe(false);
       expect(r.queue_pending).toBe(0);
-      expect(r.undo_window_until).toBeNull();
+      // v0.9.6 dropped `undo_window_until` from the status payload —
+      // assert it's gone so a future regression that re-introduces
+      // it doesn't slip past the suite.
+      expect("undo_window_until" in r).toBe(false);
     } finally {
       await daemon.stop();
     }
@@ -1236,15 +1239,213 @@ describe("daemon: system-audio config gating via enable-watcher", () => {
   });
 });
 
-describe("daemon: undo window", () => {
-  test("undo_last returns no_undo_available when no auto-stop has happened", async () => {
+describe("daemon: stop-recording popup on HIGH → NONE edge (v0.9.6)", () => {
+  /**
+   * The detection edge handler is private; we reach into it the
+   * same way the v0.8.0 popup tests do (a cast to `unknown` and
+   * down to the private method). The handler is async + idempotent
+   * so the cast is safe — we're calling the production code path,
+   * not a test seam.
+   */
+  type DaemonEdgeAccess = {
+    onDetectionEdge: (edge: {
+      from: "NONE" | "MEDIUM" | "HIGH";
+      to: "NONE" | "MEDIUM" | "HIGH";
+      signal: {
+        confidence: "NONE" | "MEDIUM" | "HIGH";
+        reason: string;
+        evidence: {
+          mic_in_use: boolean;
+          frontmost_bundle_id: string | null;
+          running_call_apps_strict: string[];
+          running_call_apps_soft: string[];
+          browser_url: string | null;
+          browser_url_matches: boolean;
+        };
+      };
+    }) => Promise<void>;
+  };
+
+  const stopEdge = {
+    from: "HIGH" as const,
+    to: "NONE" as const,
+    signal: {
+      confidence: "NONE" as const,
+      reason: "mic released",
+      evidence: {
+        mic_in_use: false,
+        frontmost_bundle_id: null,
+        running_call_apps_strict: [],
+        running_call_apps_soft: [],
+        browser_url: null,
+        browser_url_matches: false,
+      },
+    },
+  };
+
+  test("user clicks Stop & save → recorder stops + queue row added", async () => {
+    const rec = makeFakeRecorder();
     const daemon = new MeetingDaemon(
-      baseOptions({ deps: { spawnEventsHelper: silentEventsHandle } }),
+      baseOptions({
+        deps: {
+          spawnEventsHelper: silentEventsHandle,
+          startRecording: rec.startRecording,
+          stopRecording: rec.stopRecording,
+          askStopRecording: async () => "save",
+        },
+      }),
     );
     await daemon.start();
     try {
-      const r = await callSocket<{ error?: string }>({ op: "undo_last" });
-      expect(r.error).toBe("no_undo_available");
+      // Start a recording so the edge actually has something to stop.
+      const start = await callSocket<{ ok?: true; audio_path?: string }>({
+        op: "record_start",
+      });
+      expect(start.ok).toBe(true);
+      // Fire HIGH → NONE.
+      await (daemon as unknown as DaemonEdgeAccess).onDetectionEdge(stopEdge);
+      // Recorder should be stopped + queue row enqueued.
+      const status = await callSocket<{ recording: boolean }>({ op: "status" });
+      expect(status.recording).toBe(false);
+      const list = await callSocket<{ items: queue.MeetingQueueRow[] }>({ op: "queue_list" });
+      expect(list.items.length).toBe(1);
+      expect(list.items[0]?.audio_path).toBe(start.audio_path ?? "");
+    } finally {
+      await daemon.stop();
+    }
+  });
+
+  test("user dismisses (popup returns 'keep') → recorder keeps running, no queue row", async () => {
+    const rec = makeFakeRecorder();
+    let popupCalls = 0;
+    const daemon = new MeetingDaemon(
+      baseOptions({
+        deps: {
+          spawnEventsHelper: silentEventsHandle,
+          startRecording: rec.startRecording,
+          stopRecording: rec.stopRecording,
+          askStopRecording: async () => {
+            popupCalls += 1;
+            return "keep";
+          },
+        },
+      }),
+    );
+    await daemon.start();
+    try {
+      await callSocket({ op: "record_start" });
+      await (daemon as unknown as DaemonEdgeAccess).onDetectionEdge(stopEdge);
+      expect(popupCalls).toBe(1);
+      const status = await callSocket<{ recording: boolean }>({ op: "status" });
+      // Recording must still be in-flight.
+      expect(status.recording).toBe(true);
+      const list = await callSocket<{ items: queue.MeetingQueueRow[] }>({ op: "queue_list" });
+      // No queue row should have been added (no stop happened).
+      expect(list.items.length).toBe(0);
+      // Subsequent HIGH → NONE edges still re-fire the popup as long
+      // as the recorder is alive.
+      await (daemon as unknown as DaemonEdgeAccess).onDetectionEdge(stopEdge);
+      expect(popupCalls).toBe(2);
+      // Manually stop so the daemon's shutdown doesn't enqueue.
+      await callSocket({ op: "record_stop", discard: true });
+    } finally {
+      await daemon.stop();
+    }
+  });
+
+  test("popup helper throws → degrades to 'keep' (recording continues, never lost)", async () => {
+    const rec = makeFakeRecorder();
+    const daemon = new MeetingDaemon(
+      baseOptions({
+        deps: {
+          spawnEventsHelper: silentEventsHandle,
+          startRecording: rec.startRecording,
+          stopRecording: rec.stopRecording,
+          askStopRecording: async () => {
+            throw new Error("helper missing");
+          },
+        },
+      }),
+    );
+    await daemon.start();
+    try {
+      await callSocket({ op: "record_start" });
+      await (daemon as unknown as DaemonEdgeAccess).onDetectionEdge(stopEdge);
+      const status = await callSocket<{ recording: boolean }>({ op: "status" });
+      expect(status.recording).toBe(true);
+      await callSocket({ op: "record_stop", discard: true });
+    } finally {
+      await daemon.stop();
+    }
+  });
+
+  test("HIGH → NONE with no active recording is a no-op (no popup)", async () => {
+    let popupCalls = 0;
+    const daemon = new MeetingDaemon(
+      baseOptions({
+        deps: {
+          spawnEventsHelper: silentEventsHandle,
+          askStopRecording: async () => {
+            popupCalls += 1;
+            return "save";
+          },
+        },
+      }),
+    );
+    await daemon.start();
+    try {
+      await (daemon as unknown as DaemonEdgeAccess).onDetectionEdge(stopEdge);
+      await sleep(20);
+      expect(popupCalls).toBe(0);
+    } finally {
+      await daemon.stop();
+    }
+  });
+
+  test("concurrent HIGH → NONE edges while popup is in-flight: no duplicate popups", async () => {
+    const rec = makeFakeRecorder();
+    let popupCalls = 0;
+    // Pending-resolver stack. Each askStopRecording call pushes a
+    // resolver; the test pops + invokes to advance the daemon.
+    const pending: Array<(c: "save" | "keep") => void> = [];
+    const daemon = new MeetingDaemon(
+      baseOptions({
+        deps: {
+          spawnEventsHelper: silentEventsHandle,
+          startRecording: rec.startRecording,
+          stopRecording: rec.stopRecording,
+          askStopRecording: async () => {
+            popupCalls += 1;
+            return new Promise<"save" | "keep">((resolve) => {
+              pending.push(resolve);
+            });
+          },
+        },
+      }),
+    );
+    await daemon.start();
+    try {
+      await callSocket({ op: "record_start" });
+      // Fire two edges back-to-back. The first opens the popup; the
+      // second must no-op until the first resolves.
+      const edgeP1 = (daemon as unknown as DaemonEdgeAccess).onDetectionEdge(stopEdge);
+      const edgeP2 = (daemon as unknown as DaemonEdgeAccess).onDetectionEdge(stopEdge);
+      // Give the second edge a microtask to run its in-flight check.
+      await sleep(10);
+      expect(popupCalls).toBe(1);
+      // Resolve the first popup as 'keep'. The second edge handler
+      // should have noticed `stopPopupInFlight` and returned without
+      // opening a second banner.
+      pending.shift()?.("keep");
+      await edgeP1;
+      await edgeP2;
+      // After the first popup resolves, a new edge may fire again.
+      const edgeP3 = (daemon as unknown as DaemonEdgeAccess).onDetectionEdge(stopEdge);
+      await sleep(10);
+      expect(popupCalls).toBe(2);
+      pending.shift()?.("keep");
+      await edgeP3;
+      await callSocket({ op: "record_stop", discard: true });
     } finally {
       await daemon.stop();
     }
@@ -1386,7 +1587,7 @@ describe("daemon: config_reload op", () => {
     // This is the integration-level proof: socket-driven config
     // mutation must take effect on the NEXT detection edge.
     let popupCalls = 0;
-    const askStartRecording = async (): Promise<"record" | "skip" | "timeout"> => {
+    const askStartRecording = async (): Promise<"record" | "skip"> => {
       popupCalls += 1;
       return "skip";
     };

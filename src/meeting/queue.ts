@@ -169,12 +169,15 @@ export function markFailed(db: Database, id: number, errorMsg: string): void {
  * Discard mirrors `markFailed` but uses a sentinel error so the UI can
  * distinguish user-initiated discards from real failures.
  *
- * As of v0.9.1, the production code paths (processor.discard,
- * daemon.undo_last) prefer `removeRow` over `markDiscarded` — successful
- * and user-discarded items are deleted from the queue rather than left
- * behind as `failed` rows. The function stays exported so any
- * downstream caller wanting to "soft-discard" with the sentinel error
- * still has it; nothing in-tree calls it anymore.
+ * As of v0.9.1, the production code path (`processor.discard`)
+ * prefers `removeRow` over `markDiscarded` — successful and
+ * user-discarded items are deleted from the queue rather than left
+ * behind as `failed` rows. (Before v0.9.6, `daemon.undo_last` was
+ * also a caller; that op is gone — the stop flow now lives in a
+ * notification banner, not a post-stop undo window.) The function
+ * stays exported so any downstream caller wanting to "soft-discard"
+ * with the sentinel error still has it; nothing in-tree calls it
+ * anymore.
  */
 export function markDiscarded(db: Database, id: number): void {
   markFailed(db, id, DISCARD_ERROR);

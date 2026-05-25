@@ -16,6 +16,7 @@ import {
   PermissionsSchema,
   RecorderHeartbeatSchema,
   fireStartRecordingNotification,
+  fireStopRecordingNotification,
   getFrontmostApp,
   getPermissions,
   isMicInUse,
@@ -274,14 +275,20 @@ describe("fireStartRecordingNotification (stubbed exec)", () => {
     expect(r).toBe("record");
   });
 
-  test("stdout 'skip' → 'skip'", async () => {
+  // v0.9.6 dropped the explicit "skip" action button — the start
+  // banner is now single-action (Record). Anything other than
+  // "record" or "timeout" degrades to "timeout" via the schema
+  // validator; we assert that fallback here using the legacy literal
+  // so a future regression that re-introduces a "skip" wire payload
+  // can't accidentally pass through unmapped.
+  test("stdout 'skip' (legacy) → 'timeout' (single-action banner)", async () => {
     const r = await fireStartRecordingNotification({
       reason: "Test",
       timeoutSeconds: 5,
       helperPath: "/usr/bin/true",
       exec: async () => ({ exitCode: 0, stdout: "skip\n", stderr: "" }),
     });
-    expect(r).toBe("skip");
+    expect(r).toBe("timeout");
   });
 
   test("stdout 'timeout' → 'timeout'", async () => {
@@ -326,7 +333,7 @@ describe("fireStartRecordingNotification (stubbed exec)", () => {
     expect(r).toBe("timeout");
   });
 
-  test("argv shape: notify subcommand + actions + default-action + timeout", async () => {
+  test("argv shape: notify subcommand + single action + default-action + timeout", async () => {
     let captured: string[] = [];
     await fireStartRecordingNotification({
       reason: 'Zoom is in a meeting — "ack"?',
@@ -334,16 +341,19 @@ describe("fireStartRecordingNotification (stubbed exec)", () => {
       helperPath: "/tmp/fake-helper",
       exec: async (cmd) => {
         captured = [...cmd];
-        return { exitCode: 0, stdout: "skip\n", stderr: "" };
+        return { exitCode: 0, stdout: "record\n", stderr: "" };
       },
     });
     expect(captured[0]).toBe("/tmp/fake-helper");
     expect(captured[1]).toBe("notify");
     expect(captured).toContain("--actions");
     const actionsIdx = captured.indexOf("--actions");
-    expect(captured[actionsIdx + 1]).toBe("Record,Skip");
+    // v0.9.6: single-action banner using the `id=Display Label`
+    // syntax. Wire-side id stays safe ASCII; display label is what
+    // the user sees in the banner.
+    expect(captured[actionsIdx + 1]).toBe("record=Record");
     const defaultIdx = captured.indexOf("--default-action");
-    expect(captured[defaultIdx + 1]).toBe("Record");
+    expect(captured[defaultIdx + 1]).toBe("record");
     const timeoutIdx = captured.indexOf("--timeout");
     expect(captured[timeoutIdx + 1]).toBe("12");
     const bodyIdx = captured.indexOf("--body");
@@ -384,17 +394,112 @@ describe.skipIf(!HELPER_PRESENT || NOTIFY_SMOKE_DISABLED)(
         });
         // Acceptable outcomes:
         //   * "timeout" — banner auto-dismissed (no user click).
-        //   * "record" / "skip" — the suite runner happened to click.
-        //     We allow both rather than asserting a specific value.
+        //   * "record" — the suite runner happened to click.
         //   * Auth-denied paths degrade to "timeout" via the wrapper,
         //     same as a true timeout — they're equivalent from the
         //     daemon's POV.
-        expect(["record", "skip", "timeout"]).toContain(r);
+        // (v0.9.6 dropped the legacy "skip" wire payload.)
+        expect(["record", "timeout"]).toContain(r);
       },
       10_000,
     );
   },
 );
+
+/* -------------------------------------------------------------------------- */
+/* fireStopRecordingNotification — unit-level wrapper coverage (v0.9.6)      */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Symmetric with the start-notification block. The stop banner is
+ * single-action (`Stop & save`) — anything other than `save` /
+ * `timeout` on stdout degrades to `"timeout"`. The daemon's
+ * `popup.ts::askStopRecording` then maps `"timeout"` to the
+ * user-facing `"keep"`.
+ */
+describe("fireStopRecordingNotification (stubbed exec)", () => {
+  test("stdout 'save' → 'save'", async () => {
+    const r = await fireStopRecordingNotification({
+      elapsedSec: 65,
+      timeoutSeconds: 5,
+      helperPath: "/usr/bin/true",
+      exec: async () => ({ exitCode: 0, stdout: "save\n", stderr: "" }),
+    });
+    expect(r).toBe("save");
+  });
+
+  test("stdout 'timeout' → 'timeout'", async () => {
+    const r = await fireStopRecordingNotification({
+      elapsedSec: 65,
+      timeoutSeconds: 5,
+      helperPath: "/usr/bin/true",
+      exec: async () => ({ exitCode: 0, stdout: "timeout\n", stderr: "" }),
+    });
+    expect(r).toBe("timeout");
+  });
+
+  test("legacy 'discard' wire payload (single-action) degrades to 'timeout'", async () => {
+    // v0.9.6 dropped the Stop-&-discard button from the banner.
+    // If a future regression re-emits "discard" on stdout, the
+    // schema must reject it so the daemon never accidentally
+    // discards a recording on a stale wire payload.
+    const r = await fireStopRecordingNotification({
+      elapsedSec: 65,
+      timeoutSeconds: 5,
+      helperPath: "/usr/bin/true",
+      exec: async () => ({ exitCode: 0, stdout: "discard\n", stderr: "" }),
+    });
+    expect(r).toBe("timeout");
+  });
+
+  test("non-zero exit degrades to 'timeout' rather than throwing", async () => {
+    const r = await fireStopRecordingNotification({
+      elapsedSec: 65,
+      timeoutSeconds: 5,
+      helperPath: "/usr/bin/true",
+      exec: async () => ({ exitCode: 4, stdout: "", stderr: "authorization denied" }),
+    });
+    expect(r).toBe("timeout");
+  });
+
+  test("spawn-level error degrades to 'timeout'", async () => {
+    const r = await fireStopRecordingNotification({
+      elapsedSec: 65,
+      timeoutSeconds: 5,
+      helperPath: "/usr/bin/true",
+      exec: async () => {
+        throw new Error("spawn failed");
+      },
+    });
+    expect(r).toBe("timeout");
+  });
+
+  test("argv shape: single action `save=Stop & save`, default-action `save`, elapsed in body", async () => {
+    let captured: string[] = [];
+    await fireStopRecordingNotification({
+      elapsedSec: 125, // 2:05
+      timeoutSeconds: 7,
+      helperPath: "/tmp/fake-helper",
+      exec: async (cmd) => {
+        captured = [...cmd];
+        return { exitCode: 0, stdout: "save\n", stderr: "" };
+      },
+    });
+    expect(captured[0]).toBe("/tmp/fake-helper");
+    expect(captured[1]).toBe("notify");
+    const actionsIdx = captured.indexOf("--actions");
+    expect(captured[actionsIdx + 1]).toBe("save=Stop & save");
+    const defaultIdx = captured.indexOf("--default-action");
+    expect(captured[defaultIdx + 1]).toBe("save");
+    const timeoutIdx = captured.indexOf("--timeout");
+    expect(captured[timeoutIdx + 1]).toBe("7");
+    const bodyIdx = captured.indexOf("--body");
+    // 125 s renders as 2:05.
+    expect(captured[bodyIdx + 1]).toContain("2:05");
+    const titleIdx = captured.indexOf("--title");
+    expect(captured[titleIdx + 1]).toBe("Meeting ended");
+  });
+});
 
 /**
  * Helper: pull the first heartbeat off the iterator within a hard

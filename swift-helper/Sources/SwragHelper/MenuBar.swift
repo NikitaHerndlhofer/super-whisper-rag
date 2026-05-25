@@ -18,11 +18,13 @@ import Foundation
 /// On disconnect the menu shows "Daemon unavailable" and we attempt
 /// to reconnect with exponential backoff (1 → 5 → 30 → 60 s).
 ///
-/// The Phase 4 spec's state-table covers six conditional shapes
+/// The Phase 4 spec's state-table covers five conditional shapes
 /// (paused-empty / paused-pending / processing / pausing /
-/// recording-overlay / undo-window); we drive everything off two
-/// pieces of state — the latest `status` payload + the latest
-/// `queue_state` payload — and rebuild the menu on every change.
+/// recording-overlay) — v0.9.6 dropped the sixth (undo-window) when
+/// the stop flow moved to a notification banner. We drive everything
+/// off two pieces of state — the latest `status` payload + the
+/// latest `queue_state` payload — and rebuild the menu on every
+/// change.
 
 private let DEFAULT_SOCKET_PATH = NSHomeDirectory()
   + "/Library/Application Support/superwhisper-rag/meeting.sock"
@@ -32,14 +34,12 @@ private struct StatusPayload: Decodable {
   let since: String?
   let audioPath: String?
   let queuePending: Int
-  let undoWindowUntil: String?
 
   enum CodingKeys: String, CodingKey {
     case recording
     case since
     case audioPath = "audio_path"
     case queuePending = "queue_pending"
-    case undoWindowUntil = "undo_window_until"
   }
 }
 
@@ -90,20 +90,20 @@ private final class MenuBarController: NSObject {
   private var status: StatusPayload?
   private var queueState: QueueStatePayload?
   private var queueItems: [QueueStatePayload.QueueItem] = []
-  private var undoCountdownTimer: Timer?
   // 1 Hz timer that re-renders the menu while a recording is in
   // progress. Without it, the "Recording M:SS" header freezes at the
-  // value of the first `status_changed` push (v0.9.2 fix).
+  // value of the first `status_changed` push (v0.9.2 fix). v0.9.6
+  // removed the parallel undo-countdown timer — the stop flow moved
+  // to a notification banner; there is no menu-bar undo affordance.
   private var recordingTickTimer: Timer?
-  // Live references to the two header items whose titles tick on a
-  // timer. v0.9.5: we mutate the title on the currently-tracking
-  // item + call `NSMenu.update()` instead of calling `rebuildMenu()`,
-  // because reassigning `statusItem.menu` doesn't refresh the
+  // Live reference to the recording header item. v0.9.5: we mutate
+  // the title on the currently-tracking item + call
+  // `NSMenu.update()` instead of calling `rebuildMenu()`, because
+  // reassigning `statusItem.menu` doesn't refresh the
   // already-tracking menu (NSMenu snapshots its layout when it
-  // opens). The refs are reset on every `rebuildMenu()`; the timer
-  // callbacks no-op when the ref is nil (state transitioned away).
+  // opens). The ref is reset on every `rebuildMenu()`; the timer
+  // callback no-ops when the ref is nil (state transitioned away).
   private weak var recordingHeaderItem: NSMenuItem?
-  private weak var undoBannerItem: NSMenuItem?
 
   // Subscriber connection (long-lived). Per-op ops use one-shots.
   private var subscriber: DaemonConnection?
@@ -216,7 +216,6 @@ private final class MenuBarController: NSObject {
       if let envelope = try? JSONDecoder().decode(SubscribedEnvelope.self, from: raw) {
         if let s = envelope.status {
           self.status = s
-          updateUndoCountdown(until: s.undoWindowUntil)
         }
       }
       // Pull a fresh queue snapshot via a one-shot — the subscribed
@@ -308,7 +307,6 @@ private final class MenuBarController: NSObject {
       guard let self = self else { return }
       if let s = try? JSONDecoder().decode(StatusPayload.self, from: data) {
         self.status = s
-        self.updateUndoCountdown(until: s.undoWindowUntil)
         self.rebuildMenu()
       }
     }
@@ -335,37 +333,7 @@ private final class MenuBarController: NSObject {
     }
   }
 
-  // MARK: - Undo window timer
-
-  private func updateUndoCountdown(until iso: String?) {
-    undoCountdownTimer?.invalidate()
-    undoCountdownTimer = nil
-    guard let iso = iso else { return }
-    guard let until = isoDate(iso) else { return }
-    let now = Date()
-    if until <= now { return }
-    // Manual Timer + dual-mode registration (v0.9.4): same reasoning as the
-    // recording-tick timer. The "Undo auto-stop (Ns)" banner is rendered inside
-    // the menu, so without `.eventTracking` the countdown freezes while the
-    // user is hovering it — exactly the case where they're deciding whether
-    // to undo. v0.9.5: on tick we mutate the banner item's title in-place +
-    // call `menu.update()` rather than `rebuildMenu()` — see
-    // `tickRecordingElapsed()` for the underlying NSMenu-layout-cache reason.
-    let t = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
-      guard let self = self else { return }
-      if Date() >= until {
-        self.undoCountdownTimer?.invalidate()
-        self.undoCountdownTimer = nil
-        // Window expired — full rebuild removes the banner.
-        self.rebuildMenu()
-      } else {
-        self.tickUndoCountdown(until: until)
-      }
-    }
-    RunLoop.main.add(t, forMode: .common)
-    RunLoop.main.add(t, forMode: .eventTracking)
-    undoCountdownTimer = t
-  }
+  // MARK: - ISO8601 parsing
 
   private func isoDate(_ s: String) -> Date? {
     let f = ISO8601DateFormatter()
@@ -456,17 +424,6 @@ private final class MenuBarController: NSObject {
     item.menu?.update()
   }
 
-  /// See `tickRecordingElapsed()` — identical reasoning for the
-  /// "Undo auto-stop (Ns)" banner whose seconds-remaining counter
-  /// also froze inside an open menu.
-  private func tickUndoCountdown(until: Date) {
-    guard let item = undoBannerItem else { return }
-    let remaining = max(0, Int(until.timeIntervalSinceNow.rounded(.up)))
-    if remaining <= 0 { return }
-    item.title = "Undo auto-stop (\(remaining)s)"
-    item.menu?.update()
-  }
-
   // MARK: - Menu construction
 
   private func rebuildMenu() {
@@ -505,19 +462,6 @@ private final class MenuBarController: NSObject {
       recordingHeaderItem = nil
       menu.addItem(makeItem(title: "Start recording…", action: #selector(startRecording)))
       menu.addItem(.separator())
-    }
-
-    // Undo window banner (transient). Same v0.9.5 pattern: stash the
-    // banner ref so the countdown timer can update the title in-place.
-    undoBannerItem = nil
-    if let status = status, let untilIso = status.undoWindowUntil, let until = isoDate(untilIso) {
-      let remaining = max(0, Int(until.timeIntervalSinceNow.rounded(.up)))
-      if remaining > 0 {
-        let item = makeItem(title: "Undo auto-stop (\(remaining)s)", action: #selector(undoLast))
-        menu.addItem(item)
-        undoBannerItem = item
-        menu.addItem(.separator())
-      }
     }
 
     // Queue state.
@@ -675,10 +619,6 @@ private final class MenuBarController: NSObject {
 
   @objc private func queuePause() {
     dispatchOp(["op": "queue_pause"])
-  }
-
-  @objc private func undoLast() {
-    dispatchOp(["op": "undo_last"])
   }
 
   @objc private func discardItem(_ sender: NSMenuItem) {

@@ -51,12 +51,43 @@ private final class NotifyDelegate: NSObject, UNUserNotificationCenterDelegate {
   }
 }
 
+private struct NotifyAction {
+  var identifier: String
+  var title: String
+}
+
 private struct NotifyArgs {
   var title: String = ""
   var body: String = ""
-  var actions: [String] = []
+  var actions: [NotifyAction] = []
   var defaultAction: String = ""
   var timeoutSec: Double = 90
+}
+
+/// Parse one piece of the `--actions` argument. Supports two shapes:
+///   * `Plain`              → identifier = title = "Plain"
+///   * `id=Display Label`   → identifier = "id", title = "Display Label"
+///
+/// The `id=title` form was introduced in v0.9.6 to support the stop-
+/// recording banner whose user-facing labels contain `&` (e.g. `Stop &
+/// save`). Using the raw label as an identifier risks future macOS
+/// changes mangling action-id matching on response, and the `&` glyph
+/// in particular has historically been a problem character for various
+/// system identifier registries. The `id=` prefix lets callers keep the
+/// wire-side identifier clean (`save`, `discard`) without losing the
+/// human-readable display label.
+private func parseNotifyAction(_ piece: String) -> NotifyAction? {
+  let trimmed = piece.trimmingCharacters(in: .whitespaces)
+  if trimmed.isEmpty { return nil }
+  if let eq = trimmed.firstIndex(of: "=") {
+    let id = String(trimmed[..<eq]).trimmingCharacters(in: .whitespaces)
+    let title = String(trimmed[trimmed.index(after: eq)...]).trimmingCharacters(in: .whitespaces)
+    let safeId = id.isEmpty ? title : id
+    let safeTitle = title.isEmpty ? id : title
+    if safeId.isEmpty { return nil }
+    return NotifyAction(identifier: safeId, title: safeTitle)
+  }
+  return NotifyAction(identifier: trimmed, title: trimmed)
 }
 
 private func parseNotifyArgs(_ args: [String]) -> NotifyArgs {
@@ -74,8 +105,7 @@ private func parseNotifyArgs(_ args: [String]) -> NotifyArgs {
       if let v = next {
         out.actions = v
           .split(separator: ",", omittingEmptySubsequences: true)
-          .map { $0.trimmingCharacters(in: .whitespaces) }
-          .filter { !$0.isEmpty }
+          .compactMap { parseNotifyAction(String($0)) }
         i += 2
       } else {
         i += 1
@@ -159,12 +189,15 @@ func runNotify(args: [String]) {
 
   // Build category with action buttons. Identifiers double as
   // stdout payloads — we want them readable downstream, so we keep
-  // the caller's casing and lowercase on the way out.
+  // the caller's casing and lowercase on the way out. Titles are
+  // independent from identifiers (v0.9.6) so callers can use safe
+  // ASCII ids on the wire while showing arbitrary display labels in
+  // the banner — see `parseNotifyAction` for the syntax.
   let categoryId = "ai.swrag.helper.notify"
-  let unActions: [UNNotificationAction] = parsed.actions.map { name in
+  let unActions: [UNNotificationAction] = parsed.actions.map { action in
     UNNotificationAction(
-      identifier: name,
-      title: name,
+      identifier: action.identifier,
+      title: action.title,
       options: [.foreground]
     )
   }

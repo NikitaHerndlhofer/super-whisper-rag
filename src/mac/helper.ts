@@ -1110,22 +1110,25 @@ export function spawnRecorder(opts: RecorderOptions): RecorderHandle {
 /* -------------------------------------------------------------------------- */
 
 /**
- * Result of a `notify` invocation, validated through a literal union.
- * Anything outside the union — and any helper-side failure — is
- * surfaced as `"timeout"` by the caller so the daemon never blocks
- * a meeting on a notification path failure.
+ * Wire-level result of the start-recording `notify` invocation,
+ * validated through a literal union. Anything outside the union —
+ * and any helper-side failure — is surfaced as `"timeout"` by the
+ * caller so the daemon never blocks a meeting on a notification path
+ * failure. `popup.ts::askStartRecording` maps `"timeout"` to the
+ * user-facing `"skip"` outcome.
+ *
+ * v0.9.6 collapsed the start banner to a single action button — see
+ * the module header in `popup.ts` for the rationale. The "Skip"
+ * literal that used to live here is gone; dismiss/timeout IS the
+ * skip path.
  */
-const NotifyResultSchema = z.union([
-  z.literal("record"),
-  z.literal("skip"),
-  z.literal("timeout"),
-]);
-export type NotifyResult = z.infer<typeof NotifyResultSchema>;
+const StartNotifyResultSchema = z.union([z.literal("record"), z.literal("timeout")]);
+export type StartNotifyResult = z.infer<typeof StartNotifyResultSchema>;
 
 export interface FireStartRecordingNotificationOptions {
   /** Body text of the banner; the title is fixed. */
   reason: string;
-  /** Auto-dismiss the banner after this many seconds. Defaults to 90. */
+  /** Auto-dismiss the banner after this many seconds. Defaults to 60. */
   timeoutSeconds?: number;
   /** Override helper path for tests. */
   helperPath?: string;
@@ -1141,7 +1144,7 @@ export interface NotifyExecResult {
 
 export type NotifyExecFn = (cmd: string[]) => Promise<NotifyExecResult>;
 
-const DEFAULT_NOTIFY_TIMEOUT_SEC = 90;
+const DEFAULT_NOTIFY_TIMEOUT_SEC = 60;
 // Buffer above the helper-side timeout so we never SIGKILL the helper
 // in the middle of its own timeout-cleanup path. The helper sets up
 // a DispatchSource timer that calls CFRunLoopStop on the main loop;
@@ -1149,14 +1152,18 @@ const DEFAULT_NOTIFY_TIMEOUT_SEC = 90;
 const NOTIFY_PROCESS_BUFFER_MS = 3_000;
 
 /**
- * Fire a native UNUserNotificationCenter banner with Record / Skip
- * action buttons. Returns the chosen action lowercased, or
+ * Fire a native UNUserNotificationCenter banner with a single
+ * `Record` action button. Returns `"record"` if the user clicked
+ * the button (or the banner body, which defaults to Record), or
  * `"timeout"` on banner expiry / dismiss.
  *
- * This is the v0.9.0 replacement for `askStartRecording`'s modal
- * `osascript display dialog`. The banner is non-modal — it slides
- * down from the top-right and the user can ignore it without
- * stealing focus from whatever meeting tool they're already in.
+ * v0.9.6 collapsed this from two actions (Record / Skip) to one.
+ * macOS Tahoe (and earlier) only renders inline action buttons on
+ * the banner when there's exactly one action; two or more always
+ * hide behind the "Options" dropdown unless the user has switched
+ * notification style to "Alerts" globally. One action keeps the
+ * affirmative path one click away regardless of style; dismissing
+ * is the skip path.
  *
  * Failure modes (all return `"timeout"` rather than throwing, so the
  * daemon never crashes on a notification path):
@@ -1168,7 +1175,7 @@ const NOTIFY_PROCESS_BUFFER_MS = 3_000;
  */
 export async function fireStartRecordingNotification(
   opts: FireStartRecordingNotificationOptions,
-): Promise<NotifyResult> {
+): Promise<StartNotifyResult> {
   const timeoutSec = opts.timeoutSeconds ?? DEFAULT_NOTIFY_TIMEOUT_SEC;
   const exec = opts.exec ?? defaultNotifyExec;
   let bin: string;
@@ -1178,6 +1185,9 @@ export async function fireStartRecordingNotification(
     warn(`fireStartRecordingNotification: helper unresolved: ${errToString(e)}`);
     return "timeout";
   }
+  // Single-action banner (v0.9.6): use the `id=Display Label` syntax
+  // so the wire-side identifier stays safe ASCII even if a future
+  // localised label slips a special character in.
   const args = [
     bin,
     "notify",
@@ -1186,9 +1196,9 @@ export async function fireStartRecordingNotification(
     "--body",
     opts.reason,
     "--actions",
-    "Record,Skip",
+    "record=Record",
     "--default-action",
-    "Record",
+    "record",
     "--timeout",
     String(timeoutSec),
   ];
@@ -1206,12 +1216,137 @@ export async function fireStartRecordingNotification(
     return "timeout";
   }
   const raw = result.stdout.trim().split("\n").pop()?.trim() ?? "";
-  const parsed = NotifyResultSchema.safeParse(raw);
+  const parsed = StartNotifyResultSchema.safeParse(raw);
   if (!parsed.success) {
     warn(`fireStartRecordingNotification: unexpected stdout ${JSON.stringify(raw)}`);
     return "timeout";
   }
   return parsed.data;
+}
+
+/* -------------------------------------------------------------------------- */
+/* notify (stop) — v0.9.6 stop-recording banner                              */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Wire-level result of the stop-recording `notify` invocation. The
+ * Swift helper lowercases identifiers before printing them, so on a
+ * button click stdout reads `save`; `timeout` comes from the
+ * helper's own timer expiry / dismiss path.
+ *
+ * v0.9.6 collapsed the stop banner to a single action for the same
+ * reason the start banner did — see `fireStartRecordingNotification`'s
+ * doc. The "Stop & discard" affordance moved out of the banner: the
+ * user discards via the menu bar or the
+ * `swrag meeting queue discard <id>` CLI after the recording has
+ * been saved to the queue.
+ */
+const StopNotifyResultSchema = z.union([z.literal("save"), z.literal("timeout")]);
+export type StopNotifyResult = z.infer<typeof StopNotifyResultSchema>;
+
+export interface FireStopRecordingNotificationOptions {
+  /**
+   * Elapsed recording time in seconds; rendered into the body as
+   * "(elapsed M:SS)" so the user knows which recording is being
+   * asked about.
+   */
+  elapsedSec: number;
+  /** Auto-dismiss the banner after this many seconds. Defaults to 60. */
+  timeoutSeconds?: number;
+  /** Override helper path for tests. */
+  helperPath?: string;
+  /** Per-call exec stub for tests. */
+  exec?: NotifyExecFn;
+}
+
+/**
+ * Fire a native UNUserNotificationCenter banner asking the user
+ * whether to stop the current recording after a debounce-confirmed
+ * `HIGH → NONE` mic edge. Single action: `Stop & save`. Returns
+ * `"save"` on click (or body click — default action is also `save`),
+ * or `"timeout"` on banner expiry / dismiss / any helper-side
+ * failure.
+ *
+ * Failure modes (all return `"timeout"` rather than throwing, so the
+ * daemon never crashes on a notification path):
+ *   - Helper binary missing or exits non-zero (e.g. auth denied)
+ *   - Helper output doesn't match the schema
+ *   - Spawn-level error
+ * A warning is logged in every failure case so SWRAG_VERBOSE surfaces
+ * the underlying reason.
+ *
+ * Symmetric with `fireStartRecordingNotification` — same exec
+ * contract, same timeout buffer, same schema-validate-and-degrade
+ * approach.
+ */
+export async function fireStopRecordingNotification(
+  opts: FireStopRecordingNotificationOptions,
+): Promise<StopNotifyResult> {
+  const timeoutSec = opts.timeoutSeconds ?? DEFAULT_NOTIFY_TIMEOUT_SEC;
+  const exec = opts.exec ?? defaultNotifyExec;
+  let bin: string;
+  try {
+    bin = opts.helperPath ?? helperBinaryPath();
+  } catch (e) {
+    warn(`fireStopRecordingNotification: helper unresolved: ${errToString(e)}`);
+    return "timeout";
+  }
+  // Use `id=title` syntax (v0.9.6) so the wire-side identifier stays
+  // safe ASCII even though the display label contains `&` — see the
+  // Swift `parseNotifyAction` doc for the reasoning.
+  const args = [
+    bin,
+    "notify",
+    "--title",
+    "Meeting ended",
+    "--body",
+    `Stop recording? (elapsed ${formatElapsedForBody(opts.elapsedSec)})`,
+    "--actions",
+    "save=Stop & save",
+    "--default-action",
+    "save",
+    "--timeout",
+    String(timeoutSec),
+  ];
+  let result: NotifyExecResult;
+  try {
+    result = await exec(args);
+  } catch (e) {
+    warn(`fireStopRecordingNotification: spawn failed: ${errToString(e)}`);
+    return "timeout";
+  }
+  if (result.exitCode !== 0) {
+    warn(
+      `fireStopRecordingNotification: helper exit=${result.exitCode}: ${result.stderr.trim() || result.stdout.trim()}`,
+    );
+    return "timeout";
+  }
+  const raw = result.stdout.trim().split("\n").pop()?.trim() ?? "";
+  const parsed = StopNotifyResultSchema.safeParse(raw);
+  if (!parsed.success) {
+    warn(`fireStopRecordingNotification: unexpected stdout ${JSON.stringify(raw)}`);
+    return "timeout";
+  }
+  return parsed.data;
+}
+
+/**
+ * Format seconds as `M:SS` (or `H:MM:SS` past one hour) for the
+ * stop-recording banner body. Exposed via the call chain rather than
+ * exported so the formatting shape stays internal — if a future
+ * release adds a localisation layer this is where to land it.
+ */
+function formatElapsedForBody(seconds: number): string {
+  const s = Math.max(0, Math.floor(seconds));
+  if (s >= 3600) {
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s / 60) % 60);
+    const sec = s % 60;
+    return `${h}:${m.toString().padStart(2, "0")}:${sec.toString().padStart(2, "0")}`;
+  }
+  const m = Math.floor(s / 60);
+  const sec = s % 60;
+  return `${m}:${sec.toString().padStart(2, "0")}`;
 }
 
 const defaultNotifyExec: NotifyExecFn = async (cmd: string[]): Promise<NotifyExecResult> => {
