@@ -2,18 +2,23 @@ import AppKit
 import CoreAudio
 import Foundation
 
-/// Mic-in-use snapshot computed by OR'ing `kAudioDevicePropertyDeviceIsRunningSomewhere`
-/// across every input device on the system. `owners` is best-effort and may be empty
-/// on macOS < 14.4 (the `kAudioProcessPropertyPID` API used to populate it is gated
-/// to that OS).
+/// Mic-in-use snapshot. `owners` is the list of process bundle ids
+/// that have `kAudioProcessPropertyIsRunningInput=true` right now.
+/// `inUse` is `owners.count > 0` when we're running the v0.9.9
+/// process-level path; on the legacy device-level fallback (macOS <
+/// 14.4) it's the OR-aggregate of `kAudioDevicePropertyDeviceIsRunningSomewhere`
+/// across input devices and `owners` is `[]`.
 struct MicSnapshot {
   let inUse: Bool
   let owners: [String]
 }
 
+// MARK: - Device-level (legacy fallback for macOS < 14.4)
+
 /// Enumerate all audio devices that present at least one input stream.
-/// Used by both the `mic-in-use` one-shot and the `events` long-running
-/// subcommand (the latter registers a property listener per device).
+/// Only used by the legacy device-level fallback path on macOS <
+/// 14.4. The v0.9.9 events helper subscribes to per-process audio
+/// listeners directly and doesn't enumerate input devices.
 func enumerateInputDevices() -> [AudioDeviceID] {
   var addr = AudioObjectPropertyAddress(
     mSelector: kAudioHardwarePropertyDevices,
@@ -62,60 +67,51 @@ func deviceIsRunningSomewhere(_ device: AudioDeviceID) -> Bool {
   return status == noErr && value != 0
 }
 
-/// macOS 14.4+ exposes a process-list audio object, per-process PID,
-/// per-process running-input flag, and per-process bundle identifier.
-/// Together they give us a credible "which app has the mic open right
-/// now" view. Below 14.4 we return [] — the rest of the pipeline
-/// treats the list as diagnostic, never as a confidence input.
-///
-/// v0.9.8: bundle ID is resolved via `kAudioProcessPropertyBundleID`
-/// instead of `NSRunningApplication(processIdentifier:)`. The former
-/// is what CoreAudio knows about the process directly; the latter
-/// returns `nil` for any process that isn't a GUI app, which on this
-/// machine includes the swrag-helper recorder subprocess itself.
-/// That `nil` was the root cause of v0.9.7's empty owners list even
-/// though the recorder was the active mic client — leading the
-/// detector to never see a HIGH → NONE edge once we started recording,
-/// and the stop-recording banner never firing.
-func currentAudioClientBundleIDs() -> [String] {
-  guard #available(macOS 14.4, *) else { return [] }
+// MARK: - Process-level (v0.9.9, macOS 14.4+)
 
+/// Enumerate every `AudioProcess` object the system tracks right now.
+/// One per process that has registered with CoreAudio (which is every
+/// process that talks to audio HAL). This is the v0.9.9 enumeration
+/// primitive — it replaces the device-level enumeration used in
+/// v0.9.8 and earlier.
+///
+/// Use `kAudioHardwarePropertyProcessObjectList` on
+/// `kAudioObjectSystemObject`. The system object also exposes a
+/// property listener on this address, which fires when a process
+/// appears or disappears from the list — that's how the events
+/// helper learns about new processes without polling.
+@available(macOS 14.4, *)
+func enumerateAudioProcesses() -> [AudioObjectID] {
   var listAddr = AudioObjectPropertyAddress(
     mSelector: kAudioHardwarePropertyProcessObjectList,
     mScope: kAudioObjectPropertyScopeGlobal,
     mElement: kAudioObjectPropertyElementMain
   )
   var listSize: UInt32 = 0
-  let listStatus = AudioObjectGetPropertyDataSize(
+  let sizeStatus = AudioObjectGetPropertyDataSize(
     AudioObjectID(kAudioObjectSystemObject),
     &listAddr, 0, nil, &listSize
   )
-  guard listStatus == noErr, listSize > 0 else { return [] }
+  guard sizeStatus == noErr, listSize > 0 else { return [] }
 
   let count = Int(listSize) / MemoryLayout<AudioObjectID>.size
   var objects = [AudioObjectID](repeating: 0, count: count)
   let getStatus = objects.withUnsafeMutableBufferPointer { buf -> OSStatus in
-    var inout_size = listSize
+    var ioSize = listSize
     return AudioObjectGetPropertyData(
       AudioObjectID(kAudioObjectSystemObject),
-      &listAddr, 0, nil, &inout_size, buf.baseAddress!
+      &listAddr, 0, nil, &ioSize, buf.baseAddress!
     )
   }
   guard getStatus == noErr else { return [] }
-
-  var bundleIds: [String] = []
-  for obj in objects {
-    // Filter to processes actually running audio input right now.
-    if !processObjectIsRunningInput(obj) { continue }
-    if let bid = processObjectBundleID(obj), !bid.isEmpty {
-      bundleIds.append(bid)
-    }
-  }
-  return Array(NSOrderedSet(array: bundleIds)) as? [String] ?? bundleIds
+  return objects
 }
 
+/// `true` iff `kAudioProcessPropertyIsRunningInput` is set on the
+/// given AudioProcess object — i.e. that specific process is using
+/// the mic right now.
 @available(macOS 14.4, *)
-private func processObjectIsRunningInput(_ obj: AudioObjectID) -> Bool {
+func processObjectIsRunningInput(_ obj: AudioObjectID) -> Bool {
   var addr = AudioObjectPropertyAddress(
     mSelector: kAudioProcessPropertyIsRunningInput,
     mScope: kAudioObjectPropertyScopeGlobal,
@@ -128,15 +124,22 @@ private func processObjectIsRunningInput(_ obj: AudioObjectID) -> Bool {
 }
 
 /// Resolve the process object's bundle identifier directly from
-/// CoreAudio via `kAudioProcessPropertyBundleID`. The property returns
-/// a retained CFString; we bridge into Swift's `String` and release
-/// via `takeRetainedValue()`.
+/// CoreAudio via `kAudioProcessPropertyBundleID`. The property
+/// returns a retained CFString; we bridge into Swift's `String` and
+/// release via `takeRetainedValue()`.
 ///
-/// Returns `nil` on any error or when the property is empty. An empty
-/// bundle id is real (some daemon processes have no bundle); we treat
-/// those as anonymous and exclude them from the owners list.
+/// Returns `nil` on error or when the property is empty. An empty
+/// bundle id is real for some daemons; we treat those as anonymous
+/// and skip them in the owners list.
+///
+/// v0.9.8 introduced bundle-id resolution through this property
+/// because `NSRunningApplication(processIdentifier:)` returned nil
+/// for our own recorder subprocess (it's not a GUI app), masking the
+/// recorder from the owners list and breaking the recorder-mask
+/// filter in the TS detector. v0.9.9 keeps the same primitive — only
+/// the listener strategy changes.
 @available(macOS 14.4, *)
-private func processObjectBundleID(_ obj: AudioObjectID) -> String? {
+func processObjectBundleID(_ obj: AudioObjectID) -> String? {
   var addr = AudioObjectPropertyAddress(
     mSelector: kAudioProcessPropertyBundleID,
     mScope: kAudioObjectPropertyScopeGlobal,
@@ -150,12 +153,42 @@ private func processObjectBundleID(_ obj: AudioObjectID) -> String? {
   return cf as String
 }
 
-/// One-shot mic snapshot. Used by both the `mic-in-use` subcommand and
-/// the `events` subcommand's startup snapshot + every re-evaluation
-/// triggered by a CoreAudio property listener.
+/// One sweep of the process list: collect the bundle ids of every
+/// process that is currently running input. Deduplicated, preserving
+/// first-seen order. Used by both `snapshotMic()` and the events
+/// helper's re-evaluation path.
+@available(macOS 14.4, *)
+func currentInputRunningProcessBundleIDs() -> [String] {
+  let objects = enumerateAudioProcesses()
+  var bundleIds: [String] = []
+  for obj in objects {
+    if !processObjectIsRunningInput(obj) { continue }
+    if let bid = processObjectBundleID(obj), !bid.isEmpty {
+      bundleIds.append(bid)
+    }
+  }
+  return Array(NSOrderedSet(array: bundleIds)) as? [String] ?? bundleIds
+}
+
+// MARK: - Public snapshot
+
+/// One-shot mic snapshot. Two code paths:
+///   - macOS 14.4+: enumerate AudioProcess objects, filter where
+///     `IsRunningInput=true`, collect bundle ids. `inUse` derives
+///     from `owners.count > 0` (any process running input means the
+///     mic is in use). This matches the listener-driven path used
+///     by the events helper.
+///   - macOS < 14.4: legacy device-level fallback — OR-aggregate
+///     `kAudioDevicePropertyDeviceIsRunningSomewhere` across input
+///     devices; owners stays `[]` (no API to enumerate). The TS
+///     detector handles the empty-owners case as "degraded mode"
+///     and falls back to raw `inUse`.
 func snapshotMic() -> MicSnapshot {
+  if #available(macOS 14.4, *) {
+    let owners = currentInputRunningProcessBundleIDs()
+    return MicSnapshot(inUse: !owners.isEmpty, owners: owners)
+  }
   let devices = enumerateInputDevices()
   let inUse = devices.contains(where: { deviceIsRunningSomewhere($0) })
-  let owners = inUse ? currentAudioClientBundleIDs() : []
-  return MicSnapshot(inUse: inUse, owners: owners)
+  return MicSnapshot(inUse: inUse, owners: [])
 }

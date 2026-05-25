@@ -52,7 +52,7 @@ describe.skipIf(!HELPER_PRESENT)("mac/helper one-shots", () => {
   });
 
   test(
-    "mic-in-use reports owners including ai.swrag.helper while recorder is running (v0.9.8)",
+    "mic-in-use reports owners including ai.swrag.helper while recorder is running (v0.9.8 + v0.9.9)",
     async () => {
       // Regression for the v0.9.7 silent failure: owners were always
       // empty on this machine because the bundle-id resolution went
@@ -62,6 +62,17 @@ describe.skipIf(!HELPER_PRESENT)("mac/helper one-shots", () => {
       // any process that opens the mic shows up in owners — including
       // our own recorder, which is what enables the
       // recorder-PID-masking filter in detect.ts.
+      //
+      // v0.9.9 changes the underlying enumeration to per-process
+      // (kAudioHardwarePropertyProcessObjectList + kAudioProcessProperty
+      // IsRunningInput) instead of the device-level OR-aggregate.
+      // `inUse` is now derived from `owners.count > 0` rather than
+      // an independent device read. This test still asserts the
+      // same external contract: while the recorder runs, `inUse` is
+      // `true` and `owners` contains our helper bundle id. A
+      // regression in the new enumeration (process list returning
+      // empty, or our recorder failing to flip its
+      // IsRunningInput=true) would break this assertion.
       const tmp = mkdtempSync(join(tmpdir(), "swrag-rec-"));
       const outputPath = join(tmp, "owners-probe.wav");
       const handle = spawnRecorder({

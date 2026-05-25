@@ -409,6 +409,59 @@ describe("MeetingDetector — mic owners drive HIGH → NONE transition", () => 
     det.dispose();
   });
 
+  test("v0.9.9 scripted owner sequence: [comet] → [comet, swrag] → [swrag] → [] commits HIGH then NONE", async () => {
+    // v0.9.9 makes mid-recording owner-set changes observable. The
+    // helper now subscribes to per-process audio listeners and emits
+    // a fresh `mic_changed` event every time the owners list flips —
+    // even when raw `in_use` stays true the whole time. This script
+    // exercises the full four-step owner sequence the spec calls out:
+    //
+    //   1. [comet]                     — meeting starts, mic in use
+    //   2. [comet, ai.swrag.helper]    — we begin recording mid-call
+    //   3. [ai.swrag.helper]           — user closes Meet tab; only
+    //                                    our recorder remains
+    //   4. []                          — recorder stops
+    //
+    // Before v0.9.9 only edges 1 and 4 fired (kAudioDevicePropertyDeviceIs
+    // RunningSomewhere flips). Edges 2 and 3 were silent — and edge 3
+    // is the one that drives HIGH → NONE. The HIGH→NONE commit MUST
+    // land on step 3, not step 4.
+    const edges: MeetingEdge[] = [];
+    const det = new MeetingDetector({
+      debounceMs: 50,
+      resolveBrowserUrl: async () => "https://meet.google.com/abc-defg-hij",
+      onEdge: (e) => edges.push(e),
+    });
+    await det.handleEvent(snapshot({ bundleId: "ai.perplexity.comet", micInUse: false }));
+
+    // 1. Meeting starts — comet opens mic.
+    await det.handleEvent(micChanged(true, ["ai.perplexity.comet"]));
+    await Bun.sleep(70);
+    expect(edges.map((e) => e.to)).toEqual(["HIGH"]);
+
+    // 2. We start recording — helper joins. v0.9.9: this event now
+    //    fires (mid-recording owner-set changes are observable).
+    await det.handleEvent(micChanged(true, ["ai.perplexity.comet", "ai.swrag.helper"]));
+    await Bun.sleep(70);
+    // Still HIGH — no new edge.
+    expect(edges.map((e) => e.to)).toEqual(["HIGH"]);
+
+    // 3. User closes Meet tab — comet releases mic. v0.9.9: this
+    //    event now fires too. Effective mic_in_use drops to false
+    //    (only swrag holds the mic) → HIGH → NONE.
+    await det.handleEvent(micChanged(true, ["ai.swrag.helper"]));
+    await Bun.sleep(70);
+    expect(edges.map((e) => e.to)).toEqual(["HIGH", "NONE"]);
+    expect(edges[1]?.signal.evidence.mic_in_use).toBe(false);
+
+    // 4. Recorder stops — raw mic finally goes idle. No new edge
+    //    (we're already at NONE).
+    await det.handleEvent(micChanged(false, []));
+    await Bun.sleep(70);
+    expect(edges.map((e) => e.to)).toEqual(["HIGH", "NONE"]);
+    det.dispose();
+  });
+
   test("degraded mode (no owners) keeps the v0.9.7 path: HIGH stays HIGH until raw mic_in_use flips", async () => {
     // Older macOS where the CoreAudio query returns no owners. The
     // detector falls back to the raw mic_in_use bit, same as v0.9.7.

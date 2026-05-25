@@ -8,32 +8,101 @@ import Foundation
 //
 //   - NSWorkspace.shared.notificationCenter for app activation /
 //     launch / termination events.
-//   - kAudioDevicePropertyDeviceIsRunningSomewhere on every input
-//     device, so we know the instant a process starts or stops using
-//     the mic (any input — built-in, USB, AirPods, virtual loopback).
-//   - kAudioHardwarePropertyDevices system-wide, so we can tear down
-//     and re-register the per-device listeners when the user plugs in
-//     or removes a device mid-session.
+//
+//   - On macOS 14.4+ (the v0.9.9 process-level path):
+//       · `kAudioHardwarePropertyProcessObjectList` on
+//         `kAudioObjectSystemObject` — fires when a process appears
+//         in or disappears from CoreAudio's audio-process list.
+//       · Per-AudioProcess `kAudioProcessPropertyIsRunning` listeners
+//         — one per known process. Fires whenever that specific
+//         process toggles between "using any audio" and "not using
+//         any audio". This is our wakeup signal — see the macOS API
+//         note below for why we don't use `IsRunningInput` directly.
+//     On any listener fire, we re-enumerate every known AudioProcess,
+//     filter by `kAudioProcessPropertyIsRunningInput=true`, and
+//     compute the new `owners` list. The `mic_changed` event is
+//     emitted only when `(in_use, owners)` actually differs from the
+//     last snapshot — so spurious `IsRunning` fires for output-only
+//     processes (Spotify starts playing) cost a re-enumeration but
+//     not an emitted event.
+//
+//     This is the v0.9.9 change. The device-level
+//     `kAudioDevicePropertyDeviceIsRunningSomewhere` listener used in
+//     v0.9.8 and earlier was a boolean OR across all input streams
+//     and fired only when the overall device usage toggled — never
+//     when the SET of mic-using processes changed while the
+//     aggregate stayed `true`. That blind spot was the root cause of
+//     the "stop notification doesn't fire when the meeting ends
+//     during recording" bug: once our recorder joined the mic, the
+//     aggregate stayed true even after the meeting app released, so
+//     we never got an event with the new (recorder-only) owners list
+//     and the HIGH → NONE transition was masked.
+//
+//     macOS API note (verified empirically on macOS Tahoe 26 during
+//     v0.9.9 development): `kAudioProcessPropertyIsRunningInput`
+//     property *reads* return the correct value, but listener
+//     callbacks on that selector NEVER fire when the value changes
+//     mid-process-lifetime. The same is true for
+//     `kAudioProcessPropertyDevices`. Only
+//     `kAudioProcessPropertyIsRunning` (the "running any audio"
+//     aggregate) reliably fires its listener callback on transitions.
+//     That's good enough for our purposes: when the meeting app
+//     releases the mic — the canonical bug scenario — its
+//     `IsRunning` aggregate also flips (closing the tab kills both
+//     input and output sessions for that tab) and our listener fires.
+//
+//   - On macOS < 14.4: legacy device-level fallback —
+//     `kAudioDevicePropertyDeviceIsRunningSomewhere` per input device
+//     plus `kAudioHardwarePropertyDevices` for hot-plug. Owners are
+//     always `[]` because `kAudioProcessProperty*` is gated to 14.4+.
+//     The TS detector handles this as "degraded mode" — same
+//     behaviour as the v0.9.7 fallback.
 //
 // All events are JSON objects on one line each, written to stdout.
 // On SIGTERM/SIGINT we unregister listeners, flush stdout, exit 0.
 
 private final class EventsRunner {
-  private var deviceListeners: [(device: AudioDeviceID, addr: AudioObjectPropertyAddress, block: AudioObjectPropertyListenerBlock)] = []
-  private var hardwareListenerInstalled = false
-  // Captured so we can pass the same block into Remove. CoreAudio
-  // matches listeners by (objectId, address, block-identity), so we
-  // can't construct a fresh block at removal time.
-  private lazy var hardwareListenerBlock: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
-    // Hot-plug: input device set changed. Tear down + rebuild.
+  // Common state.
+  private lazy var workspaceObservers: [NSObjectProtocol] = []
+  private var lastMicSnapshot: MicSnapshot = MicSnapshot(inUse: false, owners: [])
+  private let queue = DispatchQueue(label: "swrag-helper.events")
+
+  // Process-level state (macOS 14.4+).
+  // The same block instance is reused for every per-process subscription
+  // and for the process-list listener, because CoreAudio matches
+  // listeners by (objectId, address, block-identity) — so we need
+  // stable block references for clean Remove calls at shutdown.
+  private var processIsRunningListeners:
+    [AudioObjectID: AudioObjectPropertyListenerBlock] = [:]
+  private var processListListenerInstalled = false
+  // These two blocks are only ever registered on macOS 14.4+ via
+  // `registerProcessListListener()` / `rebuildPerProcessListeners()`,
+  // both of which carry the availability guard. The closure body
+  // still needs an explicit `#available` because property
+  // initialisers don't inherit the enclosing call site's availability.
+  private lazy var processListListenerBlock: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+    DispatchQueue.main.async {
+      if #available(macOS 14.4, *) {
+        self?.rebuildPerProcessListenersAfterListChange()
+      }
+    }
+  }
+  private lazy var processIsRunningBlock: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+    DispatchQueue.main.async { self?.handleMicMaybeChanged() }
+  }
+
+  // Legacy device-level state (macOS < 14.4 fallback).
+  private var deviceListeners: [(
+    device: AudioDeviceID,
+    addr: AudioObjectPropertyAddress,
+    block: AudioObjectPropertyListenerBlock
+  )] = []
+  private var hardwareDevicesListenerInstalled = false
+  private lazy var hardwareDevicesListenerBlock: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
     DispatchQueue.main.async {
       self?.rebuildDeviceListenersAfterHotplug()
     }
   }
-
-  private lazy var workspaceObservers: [NSObjectProtocol] = []
-  private var lastMicSnapshot: MicSnapshot = MicSnapshot(inUse: false, owners: [])
-  private let queue = DispatchQueue(label: "swrag-helper.events")
 
   func start() {
     emitSnapshot()
@@ -118,12 +187,124 @@ private final class EventsRunner {
     ))
   }
 
-  // MARK: - CoreAudio
+  // MARK: - CoreAudio entry
 
   private func subscribeCoreAudio() {
-    registerDeviceListeners()
-    registerHardwareListener()
+    if #available(macOS 14.4, *) {
+      registerProcessListListener()
+      rebuildPerProcessListeners()
+    } else {
+      registerDeviceListeners()
+      registerHardwareDevicesListener()
+    }
   }
+
+  // MARK: - CoreAudio: process-level (macOS 14.4+)
+
+  @available(macOS 14.4, *)
+  private func registerProcessListListener() {
+    var addr = AudioObjectPropertyAddress(
+      mSelector: kAudioHardwarePropertyProcessObjectList,
+      mScope: kAudioObjectPropertyScopeGlobal,
+      mElement: kAudioObjectPropertyElementMain
+    )
+    let status = AudioObjectAddPropertyListenerBlock(
+      AudioObjectID(kAudioObjectSystemObject),
+      &addr, nil, processListListenerBlock
+    )
+    processListListenerInstalled = status == noErr
+  }
+
+  @available(macOS 14.4, *)
+  private func unregisterProcessListListener() {
+    guard processListListenerInstalled else { return }
+    var addr = AudioObjectPropertyAddress(
+      mSelector: kAudioHardwarePropertyProcessObjectList,
+      mScope: kAudioObjectPropertyScopeGlobal,
+      mElement: kAudioObjectPropertyElementMain
+    )
+    _ = AudioObjectRemovePropertyListenerBlock(
+      AudioObjectID(kAudioObjectSystemObject),
+      &addr, nil, processListListenerBlock
+    )
+    processListListenerInstalled = false
+  }
+
+  /// Walk the current process-object list and reconcile it against
+  /// our subscription set: add `IsRunning` listeners for any
+  /// newly-seen objects, remove listeners for objects that no longer
+  /// appear. Called once at startup and again from the process-list
+  /// listener whenever a process appears or disappears.
+  ///
+  /// We listen on `kAudioProcessPropertyIsRunning` rather than
+  /// `kAudioProcessPropertyIsRunningInput` because empirical testing
+  /// on macOS Tahoe 26 (v0.9.9 dev) confirmed that the `IsRunningInput`
+  /// listener never fires on state changes — only the
+  /// `IsRunning` (aggregate input-or-output) listener does. We still
+  /// USE `IsRunningInput` when computing the owners list — the
+  /// property read returns the correct value, only the change
+  /// notifications are silent. See the file-level comment for the
+  /// full story.
+  @available(macOS 14.4, *)
+  private func rebuildPerProcessListeners() {
+    let current = Set(enumerateAudioProcesses())
+    let known = Set(processIsRunningListeners.keys)
+
+    let toAdd = current.subtracting(known)
+    let toRemove = known.subtracting(current)
+
+    for obj in toAdd {
+      var addr = AudioObjectPropertyAddress(
+        mSelector: kAudioProcessPropertyIsRunning,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+      )
+      let status = AudioObjectAddPropertyListenerBlock(
+        obj, &addr, nil, processIsRunningBlock
+      )
+      if status == noErr {
+        processIsRunningListeners[obj] = processIsRunningBlock
+      }
+    }
+
+    for obj in toRemove {
+      guard let block = processIsRunningListeners[obj] else { continue }
+      var addr = AudioObjectPropertyAddress(
+        mSelector: kAudioProcessPropertyIsRunning,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+      )
+      _ = AudioObjectRemovePropertyListenerBlock(obj, &addr, nil, block)
+      processIsRunningListeners.removeValue(forKey: obj)
+    }
+  }
+
+  @available(macOS 14.4, *)
+  private func rebuildPerProcessListenersAfterListChange() {
+    rebuildPerProcessListeners()
+    // The process-list change itself may have been caused by a
+    // process that opened the mic on startup (so we missed the
+    // IsRunning=true edge that fired before we'd registered the
+    // listener) or by a process exiting while holding the mic
+    // (no IsRunning=false edge — the object just vanished).
+    // Either way the owners set has shifted; re-evaluate.
+    handleMicMaybeChanged()
+  }
+
+  @available(macOS 14.4, *)
+  private func unregisterAllPerProcessListeners() {
+    for (obj, block) in processIsRunningListeners {
+      var addr = AudioObjectPropertyAddress(
+        mSelector: kAudioProcessPropertyIsRunning,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+      )
+      _ = AudioObjectRemovePropertyListenerBlock(obj, &addr, nil, block)
+    }
+    processIsRunningListeners.removeAll()
+  }
+
+  // MARK: - CoreAudio: device-level (macOS < 14.4 fallback)
 
   private func registerDeviceListeners() {
     let devices = enumerateInputDevices()
@@ -143,7 +324,7 @@ private final class EventsRunner {
     }
   }
 
-  private func registerHardwareListener() {
+  private func registerHardwareDevicesListener() {
     var addr = AudioObjectPropertyAddress(
       mSelector: kAudioHardwarePropertyDevices,
       mScope: kAudioObjectPropertyScopeGlobal,
@@ -151,9 +332,9 @@ private final class EventsRunner {
     )
     let status = AudioObjectAddPropertyListenerBlock(
       AudioObjectID(kAudioObjectSystemObject),
-      &addr, nil, hardwareListenerBlock
+      &addr, nil, hardwareDevicesListenerBlock
     )
-    hardwareListenerInstalled = status == noErr
+    hardwareDevicesListenerInstalled = status == noErr
   }
 
   private func unregisterDeviceListeners() {
@@ -164,8 +345,8 @@ private final class EventsRunner {
     deviceListeners.removeAll()
   }
 
-  private func unregisterHardwareListener() {
-    guard hardwareListenerInstalled else { return }
+  private func unregisterHardwareDevicesListener() {
+    guard hardwareDevicesListenerInstalled else { return }
     var addr = AudioObjectPropertyAddress(
       mSelector: kAudioHardwarePropertyDevices,
       mScope: kAudioObjectPropertyScopeGlobal,
@@ -173,9 +354,9 @@ private final class EventsRunner {
     )
     _ = AudioObjectRemovePropertyListenerBlock(
       AudioObjectID(kAudioObjectSystemObject),
-      &addr, nil, hardwareListenerBlock
+      &addr, nil, hardwareDevicesListenerBlock
     )
-    hardwareListenerInstalled = false
+    hardwareDevicesListenerInstalled = false
   }
 
   private func rebuildDeviceListenersAfterHotplug() {
@@ -185,11 +366,18 @@ private final class EventsRunner {
     handleMicMaybeChanged()
   }
 
+  // MARK: - Mic change emission
+
   private func handleMicMaybeChanged() {
     let snap = snapshotMic()
-    // De-dup: only emit when state actually changes. owners is
-    // best-effort and may flicker on older macOS — compare against
-    // both in-use bit and owners list to be safe.
+    // De-dup: only emit when state actually changes. On the v0.9.9
+    // process-level path the owners list is the load-bearing signal —
+    // a process flipping `IsRunningInput` mid-call (e.g. Meet tab
+    // closes while we're still holding the mic) keeps `inUse=true`
+    // but mutates `owners`, and we MUST emit that change so the TS
+    // detector can see the new owners set and apply its recorder
+    // filter. Comparing the owners list as part of the de-dup gate
+    // covers that case.
     if snap.inUse == lastMicSnapshot.inUse && snap.owners == lastMicSnapshot.owners {
       return
     }
@@ -219,8 +407,12 @@ private final class EventsRunner {
   private var signalSources: [DispatchSourceSignal] = []
 
   private func shutdown() {
+    if #available(macOS 14.4, *) {
+      unregisterAllPerProcessListeners()
+      unregisterProcessListListener()
+    }
     unregisterDeviceListeners()
-    unregisterHardwareListener()
+    unregisterHardwareDevicesListener()
     for obs in workspaceObservers {
       NSWorkspace.shared.notificationCenter.removeObserver(obs)
     }
