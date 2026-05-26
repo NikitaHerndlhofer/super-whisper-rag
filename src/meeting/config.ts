@@ -96,11 +96,44 @@ export const MatchListSchema = z.object({
 });
 export type MatchList = z.infer<typeof MatchListSchema>;
 
+/**
+ * Opt-in global keyboard shortcuts (v0.9.11).
+ *
+ * Currently exposes a single hotkey:
+ *   - `stop_recording` — fires `record_stop` on the daemon socket
+ *     when pressed. Auto-stop for browser-based meetings turns out
+ *     to be unreliable (we tried across v0.9.6–v0.9.10); the
+ *     explicit hotkey gives the user a one-keystroke escape hatch
+ *     that doesn't require popping the menu bar.
+ *
+ * Off by default. The user opts in via:
+ *   `swrag meeting config set hotkeys.stop_recording "cmd+shift+s"`
+ *
+ * The Swift menubar parses the string and registers an
+ * `NSEvent.addGlobalMonitorForEvents` monitor while a recording is
+ * active. Format is `[modifier+...]+key`, e.g. `cmd+shift+s` or
+ * `ctrl+alt+space`. Modifiers: `cmd` / `command`, `shift`, `ctrl`
+ * / `control`, `alt` / `opt` / `option`. Keys: letters a–z,
+ * digits 0–9, `space`, `return` / `enter`, `tab`, `escape` /
+ * `esc`. Case-insensitive. Unparseable strings are silently
+ * ignored on the Swift side (with a logged warning); the schema
+ * validates only that it's a non-empty string.
+ *
+ * Globally-scoped monitors require macOS Accessibility permission;
+ * the menubar surfaces that in the daemon's permissions probe so
+ * the user can see whether their grant is live.
+ */
+export const HotkeysSchema = z.object({
+  stop_recording: z.string().nullable().default(null),
+});
+export type Hotkeys = z.infer<typeof HotkeysSchema>;
+
 export const PopupConfigSchema = z.object({
   threshold: ThresholdSchema.default("HIGH"),
   schedule: ScheduleSchema.default(() => ({ enabled: false, timezone: "local", windows: [] })),
   allowlist: MatchListSchema.default(() => ({ bundle_ids: [], url_patterns: [] })),
   blocklist: MatchListSchema.default(() => ({ bundle_ids: [], url_patterns: [] })),
+  hotkeys: HotkeysSchema.default(() => ({ stop_recording: null })),
 });
 export type PopupConfig = z.infer<typeof PopupConfigSchema>;
 

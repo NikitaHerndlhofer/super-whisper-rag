@@ -172,6 +172,39 @@ private final class Recorder {
         "Verify Microphone permission is granted to this process."
       )
     }
+    // v0.9.11: disable VPIO's output-side audio ducking.
+    //
+    // `setVoiceProcessingEnabled(true)` activates
+    // `kAudioUnitSubType_VoiceProcessingIO`, which by default also
+    // activates macOS's "communication audio mode". That mode is
+    // designed for VOIP clients: it ducks (attenuates) every other
+    // app's audio output and any system sounds so the remote party's
+    // voice cuts through over the speakers.
+    //
+    // We are a passive recorder, not a VOIP client — the user is
+    // listening to the meeting through some OTHER app (Meet / Zoom
+    // / Teams in a browser / native) and ducking that audio makes
+    // the call quieter for them while we're recording. We want
+    // VPIO's AEC + AGC + NR (the reason we enabled it; see the
+    // file-header comment), but NOT the output-side ducking.
+    //
+    // macOS 14+ exposes the knob:
+    //   `voiceProcessingOtherAudioDuckingConfiguration` on
+    //   AVAudioInputNode, set to a struct with
+    //   `enableAdvancedDucking=false` + `duckingLevel=.min` to drop
+    //   the attenuation to the lowest level Apple offers.
+    //
+    // The macOS-13-and-older path keeps the legacy behaviour (mild
+    // ducking) — we can't drop the ducking there without dropping
+    // VPIO entirely, which loses AEC. Almost everyone is on 14+ by
+    // now; the older path is a graceful no-op.
+    if #available(macOS 14.0, *) {
+      input.voiceProcessingOtherAudioDuckingConfiguration =
+        AVAudioVoiceProcessingOtherAudioDuckingConfiguration(
+          enableAdvancedDucking: false,
+          duckingLevel: .min
+        )
+    }
     let inputFormat = input.outputFormat(forBus: 0)
     if inputFormat.sampleRate <= 0 || inputFormat.channelCount == 0 {
       throw RecorderError(

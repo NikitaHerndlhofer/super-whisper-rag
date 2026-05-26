@@ -83,6 +83,16 @@ export const PermissionsSchema = z.object({
   // `.provisional` is a real APNs state for opt-in-without-asking
   // alerts; we surface it through to the doctor output unchanged.
   notifications: z.enum(["granted", "denied", "not_determined", "provisional"]),
+  // Accessibility: tracked starting in v0.9.11 for the menubar's
+  // opt-in stop-recording global hotkey
+  // (`NSEvent.addGlobalMonitorForEvents` requires Accessibility).
+  // `AXIsProcessTrustedWithOptions` has no `not_determined` shape;
+  // the field is two-state by nature. `.optional()` for back-compat
+  // with helper binaries from earlier versions during the upgrade
+  // window (the daemon may briefly run with a freshly-built TS side
+  // against a still-cached old helper bundle on first launch after
+  // upgrade — keep the schema lenient there).
+  accessibility: z.enum(["granted", "denied"]).optional(),
 });
 export type Permissions = z.infer<typeof PermissionsSchema>;
 

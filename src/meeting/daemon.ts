@@ -1265,6 +1265,11 @@ export class MeetingDaemon {
       audio_path: this.recording?.handle.audioPath ?? null,
       queue_pending: queuePending,
       last_detect: lastDetect,
+      // v0.9.11: expose hotkey config to subscribers (menubar) so a
+      // single subscribe round-trip is enough to know which (if any)
+      // global hotkeys to register. Mutations after subscribe arrive
+      // via the `config_reloaded` push event.
+      hotkeys: this.popupConfig.hotkeys,
     };
   }
 

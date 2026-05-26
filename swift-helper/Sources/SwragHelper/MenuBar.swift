@@ -34,12 +34,37 @@ private struct StatusPayload: Decodable {
   let since: String?
   let audioPath: String?
   let queuePending: Int
+  /// v0.9.11: opt-in hotkey config carried on the subscribe envelope
+  /// + every status response. The menubar uses
+  /// `hotkeys.stop_recording` to decide whether to arm a global
+  /// keyboard monitor while recording. Absent / null on installs
+  /// that haven't opted in via `swrag meeting config set
+  /// hotkeys.stop_recording …`.
+  let hotkeys: HotkeysPayload?
 
   enum CodingKeys: String, CodingKey {
     case recording
     case since
     case audioPath = "audio_path"
     case queuePending = "queue_pending"
+    case hotkeys
+  }
+}
+
+private struct HotkeysPayload: Decodable {
+  let stopRecording: String?
+
+  enum CodingKeys: String, CodingKey {
+    case stopRecording = "stop_recording"
+  }
+}
+
+private struct ConfigReloadedEnvelope: Decodable {
+  let event: String
+  let config: ConfigPayload?
+
+  struct ConfigPayload: Decodable {
+    let hotkeys: HotkeysPayload?
   }
 }
 
@@ -110,6 +135,20 @@ private final class MenuBarController: NSObject {
   private var reconnectBackoffIdx = 0
   private let reconnectBackoffSec: [TimeInterval] = [1, 5, 30, 60]
   private var disconnected = true
+
+  // v0.9.11: opt-in global stop-recording hotkey. The monitor is
+  // installed ONLY while recording is active and a hotkey is
+  // configured, then torn down on stop / config disable / disconnect.
+  // We never register a monitor on an idle menubar — global key
+  // monitors are powerful and surprising; opt-in + lifecycle-scoped
+  // keeps the surface minimal.
+  private let stopHotkeyMonitor = HotkeyMonitor()
+  /// Last configured hotkey string we saw from the daemon (canonical
+  /// form, e.g. `cmd+shift+s`). `nil` = unconfigured / disabled.
+  /// Comparing canonical strings keeps the install loop idempotent:
+  /// every push of `config_reloaded` only re-parses when the value
+  /// changed.
+  private var configuredStopHotkey: HotkeyCombo?
 
   init(socketPath: String) {
     self.socketPath = socketPath
@@ -216,6 +255,10 @@ private final class MenuBarController: NSObject {
       if let envelope = try? JSONDecoder().decode(SubscribedEnvelope.self, from: raw) {
         if let s = envelope.status {
           self.status = s
+          // Carry the hotkey config off the initial snapshot — saves
+          // a round-trip to the daemon. Mutations after subscribe
+          // arrive via `config_reloaded` (handled below).
+          self.updateConfiguredStopHotkey(s.hotkeys?.stopRecording)
         }
       }
       // Pull a fresh queue snapshot via a one-shot — the subscribed
@@ -240,12 +283,25 @@ private final class MenuBarController: NSObject {
     case "detect_changed":
       // Detector visibility is debug-only in this UI; don't surface.
       _ = payload
+    case "config_reloaded":
+      // v0.9.11: daemon re-broadcasts the full popup config on every
+      // CLI mutation via `swrag meeting config …`. We only care about
+      // the hotkeys block — the rest of the config doesn't reach the
+      // menubar surface.
+      if let envelope = try? JSONDecoder().decode(ConfigReloadedEnvelope.self, from: raw) {
+        self.updateConfiguredStopHotkey(envelope.config?.hotkeys?.stopRecording)
+        self.reconcileStopHotkeyMonitor()
+      }
     case "shutdown":
       // Daemon is going away. Drop the subscriber + show "Daemon
       // unavailable" until the next launchd respawn brings it back.
       self.subscriber?.cancel()
       self.subscriber = nil
       self.disconnected = true
+      // No daemon = nowhere to send `record_stop`; the hotkey would
+      // do nothing. Pull the monitor proactively so we don't leak
+      // a key-grabbing closure across the disconnect.
+      self.stopHotkeyMonitor.remove()
       self.scheduleReconnect()
       rebuildMenu()
     default:
@@ -307,6 +363,10 @@ private final class MenuBarController: NSObject {
       guard let self = self else { return }
       if let s = try? JSONDecoder().decode(StatusPayload.self, from: data) {
         self.status = s
+        // Status responses also carry hotkey config (since v0.9.11);
+        // keep our local view in sync so a transient disconnect
+        // doesn't lose the configured hotkey.
+        self.updateConfiguredStopHotkey(s.hotkeys?.stopRecording)
         self.rebuildMenu()
       }
     }
@@ -550,6 +610,63 @@ private final class MenuBarController: NSObject {
     // just rendered. Idempotent — only re-creates the timer on
     // recording-state transitions.
     updateRecordingTickTimer()
+    // v0.9.11: arm/disarm the stop-recording hotkey on every menu
+    // rebuild. Reconcile is idempotent — only mutates the underlying
+    // NSEvent monitor on a real state transition (recording on/off
+    // or configured hotkey changed).
+    reconcileStopHotkeyMonitor()
+  }
+
+  // MARK: - Stop-recording hotkey (v0.9.11)
+
+  /// Parse the latest hotkey string from the daemon and stash the
+  /// parsed combo on the controller. Called from every payload that
+  /// could carry hotkey config (subscribe envelope, fetched status,
+  /// `config_reloaded` push).
+  ///
+  /// `raw == nil` means "unconfigured" — we drop any prior combo so
+  /// the reconciler removes the monitor on the next pass.
+  private func updateConfiguredStopHotkey(_ raw: String?) {
+    guard let raw = raw, !raw.isEmpty else {
+      configuredStopHotkey = nil
+      return
+    }
+    guard let combo = HotkeyCombo.parse(raw) else {
+      // Unparseable hotkey strings get logged + dropped. The TS-side
+      // schema only validates that the value is a non-empty string;
+      // we do the structural validation here so a typo doesn't blow
+      // up the menubar.
+      FileHandle.standardError.write(
+        Data("menubar: unparseable hotkey \(raw); ignoring\n".utf8)
+      )
+      configuredStopHotkey = nil
+      return
+    }
+    configuredStopHotkey = combo
+  }
+
+  /// Install or remove the global stop-recording monitor based on
+  /// current state. The monitor is active ONLY when:
+  ///   * the daemon is connected,
+  ///   * a recording is in progress,
+  ///   * a parseable hotkey is configured.
+  ///
+  /// Anything else → monitor removed (no stray key-grabbing closure
+  /// while the menubar is idle).
+  private func reconcileStopHotkeyMonitor() {
+    let isRecording = !disconnected && (status?.recording ?? false)
+    guard isRecording, let combo = configuredStopHotkey else {
+      stopHotkeyMonitor.remove()
+      return
+    }
+    // Idempotent: if the same combo is already installed, leave it.
+    // Otherwise replace (the monitor itself removes the prior one).
+    if stopHotkeyMonitor.current == combo { return }
+    stopHotkeyMonitor.install(combo: combo) { [weak self] in
+      DispatchQueue.main.async {
+        self?.dispatchOp(["op": "record_stop", "discard": false])
+      }
+    }
   }
 
   // MARK: - Icon

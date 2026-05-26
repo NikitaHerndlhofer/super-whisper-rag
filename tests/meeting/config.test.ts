@@ -50,6 +50,28 @@ describe("PopupConfigSchema defaults", () => {
     expect(c.schedule.windows).toEqual([]);
     expect(c.allowlist).toEqual({ bundle_ids: [], url_patterns: [] });
     expect(c.blocklist).toEqual({ bundle_ids: [], url_patterns: [] });
+    // v0.9.11: hotkeys default to null (no global shortcuts armed).
+    expect(c.hotkeys).toEqual({ stop_recording: null });
+  });
+
+  test("hotkeys.stop_recording: legacy stored config (no hotkeys field) round-trips with the v0.9.11 default", () => {
+    // Simulate a v0.9.10 archive — stored JSON predates the
+    // `hotkeys` field. Schema must fill in the default rather than
+    // reject the row.
+    const c = PopupConfigSchema.parse({
+      threshold: "HIGH",
+      schedule: { enabled: false, timezone: "local", windows: [] },
+      allowlist: { bundle_ids: [], url_patterns: [] },
+      blocklist: { bundle_ids: [], url_patterns: [] },
+    });
+    expect(c.hotkeys).toEqual({ stop_recording: null });
+  });
+
+  test("hotkeys.stop_recording: accepts a configured string", () => {
+    const c = PopupConfigSchema.parse({
+      hotkeys: { stop_recording: "cmd+shift+s" },
+    });
+    expect(c.hotkeys.stop_recording).toBe("cmd+shift+s");
   });
 
   test("defaultConfig() returns a fresh independent object", () => {

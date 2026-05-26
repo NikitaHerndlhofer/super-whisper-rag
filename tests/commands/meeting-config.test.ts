@@ -108,6 +108,15 @@ describe("cmdSet — scalar paths", () => {
   test("assigning a scalar to an object path throws (would corrupt schema)", () => {
     expect(() => cmdSet(archive, "schedule", "true")).toThrow();
   });
+
+  test("hotkeys.stop_recording (v0.9.11) coerces opt-in hotkey string through", () => {
+    const c = cmdSet(archive, "hotkeys.stop_recording", "cmd+shift+s");
+    expect(c.hotkeys.stop_recording).toBe("cmd+shift+s");
+  });
+
+  test("hotkeys.stop_recording: a fresh archive starts with the value defaulted to null", () => {
+    expect(cmdGet(archive).hotkeys.stop_recording).toBeNull();
+  });
 });
 
 describe("cmdSet — array paths", () => {

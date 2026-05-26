@@ -110,6 +110,14 @@ describe.skipIf(!HELPER_PRESENT)("mac/helper one-shots", () => {
     expect(["granted", "denied", "not_determined"]).toContain(result.screen_recording);
     // notifications carries a four-state enum starting in v0.9.0.
     expect(["granted", "denied", "not_determined", "provisional"]).toContain(result.notifications);
+    // accessibility is a two-state enum starting in v0.9.11
+    // (AXIsProcessTrustedWithOptions has no "not_determined" state).
+    // The TS schema marks the field `.optional()` for back-compat
+    // with helper binaries from earlier versions during the upgrade
+    // window, but in this test we just compiled the helper from
+    // source so the field MUST be present.
+    expect(result.accessibility).toBeDefined();
+    expect(["granted", "denied"]).toContain(result.accessibility ?? "");
     // automation should contain entries for the seven well-known browsers.
     const expectedBrowsers = [
       "com.apple.Safari",

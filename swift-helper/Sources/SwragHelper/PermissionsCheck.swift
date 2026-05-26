@@ -1,4 +1,5 @@
 import AppKit
+import ApplicationServices
 import AVFoundation
 import CoreGraphics
 import Foundation
@@ -33,12 +34,14 @@ struct PermissionsPayload: Codable {
   let screenRecording: String
   let automation: [String: String]
   let notifications: String
+  let accessibility: String
 
   enum CodingKeys: String, CodingKey {
     case microphone
     case screenRecording = "screen_recording"
     case automation
     case notifications
+    case accessibility
   }
 }
 
@@ -51,11 +54,21 @@ func runPermissionsCheck(prompt: Bool) {
   // bundle the probe is meaningful. `--prompt` fires the system
   // dialog (one-time per .app identity, persisted via TCC).
   let notif = prompt ? promptNotificationAuthorization() : probeNotificationAuthorization()
+  // Accessibility (v0.9.11): required for the menubar's opt-in
+  // `record_stop` global hotkey. Without this grant
+  // `addGlobalMonitorForEvents` silently never fires. Probed via
+  // `AXIsProcessTrustedWithOptions` which is a synchronous API —
+  // when `--prompt` is set we hand it `kAXTrustedCheckOptionPrompt`
+  // so the system pops the standard "X would like to control your
+  // computer" dialog the first time; on subsequent invocations the
+  // value is cached and the dialog doesn't re-fire.
+  let access = checkAccessibility(prompt: prompt)
   let payload = PermissionsPayload(
     microphone: mic,
     screenRecording: scr,
     automation: automation,
-    notifications: notif
+    notifications: notif,
+    accessibility: access
   )
   printJSON(payload)
   exit(0)
@@ -101,6 +114,40 @@ private func checkScreenRecording(prompt: Bool) -> String {
     return after ? "granted" : (triggered ? "not_determined" : "denied")
   }
   return "not_determined"
+}
+
+// MARK: - Accessibility (v0.9.11)
+
+/// Probe — and optionally trigger the system grant prompt for —
+/// macOS Accessibility permission. Required for the menubar's opt-in
+/// stop-recording global hotkey: `NSEvent.addGlobalMonitorForEvents`
+/// silently never invokes its handler if the calling process isn't
+/// listed as trusted under System Settings → Privacy & Security →
+/// Accessibility.
+///
+/// Returns one of `granted` / `denied`. We don't surface
+/// `not_determined` because the underlying
+/// `AXIsProcessTrustedWithOptions` doesn't expose a "first-launch"
+/// state — it returns false until the user explicitly toggles the
+/// app on, then returns true forever. Mapping false → "denied" is
+/// honest about the user-facing reality even on a fresh install
+/// (the hotkey won't fire until the toggle is on).
+///
+/// With `prompt=true` we set `kAXTrustedCheckOptionPrompt` so the
+/// first call surfaces the system dialog directing the user to the
+/// right Settings pane. The dialog itself is non-blocking — the
+/// function still returns the *current* trusted state before the
+/// user has had a chance to act — so callers should expect "denied"
+/// even from the prompting path on the very first run. The user
+/// re-runs `swrag meeting permissions-check` after granting to
+/// confirm.
+private func checkAccessibility(prompt: Bool) -> String {
+  // String-key form of `kAXTrustedCheckOptionPrompt` so we don't have
+  // to bridge a `CFString` through Swift's NSDictionary surface; the
+  // ApplicationServices header documents both forms as equivalent.
+  let key = "AXTrustedCheckOptionPrompt" as CFString
+  let opts: CFDictionary = [key: prompt] as CFDictionary
+  return AXIsProcessTrustedWithOptions(opts) ? "granted" : "denied"
 }
 
 // MARK: - Apple Events / Automation per browser
