@@ -128,6 +128,45 @@ Each step is independently invokable too (`swrag index`,
 --prompt`, `swrag install-skill`, `swrag doctor`) if you'd rather
 pick and choose.
 
+### Enabling system audio recording (one-time setup)
+
+By default, swrag records your mic only. System audio capture (the
+other party's voice in calls, audio from any other app) requires
+ScreenCaptureKit, which Apple restricts to signed binaries. Since
+swrag is distributed unsigned (we don't have a paid Apple Developer
+ID), each user re-signs the helper locally with their own free Apple
+ID certificate.
+
+**Time required**: ~5 minutes (plus a 12 GB Xcode download if you
+don't have it).
+**Cost**: $0.
+
+1. Install Xcode (free, Mac App Store).
+2. Open Xcode → Settings → Accounts → `+` → Apple ID. Sign in with any
+   free Apple ID.
+3. Xcode auto-provisions a "Personal Team" with an "Apple Development"
+   certificate.
+4. Run `swrag setup-signing`. It finds your cert and re-signs the
+   helper.
+5. Grant Screen Recording in System Settings → Privacy & Security →
+   Screen Recording (the command prints the exact path to drag in).
+6. Verify: `swrag meeting permissions-check` should show
+   `screen_recording: "granted"`.
+
+This survives all future `brew upgrade` cycles because TCC tracks
+your stable Team ID, not the per-build cdhash.
+
+> **Why this dance is needed**: see the [Tahoe TCC + ad-hoc signing
+> issue](https://github.com/CapSoftware/Cap/issues/1722). Apple
+> tightened Screen Recording attribution in macOS Sequoia/Tahoe;
+> ad-hoc-signed binaries are silently rejected regardless of System
+> Settings toggles. The free Apple Development cert is the cheapest
+> workaround.
+
+`swrag bootstrap` asks you about this on first run. To skip the
+prompt (CI, scripted installs): set `SWRAG_SKIP_SIGNING_PROMPT=1`
+before running `swrag bootstrap`.
+
 ### About the meeting watcher
 
 `swrag bootstrap` installs the meeting watcher: two `KeepAlive`
@@ -232,7 +271,8 @@ swrag doctor
 
 Reports the health of every piece swrag depends on: extension-capable
 sqlite3 + vec extension + Ollama + archive + data version + chunk
-coverage + meeting watcher (launchd) + macOS permissions.
+coverage + meeting watcher (launchd) + macOS permissions + helper
+signature (ad-hoc vs your Apple Development cert).
 
 ## Configuration
 
@@ -249,6 +289,8 @@ All have sensible defaults; you shouldn't need to set any of them.
 | `SWRAG_VERBOSE`      | Truthy → verbose stderr logs                                                         |
 | `SWRAG_SKIP_EMBED`   | Truthy → text-only ingest, skip the embed pass                                       |
 | `SWRAG_SQLITE_DYLIB` | Custom path to `libsqlite3.dylib`                                                    |
+| `SWRAG_SKIP_SIGNING_PROMPT` | Truthy → skip the one-time signing prompt during `swrag bootstrap` (for CI / scripted installs). Re-run `swrag setup-signing` later by hand. |
+| `SWRAG_SIGN_IDENTITY` | (Build-time) identity passed to `codesign --sign` when building the Swift helper bundle. Defaults to `-` (ad-hoc). Power users can set this to a SHA-1 hex from `security find-identity -v -p codesigning` to bake a non-ad-hoc signature into the release artefact. |
 
 ## Commands
 
@@ -256,7 +298,8 @@ All have sensible defaults; you shouldn't need to set any of them.
 | -------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
 | `swrag sql [SQL]`                                  | Run SQL via sqlite3 (default: list mode). Omit SQL to open the REPL. Pass `-` to read from stdin. |
 | `swrag index`                                      | Ingest changes from Super Whisper now.                                                            |
-| `swrag bootstrap`                                  | One-shot post-install: start ollama, pull `bge-m3`, warm permissions, install the meeting watcher, index, install the agent skill, verify. Safe to re-run. |
+| `swrag bootstrap`                                  | One-shot post-install: start ollama, pull `bge-m3`, warm permissions, install the meeting watcher, prompt to set up signing (v0.9.12+), index, install the agent skill, verify. Safe to re-run. |
+| `swrag setup-signing`                              | Re-sign the bundled helper with your own free Apple Development cert so system audio recording works on macOS Sequoia/Tahoe. See "Enabling system audio recording". |
 | `swrag doctor`                                     | Verify the environment.                                                                           |
 | `swrag path [archive\|sqlite3\|vec0]`              | Print a filesystem path. Default: `archive`.                                                      |
 | `swrag embed "TEXT"`                               | Print the embedding of `TEXT` as a SQLite blob literal (`x'…'`), for shell composition.           |

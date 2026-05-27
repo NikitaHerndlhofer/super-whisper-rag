@@ -76,15 +76,36 @@ chmod +x "$APP_DIR/Contents/MacOS/swrag-helper"
 
 cp "$PKG_DIR/Resources/Info.plist" "$APP_DIR/Contents/Info.plist"
 
-# Ad-hoc sign. `--force` lets us re-sign over the existing identity
-# every build (the bundle is fresh, but defensive); `--deep` walks
-# nested executables — we only have one, but future-proofs against
-# adding helper sub-binaries. `--sign -` is the magic ad-hoc identity:
-# no Developer ID required, but produces a stable signature checksum
-# tied to the binary contents + Info.plist that TCC uses to identify
-# the bundle across upgrades.
-echo "[swift-helper] codesign --sign - $APP_DIR"
-codesign --force --deep --sign - "$APP_DIR"
+# Sign the bundle.
+#
+# Default identity is `-` (ad-hoc). `--force` lets us re-sign over
+# the existing identity every build (the bundle is fresh, but
+# defensive); `--deep` walks nested executables — we only have one,
+# but future-proofs against adding helper sub-binaries.
+#
+# Ad-hoc sign produces a stable signature checksum tied to the
+# binary contents + Info.plist that TCC uses to identify the
+# bundle across upgrades. The resulting binary works for mic-only
+# capture out of the box; system audio capture on macOS Sequoia/
+# Tahoe additionally requires a non-ad-hoc signature (see
+# src/commands/setup-signing.ts and the README's "Enabling system
+# audio recording" section). Users opt into that locally via
+# `swrag setup-signing`; CI / power-users can pre-sign the bundle
+# at build time by exporting SWRAG_SIGN_IDENTITY (any string
+# `codesign --sign` accepts — typically a SHA-1 hex from
+# `security find-identity -v -p codesigning`).
+#
+# When SWRAG_SIGN_IDENTITY is set we also pass `--options runtime`
+# to enable the hardened runtime, which TCC on Tahoe needs for
+# Screen Recording attribution to land correctly.
+SIGN_IDENTITY="${SWRAG_SIGN_IDENTITY:--}"
+if [[ "$SIGN_IDENTITY" == "-" ]]; then
+  echo "[swift-helper] codesign --sign - (ad-hoc) $APP_DIR"
+  codesign --force --deep --sign - "$APP_DIR"
+else
+  echo "[swift-helper] codesign --sign $SIGN_IDENTITY --options runtime $APP_DIR"
+  codesign --force --deep --sign "$SIGN_IDENTITY" --options runtime "$APP_DIR"
+fi
 codesign --verify --deep --strict "$APP_DIR" 2>/dev/null || {
   echo "[swift-helper] error: codesign verification failed" >&2
   exit 1

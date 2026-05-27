@@ -57,6 +57,11 @@ import { getPermissions, type Permissions } from "../mac/helper.ts";
 import { enableWatcher, type EnableWatcherResult } from "./enable-watcher.ts";
 import { runDoctor } from "./doctor.ts";
 import { installSkill } from "./install-skill.ts";
+import {
+  currentHelperSignatureSummary,
+  runSetupSigning,
+  type SetupSigningResult,
+} from "./setup-signing.ts";
 
 const SERVICE_START_WAIT_MS = 8_000;
 const SERVICE_START_POLL_INTERVAL_MS = 500;
@@ -93,6 +98,23 @@ export interface BootstrapOptions {
   /** Override the agent skill installer for tests. */
   installAgentSkill?: () => Promise<void>;
   /**
+   * Override the signing-prompt step for tests. Defaults to the
+   * stdin-driven prompt described in the field doc on `skipSigning`.
+   */
+  promptForSigning?: () => Promise<boolean>;
+  /**
+   * Override the setup-signing run for tests. Defaults to invoking
+   * `runSetupSigning` with the current archive.
+   */
+  runSetupSigning?: () => Promise<SetupSigningResult>;
+  /**
+   * Override the signature-state probe for tests. Returns the same
+   * human-readable summary that `currentHelperSignatureSummary()`
+   * would (`"ad-hoc"` / `"Apple Development: …"` / null when the
+   * helper isn't materialised yet).
+   */
+  signatureSummary?: () => string | null;
+  /**
    * Skip the macOS permission warm-up. Useful in CI where dialogs
    * aren't possible.
    */
@@ -105,6 +127,15 @@ export interface BootstrapOptions {
   skipWatcher?: boolean;
   /** Skip the agent skill install. */
   skipSkill?: boolean;
+  /**
+   * Skip the signing-prompt step entirely. Bootstrap-time signing
+   * has a UX side effect (`stdin` read for [y/N]) that we don't
+   * want during non-interactive installs or test runs.
+   * Also forced off when SWRAG_SKIP_SIGNING_PROMPT=1 in the
+   * environment — that knob exists so CI / Homebrew automations can
+   * suppress the prompt without changing the calling code.
+   */
+  skipSigning?: boolean;
 }
 
 export interface BootstrapResult {
@@ -115,6 +146,8 @@ export interface BootstrapResult {
   installedWatcher: boolean;
   ingested: boolean;
   installedSkill: boolean;
+  /** True iff `setup-signing` ran (and exit-0'd). */
+  ranSetupSigning: boolean;
   doctorOutput: string;
 }
 
@@ -128,6 +161,7 @@ export async function runBootstrap(opts: BootstrapOptions): Promise<BootstrapRes
   let installedWatcher = false;
   let ingested = false;
   let installedSkill = false;
+  let ranSetupSigning = false;
 
   const reachable = opts.isOllamaReachable ?? (() => isOllamaReachable(host));
   const startOllama = opts.startOllama ?? (() => brewServicesStartOllama());
@@ -159,6 +193,10 @@ export async function runBootstrap(opts: BootstrapOptions): Promise<BootstrapRes
     (async () => {
       await installSkill(opts.archive);
     });
+  const signatureSummaryFn = opts.signatureSummary ?? currentHelperSignatureSummary;
+  const promptSigningFn = opts.promptForSigning ?? defaultPromptForSigning;
+  const runSetupSigningFn =
+    opts.runSetupSigning ?? (() => runSetupSigning({ archive: opts.archive }));
 
   // 1. Ollama service
   info(`bootstrap: checking ollama at ${host}`);
@@ -236,12 +274,68 @@ export async function runBootstrap(opts: BootstrapOptions): Promise<BootstrapRes
     }
   }
 
-  // 5. Archive ingest
+  // 5. Signing prompt — v0.9.12+. Asks the user whether they want to
+  //    re-sign the helper bundle with their own free Apple Development
+  //    cert, which is the only way to make ScreenCaptureKit attribution
+  //    land reliably on macOS Sequoia/Tahoe. Default is "no" so
+  //    mic-only users (who never need Screen Recording) don't pay the
+  //    Xcode dependency.
+  //
+  //    Skipped when:
+  //      - opts.skipSigning was passed (tests, non-interactive)
+  //      - SWRAG_SKIP_SIGNING_PROMPT=1 in the environment (CI, scripted
+  //        installs)
+  //      - the helper bundle is already non-ad-hoc-signed (idempotent
+  //        re-runs don't re-ask)
+  if (opts.skipSigning || process.env.SWRAG_SKIP_SIGNING_PROMPT === "1") {
+    verbose("bootstrap: skipping signing prompt (opts.skipSigning or SWRAG_SKIP_SIGNING_PROMPT)");
+  } else {
+    const summary = signatureSummaryFn();
+    if (summary != null && summary !== "ad-hoc") {
+      verbose(`bootstrap: helper already signed with ${summary}; skipping signing prompt`);
+    } else {
+      info(
+        "bootstrap: helper is ad-hoc-signed. System audio recording on macOS Sequoia/Tahoe " +
+          "requires re-signing with your own free Apple Development cert (mic-only works without it).",
+      );
+      let answer = false;
+      try {
+        answer = await promptSigningFn();
+      } catch (e) {
+        warn(
+          `bootstrap: signing prompt failed (${e instanceof Error ? e.message : String(e)}); ` +
+            "skipping. Re-run with `swrag setup-signing` later.",
+        );
+      }
+      if (answer) {
+        try {
+          const r = await runSetupSigningFn();
+          if (r.exitCode === 0 && r.outcome === "signed") {
+            ranSetupSigning = true;
+          } else {
+            info(
+              `bootstrap: setup-signing exited ${r.exitCode} (outcome=${r.outcome}). ` +
+                "Re-run `swrag setup-signing` after the prerequisites are in place.",
+            );
+          }
+        } catch (e) {
+          warn(
+            `bootstrap: setup-signing threw (${e instanceof Error ? e.message : String(e)}); ` +
+              "continuing — re-run `swrag setup-signing` manually.",
+          );
+        }
+      } else {
+        info("bootstrap: skipped signing setup — run `swrag setup-signing` later if you want system-audio recording.");
+      }
+    }
+  }
+
+  // 6. Archive ingest
   info("bootstrap: indexing the archive (sub-ms fast-path if Super Whisper hasn't changed)");
   await ingestFn();
   ingested = true;
 
-  // 6. Agent skill
+  // 7. Agent skill
   if (opts.skipSkill) {
     verbose("bootstrap: skipping agent skill install (--skip-skill)");
   } else {
@@ -250,7 +344,7 @@ export async function runBootstrap(opts: BootstrapOptions): Promise<BootstrapRes
     installedSkill = true;
   }
 
-  // 7. Doctor — final verify
+  // 8. Doctor — final verify
   const doctor =
     opts.doctor ??
     (() =>
@@ -269,6 +363,7 @@ export async function runBootstrap(opts: BootstrapOptions): Promise<BootstrapRes
   summary.push(pulledModel ? `pulled ${model}` : `${model} already pulled`);
   summary.push(warmedPermissions ? "warmed permissions" : "permissions skipped");
   summary.push(installedWatcher ? "meeting watcher enabled" : "watcher skipped");
+  summary.push(ranSetupSigning ? "helper signed with user cert" : "helper signing skipped");
   summary.push(ingested ? "archive indexed" : "archive skipped");
   summary.push(installedSkill ? "agent skill installed" : "skill skipped");
   info(`bootstrap done: ${summary.join("; ")}`);
@@ -281,8 +376,69 @@ export async function runBootstrap(opts: BootstrapOptions): Promise<BootstrapRes
     installedWatcher,
     ingested,
     installedSkill,
+    ranSetupSigning,
     doctorOutput: r.output,
   };
+}
+
+/**
+ * Default interactive prompt for the bootstrap-time signing flow.
+ *
+ * - Writes the question to stderr (so it survives stdout-redirected
+ *   invocations).
+ * - Reads one line from stdin. Yes-ish answers ("y", "Y", "yes") →
+ *   true; everything else (including EOF / empty) → false.
+ *
+ * We deliberately don't pull in a heavyweight prompt library; this
+ * is a single y/N gate on the happy path. Non-TTY stdin (CI,
+ * Homebrew background install) reads EOF instantly and returns
+ * false, which is the safer default.
+ */
+async function defaultPromptForSigning(): Promise<boolean> {
+  process.stderr.write(
+    "\nSystem audio recording requires re-signing the helper with your own Apple ID\n" +
+      "(free, but requires Xcode). Mic-only recording works without setup.\n" +
+      "\n" +
+      "Set up signing now? [y/N]: ",
+  );
+  const answer = await readOneStdinLine();
+  return /^y(es)?$/i.test(answer.trim());
+}
+
+function readOneStdinLine(): Promise<string> {
+  return new Promise<string>((resolve) => {
+    let buf = "";
+    const onData = (chunk: Buffer | string): void => {
+      buf += chunk.toString("utf8");
+      const nl = buf.indexOf("\n");
+      if (nl !== -1) {
+        cleanup();
+        resolve(buf.slice(0, nl));
+      }
+    };
+    const onEnd = (): void => {
+      cleanup();
+      resolve(buf);
+    };
+    const cleanup = (): void => {
+      process.stdin.off("data", onData);
+      process.stdin.off("end", onEnd);
+      try {
+        process.stdin.pause();
+      } catch {
+        // best-effort
+      }
+    };
+    try {
+      process.stdin.resume();
+      process.stdin.on("data", onData);
+      process.stdin.on("end", onEnd);
+    } catch {
+      // stdin isn't readable (e.g. detached) — treat as "no".
+      cleanup();
+      resolve("");
+    }
+  });
 }
 
 /**

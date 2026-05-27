@@ -10,6 +10,7 @@ import {
   MEETING_WATCH_PLIST_LABEL,
 } from "../launchd/plist.ts";
 import { getPermissions, type Permissions } from "../mac/helper.ts";
+import { currentHelperSignatureSummary } from "./setup-signing.ts";
 import { run } from "../spawn.ts";
 import { findSqlite3Binary } from "../sqlite3.ts";
 
@@ -24,6 +25,13 @@ export interface DoctorOptions {
   listLaunchAgents?: () => Promise<{ watch: boolean; menubar: boolean }>;
   /** Override the permissions probe for tests. */
   checkPermissions?: () => Promise<Permissions | null>;
+  /**
+   * Override the helper-signature probe for tests. Returns the same
+   * human-readable summary that `currentHelperSignatureSummary()`
+   * would (`"ad-hoc"` / `"Apple Development: <name> (Team …)"` /
+   * null when the bundle hasn't been materialised yet).
+   */
+  checkHelperSignature?: () => string | null;
 }
 
 interface Check {
@@ -146,6 +154,16 @@ export async function runDoctor(opts: DoctorOptions): Promise<{
   const perms = await checkPerms();
   checks.push(buildPermissionsCheck(perms));
 
+  // 7. Helper signature state (v0.9.12+)
+  //
+  //    A non-ad-hoc signature is a precondition for Screen Recording
+  //    attribution on macOS Sequoia/Tahoe (see setup-signing.ts and
+  //    the README's "Enabling system audio recording" section). We
+  //    report the current state without failing on ad-hoc — mic-only
+  //    is a legitimate, well-supported mode.
+  const checkSig = opts.checkHelperSignature ?? currentHelperSignatureSummary;
+  checks.push(buildHelperSignatureCheck(safeCheckSignature(checkSig)));
+
   const ok = checks.every((c) => c.ok);
   const lines: string[] = [];
   for (const c of checks) {
@@ -187,6 +205,50 @@ async function defaultCheckPermissions(): Promise<Permissions | null> {
     // is informational; we surface the error in the detail.
     return null;
   }
+}
+
+function safeCheckSignature(fn: () => string | null): string | null {
+  try {
+    return fn();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Translate a helper-signature summary string into a doctor `Check`.
+ *
+ *   - `null`              → bundle not on disk yet (first-launch / dev).
+ *   - `"ad-hoc"`          → reportable but NOT a failure. The README
+ *                            advertises mic-only as the default mode.
+ *   - `"Apple Development: <name> (Team …)"` → ok.
+ *
+ * The "system audio recording unavailable" line is verbatim from
+ * the spec so users searching for the hint can find docs ↔ doctor.
+ */
+function buildHelperSignatureCheck(summary: string | null): Check {
+  const name = "helper signature";
+  if (summary == null) {
+    return {
+      name,
+      ok: true,
+      detail:
+        "helper bundle not yet materialised on disk (will be on next CLI invocation)",
+    };
+  }
+  if (summary === "ad-hoc") {
+    return {
+      name,
+      ok: true,
+      detail:
+        "helper signed by: ad-hoc (system audio recording unavailable — run `swrag setup-signing`)",
+    };
+  }
+  return {
+    name,
+    ok: true,
+    detail: `helper signed by: ${summary}`,
+  };
 }
 
 const PERM_LABELS = {

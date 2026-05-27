@@ -1,6 +1,6 @@
 {
   "name": "superwhisper-rag",
-  "version": "0.9.11",
+  "version": "0.9.12",
   "description": "Local SQL archive for Super Whisper dictation history with full-text + semantic search.",
   "type": "module",
   "private": true,

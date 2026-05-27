@@ -13,6 +13,7 @@ import { disableWatcher, enableWatcher } from "./commands/enable-watcher.ts";
 import { runIndex } from "./commands/index.ts";
 import { installSkill } from "./commands/install-skill.ts";
 import { getPath, PathTargetSchema } from "./commands/path.ts";
+import { runSetupSigning } from "./commands/setup-signing.ts";
 import { runSql, readSqlInput } from "./commands/sql.ts";
 import { getConfig, openArchive, setConfig } from "./archive/open.ts";
 import { MeetingDetector } from "./meeting/detect.ts";
@@ -243,6 +244,23 @@ const bootstrapCmd = defineCommand({
   args: {},
   async run() {
     const r = await runBootstrap(ctx().paths);
+    process.exit(r.exitCode);
+  },
+});
+
+/* -------------------------------------------------------------------------- */
+/* setup-signing — re-sign the helper bundle with a user Apple cert           */
+/* -------------------------------------------------------------------------- */
+
+const setupSigningCmd = defineCommand({
+  meta: {
+    name: "setup-signing",
+    description:
+      "Re-sign the bundled Swift helper with your own free Apple Development certificate so Screen Recording (and system-audio capture) works reliably on macOS Sequoia/Tahoe. Run after installing Xcode + signing in with your Apple ID.",
+  },
+  args: {},
+  async run() {
+    const r = await runSetupSigning({ archive: ctx().paths.archive });
     process.exit(r.exitCode);
   },
 });
@@ -1450,6 +1468,7 @@ const main = defineCommand({
     index: indexCmd,
     doctor: doctorCmd,
     bootstrap: bootstrapCmd,
+    "setup-signing": setupSigningCmd,
     path: pathCmd,
     embed: embedCmd,
     "install-skill": installSkillCmd,

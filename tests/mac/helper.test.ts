@@ -6,13 +6,25 @@
  * toolchain. Local devs should run `bash scripts/build-swift-helper.sh`
  * once to materialise the binary.
  */
-import { describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+} from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  applyConfiguredSigning,
+  CONFIG_SIGNING_IDENTITY,
   FrontmostAppSchema,
+  getHelperCacheDir,
   MicInUseSchema,
+  parseSignatureOutput,
   PermissionsSchema,
   RecorderHeartbeatSchema,
   fireStartRecordingNotification,
@@ -22,6 +34,7 @@ import {
   isMicInUse,
   spawnRecorder,
 } from "../../src/mac/helper.ts";
+import { openArchive, setConfig } from "../../src/archive/open.ts";
 
 // v0.9.0+: helper ships as a code-signed .app bundle. Tests spawn
 // the inner binary directly — Foundation still resolves the bundle
@@ -599,6 +612,293 @@ describe("fireStopRecordingNotification (stubbed exec)", () => {
     expect(captured[titleIdx + 1]).toBe("Meeting ended");
   });
 });
+
+/* -------------------------------------------------------------------------- */
+/* v0.9.12 — helper cache path + applyConfiguredSigning + parseSignatureOutput*/
+/* -------------------------------------------------------------------------- */
+
+describe("getHelperCacheDir (v0.9.12)", () => {
+  test("resolves under ~/Library/Application Support/superwhisper-rag/helper", () => {
+    const cache = getHelperCacheDir();
+    // The cache lives next to the SQLite archive (`swrag.sqlite`)
+    // inside Application Support so a single rm -rf wipes both.
+    const expectedPrefix = join(
+      homedir(),
+      "Library",
+      "Application Support",
+      "superwhisper-rag",
+    );
+    expect(cache.startsWith(expectedPrefix)).toBe(true);
+    expect(cache.endsWith("/helper")).toBe(true);
+    // CRITICAL: not under /var/folders (the TCC-hostile $TMPDIR).
+    // This is the regression v0.9.12 fixes.
+    expect(cache.includes("/var/folders/")).toBe(false);
+    expect(cache.startsWith("/tmp")).toBe(false);
+  });
+});
+
+describe("parseSignatureOutput (v0.9.12)", () => {
+  test("ad-hoc bundle: detects Signature=adhoc, no authority/team", () => {
+    const raw = [
+      "Executable=/path/to/swrag-helper.app/Contents/MacOS/swrag-helper",
+      "Identifier=ai.swrag.helper",
+      "Format=app bundle with Mach-O universal (x86_64 arm64)",
+      "CodeDirectory v=20400 size=1640 flags=0x2(adhoc) hashes=45+3 location=embedded",
+      "Signature=adhoc",
+      "Info.plist entries=12",
+      "TeamIdentifier=not set",
+      "Sealed Resources version=2 rules=13 files=0",
+      "Internal requirements count=0 size=12",
+    ].join("\n");
+    const info = parseSignatureOutput(raw);
+    expect(info.signed).toBe(true);
+    expect(info.adhoc).toBe(true);
+    expect(info.authority).toBeNull();
+    expect(info.teamIdentifier).toBeNull();
+  });
+
+  test("Apple Development signed: detects Authority + Team", () => {
+    const raw = [
+      "Executable=/path/to/swrag-helper.app/Contents/MacOS/swrag-helper",
+      "Identifier=ai.swrag.helper",
+      "Format=app bundle with Mach-O universal (x86_64 arm64)",
+      "CodeDirectory v=20500 size=1640 flags=0x10000(runtime) hashes=45+3 location=embedded",
+      "Authority=Apple Development: Jane Dev (TEAMID12AB)",
+      "Authority=Apple Worldwide Developer Relations Certification Authority",
+      "Authority=Apple Root CA",
+      "Signed Time=Jan 1, 2026 at 10:00:00 AM",
+      "TeamIdentifier=TEAMID12AB",
+      "Signature=signed",
+    ].join("\n");
+    const info = parseSignatureOutput(raw);
+    expect(info.signed).toBe(true);
+    expect(info.adhoc).toBe(false);
+    expect(info.authority).toBe("Apple Development: Jane Dev (TEAMID12AB)");
+    expect(info.teamIdentifier).toBe("TEAMID12AB");
+  });
+
+  test("TeamIdentifier=not set is normalised to null", () => {
+    const raw = [
+      "Signature=signed",
+      "Authority=Some Authority",
+      "TeamIdentifier=not set",
+    ].join("\n");
+    const info = parseSignatureOutput(raw);
+    expect(info.teamIdentifier).toBeNull();
+  });
+});
+
+describe("applyConfiguredSigning (v0.9.12)", () => {
+  let workDir: string;
+  let archive: string;
+  let appPath: string;
+  let cacheDir: string;
+
+  beforeEach(() => {
+    workDir = mkdtempSync(join(tmpdir(), "swrag-applyconfsign-"));
+    archive = join(workDir, "archive.sqlite");
+    cacheDir = join(workDir, "helper-cache");
+    mkdirSync(cacheDir, { recursive: true });
+    appPath = join(cacheDir, "swrag-helper.app");
+    mkdirSync(appPath, { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(workDir, { recursive: true, force: true });
+  });
+
+  function withSigningIdentity(value: string): void {
+    const db = openArchive(archive, {});
+    try {
+      setConfig(db, CONFIG_SIGNING_IDENTITY, value);
+    } finally {
+      db.close();
+    }
+  }
+
+  test("no archive → no-op (returns silently, no codesign call)", () => {
+    let codesignCalls = 0;
+    applyConfiguredSigning(appPath, {
+      archive: null,
+      codesign: () => {
+        codesignCalls++;
+        return { ok: true, message: "" };
+      },
+    });
+    expect(codesignCalls).toBe(0);
+    // No marker file written.
+    expect(existsSync(join(cacheDir, ".signed-with-bbf7d6f81e6e8d2f"))).toBe(false);
+  });
+
+  test("archive without signing_identity → no-op", () => {
+    // Open + close to create an empty archive (no signing_identity row).
+    openArchive(archive, {}).close();
+    let codesignCalls = 0;
+    applyConfiguredSigning(appPath, {
+      archive,
+      codesign: () => {
+        codesignCalls++;
+        return { ok: true, message: "" };
+      },
+    });
+    expect(codesignCalls).toBe(0);
+  });
+
+  test("signing_identity set, no marker → codesign is called and marker is written", () => {
+    withSigningIdentity("DEADBEEFCAFEBABE0123456789ABCDEF01234567");
+    const captured: { app: string; identity: string }[] = [];
+    applyConfiguredSigning(appPath, {
+      archive,
+      codesign: (app, identity) => {
+        captured.push({ app, identity });
+        return { ok: true, message: "" };
+      },
+    });
+    expect(captured).toHaveLength(1);
+    expect(captured[0]?.app).toBe(appPath);
+    expect(captured[0]?.identity).toBe(
+      "DEADBEEFCAFEBABE0123456789ABCDEF01234567",
+    );
+    // Marker landed.
+    const markers = readdirSafe(cacheDir).filter((n) =>
+      n.startsWith(".signed-with-"),
+    );
+    expect(markers).toHaveLength(1);
+  });
+
+  test("idempotent: with marker present + signature is non-adhoc, codesign is NOT called", () => {
+    withSigningIdentity("IDHASH1");
+    // First call sets up the marker.
+    let firstCalls = 0;
+    applyConfiguredSigning(appPath, {
+      archive,
+      codesign: () => {
+        firstCalls++;
+        return { ok: true, message: "" };
+      },
+      signatureInfo: () => ({
+        signed: true,
+        adhoc: false,
+        authority: "Apple Development: …",
+        teamIdentifier: "TEAMID",
+        raw: "",
+      }),
+    });
+    expect(firstCalls).toBe(1);
+    // Second call: marker exists and signature is non-adhoc, so no
+    // re-sign happens.
+    let secondCalls = 0;
+    applyConfiguredSigning(appPath, {
+      archive,
+      codesign: () => {
+        secondCalls++;
+        return { ok: true, message: "" };
+      },
+      signatureInfo: () => ({
+        signed: true,
+        adhoc: false,
+        authority: "Apple Development: …",
+        teamIdentifier: "TEAMID",
+        raw: "",
+      }),
+    });
+    expect(secondCalls).toBe(0);
+  });
+
+  test("stale marker (bundle reverted to ad-hoc) triggers a re-sign", () => {
+    withSigningIdentity("IDHASH2");
+    applyConfiguredSigning(appPath, {
+      archive,
+      codesign: () => ({ ok: true, message: "" }),
+      signatureInfo: () => ({
+        signed: true,
+        adhoc: false,
+        authority: "Apple Development: …",
+        teamIdentifier: "TEAMID",
+        raw: "",
+      }),
+    });
+    // Now the bundle is somehow back to ad-hoc (e.g. re-extracted by
+    // `materialiseHelper` after a `brew upgrade` mid-call). The next
+    // applyConfiguredSigning should re-run codesign.
+    let calls = 0;
+    applyConfiguredSigning(appPath, {
+      archive,
+      codesign: () => {
+        calls++;
+        return { ok: true, message: "" };
+      },
+      signatureInfo: () => ({
+        signed: true,
+        adhoc: true,
+        authority: null,
+        teamIdentifier: null,
+        raw: "Signature=adhoc",
+      }),
+    });
+    expect(calls).toBe(1);
+  });
+
+  test("codesign failure logs warn and does NOT write the marker", () => {
+    withSigningIdentity("FAILHASH");
+    applyConfiguredSigning(appPath, {
+      archive,
+      codesign: () => ({ ok: false, message: "errSecInternalComponent" }),
+    });
+    const markers = readdirSafe(cacheDir).filter((n) =>
+      n.startsWith(".signed-with-"),
+    );
+    expect(markers).toEqual([]);
+  });
+
+  test("switching identities clears the old marker", () => {
+    withSigningIdentity("IDOLD");
+    applyConfiguredSigning(appPath, {
+      archive,
+      codesign: () => ({ ok: true, message: "" }),
+      signatureInfo: () => ({
+        signed: true,
+        adhoc: false,
+        authority: "old",
+        teamIdentifier: null,
+        raw: "",
+      }),
+    });
+    const beforeMarkers = readdirSafe(cacheDir).filter((n) =>
+      n.startsWith(".signed-with-"),
+    );
+    expect(beforeMarkers).toHaveLength(1);
+    const oldMarker = beforeMarkers[0];
+
+    // Rotate to a different identity.
+    withSigningIdentity("IDNEW");
+    applyConfiguredSigning(appPath, {
+      archive,
+      codesign: () => ({ ok: true, message: "" }),
+      signatureInfo: () => ({
+        signed: true,
+        adhoc: false,
+        authority: "new",
+        teamIdentifier: null,
+        raw: "",
+      }),
+    });
+    const afterMarkers = readdirSafe(cacheDir).filter((n) =>
+      n.startsWith(".signed-with-"),
+    );
+    expect(afterMarkers).toHaveLength(1);
+    // The new marker has a different name than the old one.
+    expect(afterMarkers[0]).not.toBe(oldMarker);
+  });
+});
+
+function readdirSafe(dir: string): string[] {
+  try {
+    return readdirSync(dir);
+  } catch {
+    return [];
+  }
+}
 
 /**
  * Helper: pull the first heartbeat off the iterator within a hard

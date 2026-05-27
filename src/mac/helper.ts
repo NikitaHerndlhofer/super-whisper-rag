@@ -34,14 +34,17 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  readdirSync,
   renameSync,
   rmSync,
   statSync,
   writeFileSync,
 } from "node:fs";
 import { unlink } from "node:fs/promises";
-import { tmpdir, userInfo } from "node:os";
+import { createHash } from "node:crypto";
+import { homedir, tmpdir, userInfo } from "node:os";
 import { dirname, join } from "node:path";
+import { Database } from "bun:sqlite";
 import { z } from "zod";
 import { verbose, warn } from "../log.ts";
 import embeddedHelperTar from "../../vendor/swrag-helper.app.tar" with { type: "file" };
@@ -283,6 +286,39 @@ interface MaterialisedHelper {
   app: string;
 }
 
+/**
+ * Persistent cache directory for the materialised helper `.app`.
+ *
+ * v0.9.12 moved this OUT of `$TMPDIR/swrag-helper-<uid>-<user>/`. The
+ * Tahoe-era TCC is suspicious of executables that live under
+ * `/var/folders/.../T/` (the OS's volatile per-user tmp dir, which the
+ * kernel can sweep at any moment and which third-party "tmp cleaner"
+ * apps regularly target). Concretely:
+ *
+ *   - `CGPreflightScreenCaptureAccess` returns false for an ad-hoc-
+ *     signed `.app` under $TMPDIR even when the user has toggled
+ *     Screen Recording ON for the bundle — confirmed via web search of
+ *     the CapSoftware/Cap repo issue thread.
+ *   - The launchd plists embed an absolute path to the swrag CLI, but
+ *     the helper's path is resolved at runtime via this materialiser.
+ *     A path under $TMPDIR also makes the per-user-cache-encoded suffix
+ *     less stable across `brew upgrade` than we'd like.
+ *
+ * Stable home: `~/Library/Application Support/superwhisper-rag/helper/`.
+ * Same parent directory as the SQLite archive (`swrag.sqlite`), so a
+ * `rm -rf ~/Library/Application Support/superwhisper-rag` blow-away
+ * still cleans up everything in one go.
+ */
+function helperCacheDir(): string {
+  return join(
+    homedir(),
+    "Library",
+    "Application Support",
+    "superwhisper-rag",
+    "helper",
+  );
+}
+
 function materialiseHelper(embedded: string): MaterialisedHelper {
   // Dev path: when running under `bun src/cli.ts`, the embedded
   // reference is a real fs path to `vendor/swrag-helper.app.tar`.
@@ -293,6 +329,9 @@ function materialiseHelper(embedded: string): MaterialisedHelper {
     const sibling = embedded.replace(/\.tar$/, "");
     const innerBin = join(sibling, "Contents", "MacOS", "swrag-helper");
     if (existsSync(innerBin)) {
+      // Even in dev mode, apply any configured signing identity so
+      // the dev experience matches production. Best-effort.
+      applyConfiguredSigning(sibling);
       return { binary: innerBin, app: sibling };
     }
     // No sibling — fall through to tarball extraction. Happens when
@@ -302,29 +341,24 @@ function materialiseHelper(embedded: string): MaterialisedHelper {
 
   const data = readFileSync(embedded);
   const size = data.byteLength;
-  const cacheDir = join(tmpdir(), `swrag-helper-${safeUid()}-${safeUsername()}`);
+  const cacheDir = helperCacheDir();
   try {
     mkdirSync(cacheDir, { recursive: true, mode: 0o700 });
     chmodSync(cacheDir, 0o700);
   } catch {
     // ignore — pre-existing dirs from other invocations are fine.
   }
-  // Clean up v0.8.x leftovers: the previous materialiser wrote a
-  // single-file `swrag-helper-universal-<size>` per-tarball-size into
-  // the same cache directory. Those raw binaries are dead weight in
-  // v0.9.0 — silently remove them so cache dirs stay slim across the
-  // upgrade. Best-effort: a failure here doesn't affect correctness.
+  // One-time migration from v0.9.0–v0.9.11's per-tmp cache layout.
+  // The legacy directory at
+  //   $TMPDIR/swrag-helper-<uid>-<user>/swrag-helper.app/
+  // had a TCC-hostile parent (see helperCacheDir doc) and we keep
+  // the new persistent location strictly invariant per release.
+  // Best-effort cleanup — the OS would have eventually swept the
+  // temp dir anyway.
   try {
-    const Bun_ = (globalThis as { Bun?: { Glob: new (s: string) => { scanSync(opts: { cwd: string }): Iterable<string> } } }).Bun;
-    if (Bun_?.Glob) {
-      const matches = new Bun_.Glob("swrag-helper-universal-*").scanSync({ cwd: cacheDir });
-      for (const name of matches) {
-        try {
-          rmSync(join(cacheDir, name), { force: true });
-        } catch {
-          // best-effort
-        }
-      }
+    const legacyDir = join(tmpdir(), `swrag-helper-${safeUid()}-${safeUsername()}`);
+    if (existsSync(legacyDir)) {
+      rmSync(legacyDir, { recursive: true, force: true });
     }
   } catch {
     // best-effort
@@ -336,6 +370,7 @@ function materialiseHelper(embedded: string): MaterialisedHelper {
   // Fast path: the marker for THIS tarball size exists AND the
   // inner binary exists. Reuse the extracted bundle.
   if (existsSync(sizeMarker) && existsSync(innerBin)) {
+    applyConfiguredSigning(appPath);
     return { binary: innerBin, app: appPath };
   }
 
@@ -416,9 +451,19 @@ function materialiseHelper(embedded: string): MaterialisedHelper {
       // first and left a usable innerBin in place.
     }
     // Drop the size marker last so a half-finished extract isn't
-    // mistakenly reused on the next call.
+    // mistakenly reused on the next call. Also clear any stale
+    // `.signed-with-*` marker — the bundle we just landed is fresh
+    // ad-hoc, so any previous user-cert signature is invalid until
+    // applyConfiguredSigning re-signs.
     try {
       writeFileSync(sizeMarker, "", { mode: 0o600 });
+    } catch {
+      // best-effort
+    }
+    try {
+      for (const name of listSignedMarkers(cacheDir)) {
+        rmSync(join(cacheDir, name), { force: true });
+      }
     } catch {
       // best-effort
     }
@@ -440,6 +485,8 @@ function materialiseHelper(embedded: string): MaterialisedHelper {
       `swrag-helper: bundle materialisation produced no inner binary at ${innerBin}`,
     );
   }
+  // Re-sign with the user's stored identity if one is configured.
+  applyConfiguredSigning(appPath);
   return { binary: innerBin, app: appPath };
 }
 
@@ -454,6 +501,301 @@ function safeUsername(): string {
 function safeUid(): string {
   const uid = process.getuid?.();
   return uid == null ? "x" : String(uid);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Signing — re-sign the materialised bundle with a stored user cert (v0.9.12)*/
+/* -------------------------------------------------------------------------- */
+
+/**
+ * `config` table key that stores the SHA-1 hash of the user's Apple
+ * Development certificate. Written by `swrag setup-signing`; read on
+ * every helper materialisation. Absent / empty → ad-hoc, mic-only
+ * mode (the default).
+ */
+export const CONFIG_SIGNING_IDENTITY = "signing_identity";
+
+/**
+ * Sign the materialised helper bundle with the identity persisted in
+ * the archive's `config.signing_identity` key, if any.
+ *
+ * Why this exists
+ * ---------------
+ *
+ * macOS Sequoia/Tahoe tightened ScreenCaptureKit attribution. An
+ * ad-hoc-signed `.app` causes `CGPreflightScreenCaptureAccess()` to
+ * return false even when the user has toggled Screen Recording ON
+ * in System Settings → Privacy & Security → Screen Recording. The
+ * documented workaround — free Apple Developer cert via Xcode +
+ * Personal Team — produces a stable Team ID that TCC keeps grants
+ * attached to across all future swrag upgrades.
+ *
+ * The user opts in via `swrag setup-signing`, which:
+ *   1) Locates an Apple Development certificate in the keychain.
+ *   2) Stores its SHA-1 hash under `config.signing_identity`.
+ *   3) Runs codesign once against the materialised bundle.
+ *
+ * On every subsequent materialisation (i.e. every CLI invocation
+ * that loads the helper), this function re-applies the stored
+ * identity. Idempotent: tracked via a `.signed-with-<hash>` marker
+ * so we don't pay the codesign cost every call.
+ *
+ * Best-effort. Anything that goes wrong (archive missing, identity
+ * absent, codesign fails) leaves the bundle ad-hoc — mic-only mode
+ * still works.
+ */
+export interface ApplyConfiguredSigningOptions {
+  /**
+   * Override the archive path read. Defaults to
+   * `resolveArchivePathForSigning()` which honours
+   * `SWRAG_ARCHIVE` then falls back to the default.
+   */
+  archive?: string | null;
+  /**
+   * Override the codesign shell-out. Defaults to `runCodesign`. Used
+   * by tests to verify the re-sign happens without touching the real
+   * `codesign` binary.
+   */
+  codesign?: (appPath: string, identity: string) => CodesignResult;
+  /**
+   * Override the signature-info probe used to decide whether a stale
+   * marker file should trigger a re-sign. Defaults to
+   * `helperSignatureInfo`. Tests can pin this to a constant.
+   */
+  signatureInfo?: (appPath: string) => HelperSignatureInfo | null;
+}
+
+export function applyConfiguredSigning(
+  appPath: string,
+  opts: ApplyConfiguredSigningOptions = {},
+): void {
+  const archive = opts.archive === undefined ? resolveArchivePathForSigning() : opts.archive;
+  if (archive == null) return;
+  const identity = readSigningIdentityFromArchive(archive);
+  if (identity == null || identity.length === 0) return;
+  const cacheDir = dirname(appPath);
+  const identityHash = shortHash(identity);
+  const marker = join(cacheDir, `.signed-with-${identityHash}`);
+  const signatureInfo = opts.signatureInfo ?? helperSignatureInfo;
+  if (existsSync(marker)) {
+    // Already signed with this identity. Verify the bundle's actual
+    // signature once more to catch the edge case where the marker
+    // survived a corrupt-then-restore cycle. Cheap: codesign -v on
+    // a small bundle is sub-50ms.
+    const info = signatureInfo(appPath);
+    if (info != null && !info.adhoc) return;
+    // Stale marker — fall through to re-sign.
+    try {
+      rmSync(marker, { force: true });
+    } catch {
+      // best-effort
+    }
+  }
+  const sign = opts.codesign ?? runCodesign;
+  const r = sign(appPath, identity);
+  if (!r.ok) {
+    warn(
+      `swrag-helper: codesign with configured identity ${identity} failed: ${r.message}. ` +
+        "Falling back to ad-hoc signing for this session. Run `swrag setup-signing` to retry.",
+    );
+    return;
+  }
+  try {
+    writeFileSync(marker, identity, { mode: 0o600 });
+  } catch {
+    // best-effort — the next materialise will re-sign, which is fine
+  }
+  // Clear stale `.signed-with-*` markers from any previous identity.
+  try {
+    for (const name of listSignedMarkers(cacheDir)) {
+      if (name !== `.signed-with-${identityHash}`) {
+        rmSync(join(cacheDir, name), { force: true });
+      }
+    }
+  } catch {
+    // best-effort
+  }
+  verbose(`swrag-helper: re-signed bundle with identity ${identity}`);
+}
+
+function listSignedMarkers(cacheDir: string): string[] {
+  try {
+    return readdirSync(cacheDir).filter((n) => n.startsWith(".signed-with-"));
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Default-archive resolution for the materialiser.
+ *
+ * We can't pull in `paths.ts` here without a small import cycle
+ * (paths→schemas→…), so we inline the same default-with-env-override
+ * shape that `paths.ts` uses. If `SWRAG_ARCHIVE` is set, use it;
+ * otherwise fall back to the default Application Support location.
+ * Returns null if the file is missing — first-launch invocations
+ * before any archive has been created keep the bundle ad-hoc.
+ */
+function resolveArchivePathForSigning(): string | null {
+  const override = Bun.env.SWRAG_ARCHIVE;
+  const candidate = override && override.length > 0
+    ? override
+    : join(homedir(), "Library", "Application Support", "superwhisper-rag", "swrag.sqlite");
+  if (!existsSync(candidate)) return null;
+  return candidate;
+}
+
+/**
+ * Read `config.signing_identity` from the archive without going
+ * through `openArchive()` — that path runs migrations on a
+ * read-write open, and we don't want a side-effecting hop inside a
+ * read-only probe. Best-effort: any failure returns null and the
+ * bundle stays ad-hoc.
+ */
+function readSigningIdentityFromArchive(archivePath: string): string | null {
+  try {
+    const db = new Database(archivePath, { readonly: true });
+    try {
+      const raw: unknown = db
+        .prepare("SELECT value FROM config WHERE key = ?")
+        .get(CONFIG_SIGNING_IDENTITY);
+      if (raw == null) return null;
+      const parsed = z.object({ value: z.string() }).safeParse(raw);
+      if (!parsed.success) return null;
+      const value = parsed.data.value.trim();
+      return value.length > 0 ? value : null;
+    } finally {
+      db.close();
+    }
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Short hex tag for an identity hash, for use in marker filenames.
+ * Identities are themselves SHA-1 hex (40 chars), but a user could
+ * paste any string into the config; we hash whatever we get so the
+ * marker is filesystem-safe and bounded.
+ */
+function shortHash(s: string): string {
+  return createHash("sha1").update(s).digest("hex").slice(0, 16);
+}
+
+export interface CodesignResult {
+  ok: boolean;
+  message: string;
+}
+
+/**
+ * Re-sign a `.app` bundle with the given identity (typically a SHA-1
+ * hex hash from `security find-identity`).
+ *
+ * Flags:
+ *   --force                  Replace any existing signature.
+ *   --deep                   Recurse into nested executables.
+ *   --sign <identity>        The keychain identity to sign with.
+ *   --options runtime        Enable the hardened runtime. Some TCC
+ *                            paths in Tahoe/Sequoia require this flag
+ *                            for attribution to land correctly.
+ *
+ * Exported for `setup-signing.ts` which calls this with the same
+ * shape after first running `security find-identity`.
+ */
+export function runCodesign(appPath: string, identity: string): CodesignResult {
+  try {
+    const r = Bun.spawnSync({
+      cmd: [
+        "codesign",
+        "--force",
+        "--deep",
+        "--sign",
+        identity,
+        "--options",
+        "runtime",
+        appPath,
+      ],
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    if (r.exitCode !== 0) {
+      const stderr = new TextDecoder().decode(r.stderr).trim();
+      return {
+        ok: false,
+        message: stderr || `codesign exited ${r.exitCode}`,
+      };
+    }
+    return { ok: true, message: "" };
+  } catch (e) {
+    return { ok: false, message: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+export interface HelperSignatureInfo {
+  /** True iff the bundle is currently signed (with anything). */
+  signed: boolean;
+  /** True iff the signature is ad-hoc (i.e. `--sign -`). */
+  adhoc: boolean;
+  /** "Authority" line text — typically `Apple Development: <name> (<team>)`. */
+  authority: string | null;
+  /** Team identifier if not "not set". */
+  teamIdentifier: string | null;
+  /** Raw codesign output (stderr) for diagnostics. */
+  raw: string;
+}
+
+/**
+ * Parse the output of `codesign -dvvv <app>` into a structured
+ * record. Returns null if the call fails (binary missing, bundle
+ * absent). The raw output lives in `.raw` for diagnostics.
+ *
+ * `codesign -dvvv` writes everything to stderr — stdout is empty.
+ * macOS-only.
+ */
+export function helperSignatureInfo(appPath: string): HelperSignatureInfo | null {
+  try {
+    const r = Bun.spawnSync({
+      cmd: ["codesign", "-dvvv", appPath],
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const raw = new TextDecoder().decode(r.stderr) + new TextDecoder().decode(r.stdout);
+    if (r.exitCode !== 0) {
+      return null;
+    }
+    return parseSignatureOutput(raw);
+  } catch {
+    return null;
+  }
+}
+
+export function parseSignatureOutput(raw: string): HelperSignatureInfo {
+  const signatureMatch = raw.match(/Signature=([^\n]+)/);
+  const sig = signatureMatch?.[1]?.trim() ?? null;
+  const adhoc = sig != null && /adhoc/i.test(sig);
+  // codesign -dvvv prints all "Authority=" lines from the cert chain;
+  // the first one is the leaf cert (the user's "Apple Development:" cert).
+  const authMatch = raw.match(/Authority=([^\n]+)/);
+  const authority = authMatch?.[1]?.trim() ?? null;
+  const teamMatch = raw.match(/TeamIdentifier=([^\n]+)/);
+  const teamRaw = teamMatch?.[1]?.trim() ?? null;
+  const teamIdentifier = teamRaw == null || /^not set$/i.test(teamRaw) ? null : teamRaw;
+  return {
+    signed: sig != null,
+    adhoc,
+    authority,
+    teamIdentifier,
+    raw,
+  };
+}
+
+/**
+ * Public re-export of the helper cache directory. `setup-signing`
+ * uses this to address the materialised bundle without re-doing the
+ * resolution logic.
+ */
+export function getHelperCacheDir(): string {
+  return helperCacheDir();
 }
 
 /* -------------------------------------------------------------------------- */

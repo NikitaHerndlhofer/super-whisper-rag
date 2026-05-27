@@ -63,6 +63,11 @@ function withDefaults<T extends object>(over: T) {
     ingest: async () => {},
     installAgentSkill: async () => {},
     doctor: stubDoctorOk,
+    // v0.9.12 added a signing-prompt step. Default to "skip" in
+    // every test so the suite is non-interactive; the signing
+    // behaviour itself is covered by its own dedicated block at
+    // the bottom of this file.
+    skipSigning: true,
     ...over,
   };
 }
@@ -316,5 +321,163 @@ describe("runBootstrap", () => {
         }),
       ),
     ).rejects.toThrow(/source DB not found/);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* v0.9.12 — signing prompt step                                              */
+/* -------------------------------------------------------------------------- */
+
+describe("runBootstrap — signing prompt (v0.9.12)", () => {
+  test("ad-hoc helper + user accepts: setup-signing is invoked, ranSetupSigning=true", async () => {
+    let promptCalls = 0;
+    let setupCalls = 0;
+    const r = await runBootstrap(
+      withDefaults({
+        skipSigning: false,
+        signatureSummary: () => "ad-hoc",
+        promptForSigning: async () => {
+          promptCalls++;
+          return true;
+        },
+        runSetupSigning: async () => {
+          setupCalls++;
+          return {
+            exitCode: 0,
+            outcome: "signed" as const,
+            identityHash: "deadbeef",
+            identity: null,
+            appPath: "/tmp/swrag-helper.app",
+          };
+        },
+      }),
+    );
+    expect(promptCalls).toBe(1);
+    expect(setupCalls).toBe(1);
+    expect(r.ranSetupSigning).toBe(true);
+    expect(r.exitCode).toBe(0);
+  });
+
+  test("ad-hoc helper + user declines: setup-signing is NOT invoked", async () => {
+    let promptCalls = 0;
+    let setupCalls = 0;
+    const r = await runBootstrap(
+      withDefaults({
+        skipSigning: false,
+        signatureSummary: () => "ad-hoc",
+        promptForSigning: async () => {
+          promptCalls++;
+          return false;
+        },
+        runSetupSigning: async () => {
+          setupCalls++;
+          return {
+            exitCode: 0,
+            outcome: "signed" as const,
+            identityHash: "x",
+            identity: null,
+            appPath: "/x",
+          };
+        },
+      }),
+    );
+    expect(promptCalls).toBe(1);
+    expect(setupCalls).toBe(0);
+    expect(r.ranSetupSigning).toBe(false);
+  });
+
+  test("already-signed helper: prompt is NOT shown (idempotent re-runs don't re-ask)", async () => {
+    let promptCalls = 0;
+    let setupCalls = 0;
+    const r = await runBootstrap(
+      withDefaults({
+        skipSigning: false,
+        signatureSummary: () => "Apple Development: Jane Dev (Team TEAMID12AB)",
+        promptForSigning: async () => {
+          promptCalls++;
+          return true;
+        },
+        runSetupSigning: async () => {
+          setupCalls++;
+          return {
+            exitCode: 0,
+            outcome: "signed" as const,
+            identityHash: "x",
+            identity: null,
+            appPath: "/x",
+          };
+        },
+      }),
+    );
+    expect(promptCalls).toBe(0);
+    expect(setupCalls).toBe(0);
+    expect(r.ranSetupSigning).toBe(false);
+  });
+
+  test("setup-signing returns no_certs: bootstrap continues without setting ranSetupSigning", async () => {
+    const r = await runBootstrap(
+      withDefaults({
+        skipSigning: false,
+        signatureSummary: () => "ad-hoc",
+        promptForSigning: async () => true,
+        runSetupSigning: async () => ({
+          exitCode: 0,
+          outcome: "no_certs" as const,
+          identityHash: null,
+          identity: null,
+          appPath: null,
+        }),
+      }),
+    );
+    expect(r.ranSetupSigning).toBe(false);
+    expect(r.exitCode).toBe(0);
+  });
+
+  test("setup-signing throwing does NOT abort the bootstrap", async () => {
+    let ingestRan = false;
+    const r = await runBootstrap(
+      withDefaults({
+        skipSigning: false,
+        signatureSummary: () => "ad-hoc",
+        promptForSigning: async () => true,
+        runSetupSigning: async () => {
+          throw new Error("codesign exploded");
+        },
+        ingest: async () => {
+          ingestRan = true;
+        },
+      }),
+    );
+    expect(r.ranSetupSigning).toBe(false);
+    expect(ingestRan).toBe(true);
+    expect(r.exitCode).toBe(0);
+  });
+
+  test("SWRAG_SKIP_SIGNING_PROMPT=1: prompt is skipped without invoking signatureSummary", async () => {
+    const old = process.env.SWRAG_SKIP_SIGNING_PROMPT;
+    process.env.SWRAG_SKIP_SIGNING_PROMPT = "1";
+    let summaryCalls = 0;
+    let promptCalls = 0;
+    try {
+      const r = await runBootstrap(
+        withDefaults({
+          skipSigning: false,
+          signatureSummary: () => {
+            summaryCalls++;
+            return "ad-hoc";
+          },
+          promptForSigning: async () => {
+            promptCalls++;
+            return true;
+          },
+        }),
+      );
+      expect(r.ranSetupSigning).toBe(false);
+      expect(promptCalls).toBe(0);
+      expect(summaryCalls).toBe(0);
+    } finally {
+      if (old == null) delete process.env.SWRAG_SKIP_SIGNING_PROMPT;
+      else process.env.SWRAG_SKIP_SIGNING_PROMPT = old;
+    }
   });
 });
