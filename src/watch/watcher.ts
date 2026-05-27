@@ -41,7 +41,7 @@
  */
 import { existsSync } from "node:fs";
 import { watch } from "node:fs/promises";
-import { dirname } from "node:path";
+import { basename, dirname } from "node:path";
 import { runIndex } from "../commands/index.ts";
 import { info, verbose, warn } from "../log.ts";
 
@@ -258,9 +258,22 @@ async function watchRecordings(
  * Non-recursive watch on the parent of `sourceDb`. SQLite's WAL mode
  * touches `swrag.sqlite-wal` and `swrag.sqlite-shm` constantly, so we
  * also wake on those — they're a strong proxy for "the DB just got
- * written". Filtering to the family avoids waking on every unrelated
- * file under `~/Library/Application Support/superwhisper/database/`
- * (in practice it's empty other than the DB family, but defensive).
+ * written".
+ *
+ * Filtering rules (in order):
+ *   - filename matches `<basename(sourceDb)>` or starts with
+ *     `<basename>-` (the WAL/SHM family) → wake.
+ *   - filename is null/empty (some fs.watch implementations omit it
+ *     entirely under load or on certain APFS configurations) → wake
+ *     defensively. A spurious wake costs one mtime fast-path check
+ *     (~sub-ms); a missed wake costs an unbounded ingest delay.
+ *   - anything else → ignore.
+ *
+ * We compute the basename via `path.basename(sourceDb)` rather than
+ * slicing `parentDir.length + 1` so that symlink-resolution
+ * differences between the watch path and the DB path (macOS's
+ * `/private/var/folders/…` vs `/var/folders/…`) don't break the
+ * comparison.
  */
 async function watchSourceDb(
   parentDir: string,
@@ -268,13 +281,13 @@ async function watchSourceDb(
   signal: AbortSignal,
   onEvent: (reason: string) => void,
 ): Promise<void> {
-  const dbBaseName = sourceDb.slice(parentDir.length + 1);
+  const dbBaseName = basename(sourceDb);
   try {
     const watcher = watch(parentDir, { recursive: false, signal });
     for await (const event of watcher) {
       const fn = event.filename ?? "";
-      if (fn === dbBaseName || fn.startsWith(`${dbBaseName}-`)) {
-        onEvent(`sourceDb:${event.eventType}:${fn}`);
+      if (fn === "" || fn === dbBaseName || fn.startsWith(`${dbBaseName}-`)) {
+        onEvent(`sourceDb:${event.eventType}:${fn || "?"}`);
       }
     }
   } catch (e) {

@@ -135,6 +135,15 @@ describe("runWatch", () => {
   });
 
   test("fs events on the source DB parent dir also trigger an ingest", async () => {
+    // We trigger via creating a NEW file in the parent dir rather
+    // than modifying the existing sourceDb. macOS FSEvents (which
+    // backs fs.watch with recursive:false) reliably fires for
+    // create/delete/rename but batches plain content modifications
+    // at the kernel level — modifications may not surface within a
+    // test's 5s budget on GitHub's macos-latest runners. The
+    // watcher's `""`/`<basename>-*` filter accepts SQLite's WAL/SHM
+    // family, so creating `${sourceDb}-wal` here mirrors what a
+    // real SQLite WAL-mode commit produces.
     let calls = 0;
     const ac = new AbortController();
     const cycles: Array<() => void> = [];
@@ -154,7 +163,7 @@ describe("runWatch", () => {
     await startupDone;
 
     const second = waitForCycle();
-    writeFileSync(sourceDb, "updated");
+    writeFileSync(`${sourceDb}-wal`, "wal contents");
     await second;
     ac.abort();
     await runPromise;
