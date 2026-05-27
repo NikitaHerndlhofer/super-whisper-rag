@@ -325,6 +325,47 @@ SELECT e.folder_name, e.chunk_idx, e.text,
 FROM recording_chunk_vec v
 JOIN eligible_chunks e ON e.chunk_id = v.chunk_id
 ORDER BY dist LIMIT 10;
+
+-- 19. Rank RECORDINGS by best-chunk match (with short-recording fallback).
+--     Companion to recipe 14, which returns the best CHUNK itself; this
+--     one returns the parent recording, one row per recording. Long
+--     recordings are scored by MIN() across their chunks, so a meeting
+--     that nails topic X in 1 of 20 segments wins on that single strong
+--     hit instead of being averaged into a meh centroid by the other 19
+--     off-topic chunks. Short recordings (≤500 words; no chunks) fall
+--     back to their row-level embedding. The `via` column reports which
+--     path each row took — handy for debugging, or for restricting to
+--     chunk-only matches when you specifically want long-form recall.
+WITH q AS (SELECT $(swrag embed 'how do notifications work') AS qv),
+     chunk_best AS (
+       SELECT c.folder_name,
+              MIN(vec_distance_cosine(v.embedding, q.qv)) AS dist
+       FROM recording_chunk c
+       JOIN recording_chunk_vec v ON v.chunk_id = c.id, q
+       GROUP BY c.folder_name
+     ),
+     short_direct AS (
+       SELECT v.folder_name, vec_distance_cosine(v.embedding, q.qv) AS dist
+       FROM recording_vec v, q
+       WHERE NOT EXISTS (
+         SELECT 1 FROM recording_chunk c WHERE c.folder_name = v.folder_name
+       )
+     ),
+     all_distances AS (
+       SELECT * FROM chunk_best
+       UNION ALL
+       SELECT * FROM short_direct
+     )
+SELECT r.folder_name, ROUND(d.dist, 3) AS best_dist, r.mode_name,
+       ROUND(r.duration_sec / 60.0, 1) AS min,
+       CASE WHEN EXISTS (SELECT 1 FROM recording_chunk c
+                         WHERE c.folder_name = r.folder_name)
+            THEN 'chunk' ELSE 'row' END AS via
+FROM all_distances d
+JOIN recording r ON r.folder_name = d.folder_name
+WHERE r.superseded_by IS NULL
+ORDER BY d.dist
+LIMIT 10;
 ```
 
 <!-- swrag:cookbook:end -->
