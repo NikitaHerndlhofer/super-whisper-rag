@@ -112,7 +112,8 @@ For semantic search, compose with \`swrag embed\` via shell expansion —
 **there is no \`--param\` flag**:
 
 \`\`\`bash
-swrag sql "SELECT folder_name, datetime, llm_result,
+swrag sql "SELECT r.folder_name, r.datetime_iso,
+                  COALESCE(r.processed_transcript, r.raw_transcript) AS transcript,
                   vec_distance_cosine(v.embedding,
                                       $(swrag embed 'how do notifications work')) AS dist
            FROM recording_vec v JOIN recording r USING (folder_name)
@@ -127,10 +128,18 @@ literal (\`x'…'\`) on stdout. The shell pastes it directly into your SQL.
 
 \`recording\` — one row per dictation, append-only:
 
-- \`folder_name\` (PK), \`datetime\` (ISO), \`mode_name\`, \`mode_name_lower\`
+- \`folder_name\` (PK), \`datetime\` (raw SW), \`datetime_iso\` (normalized ISO8601, indexed — sort/filter on this)
+- \`mode_name\`, \`mode_name_lower\` (indexed, case-insensitive)
 - \`duration_ms\`, \`duration_sec\`, \`language\`, \`app_name\`, \`app_category\`
 - \`model_name\`, \`language_model_name\`, \`recording_device\`
-- \`result\`, \`llm_result\`, \`raw_result\`, \`raw_word_count\`, \`llm_word_count\`
+- **Transcript columns (v1.1.0+):**
+  - \`raw_transcript\` — Scribe (STT) output, always present.
+  - \`processed_transcript\` — LLM-processed text, NULL when no LLM ran.
+  - \`raw_word_count\` (from SW), \`processed_word_count\` (derived).
+  - Use \`COALESCE(processed_transcript, raw_transcript)\` for "best
+    available transcript". The raw \`result\` / \`llm_result\` /
+    \`raw_result\` columns are SW's source data — kept for debugging
+    but you should not query them directly.
 - \`meta_path\`, \`audio_path\`, \`has_audio\`, \`indexed_at\`
 - \`source_deleted_at\` — set when Super Whisper deleted the source row
 - \`source_audio_lost_at\` — set when the audio file disappeared
@@ -148,8 +157,9 @@ literal (\`x'…'\`) on stdout. The shell pastes it directly into your SQL.
 > (we don't waste embedding calls on duplicates), so for FTS you must filter
 > in the join.
 
-\`recording_fts\` — FTS5 over \`llm_result\`, \`raw_result\`, \`result\`. Use
-\`MATCH\`, \`snippet()\`, \`bm25()\`.
+\`recording_fts\` — FTS5 over \`raw_transcript\` and
+\`processed_transcript\`. Use \`MATCH\`, \`snippet()\`, \`bm25()\`. A
+single \`MATCH\` finds tokens in either column.
 
 \`recording_vec\` — sqlite-vec virtual table, \`embedding FLOAT[1024]\` from
 bge-m3 (multilingual). Use \`vec_distance_cosine(...)\`. **For long
@@ -234,7 +244,7 @@ If your best hit is above ~0.55, **say so to the user** ("weak match — try dif
 - ❌ **\`JOIN recording_chunk_vec v ON v.rowid = c.id\`** — the PK column is **\`chunk_id\`**, not \`rowid\`. The join silently returns 0 rows in some sqlite-vec versions; in others it errors. Always \`v.chunk_id\`.
 - ❌ **\`WHERE recording_fts MATCH …\` without \`r.superseded_by IS NULL\`** — you'll surface old reprocessings as duplicates of the canonical row.
 - ❌ **\`vec_distance_cosine(embedding, 'how do notifications work')\`** — passing a text literal instead of a vector blob silently returns garbage distances. Always shell-compose with \`$(swrag embed '…')\`.
-- ❌ **\`LIMIT 50\` on a recipe that returns \`r.llm_result\`** — meetings can be 10K+ words; this blows the context window. Use \`LIMIT 5\` for full-transcript recipes, \`LIMIT 20\` for chunk-text-only recipes.
+- ❌ **\`LIMIT 50\` on a recipe that returns full transcripts** — meetings can be 10K+ words; this blows the context window. Use \`LIMIT 5\` for full-transcript recipes, \`LIMIT 20\` for chunk-text-only recipes.
 - ❌ **Reaching for \`recording_chunk*\` when the user wants short recordings** — short rows have no chunks. They show up only via \`recording*\` queries or via the row-level \`recording_vec\` join.
 - ❌ **Filtering chunks by mode / date directly on \`recording_chunk_vec\`** — chunk_vec has no metadata columns. Join through \`recording_chunk → recording\` first, then filter, then rank. See recipe 18.
 - ❌ **Hard-coding mode names like \`'Meeting'\`** without first running recipe 0 — modes are user-configurable in Super Whisper. The user may have \`'Interview'\`, \`'Standup'\`, \`'Universal'\`, etc.

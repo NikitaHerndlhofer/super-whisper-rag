@@ -28,12 +28,14 @@ It's useful if you:
 ## Quick taste
 
 ```bash
-# Today's dictations
-swrag sql "SELECT folder_name, datetime, mode_name, llm_result
+# Today's dictations. processed_transcript = the LLM-cleaned text;
+# falls back to raw_transcript when the mode didn't run an LLM.
+swrag sql "SELECT folder_name, datetime_iso, mode_name,
+                  COALESCE(processed_transcript, raw_transcript) AS transcript
            FROM recording
-           WHERE date(datetime) = date('now','localtime')
+           WHERE date(datetime_iso) = date('now','localtime')
              AND superseded_by IS NULL
-           ORDER BY datetime DESC"
+           ORDER BY datetime_iso DESC"
 
 # Discover the modes you've actually used — modes are user-configurable in
 # Super Whisper, so don't assume any particular name exists.
@@ -46,21 +48,25 @@ swrag sql "SELECT mode_name, COUNT(*) AS n
 # Filter by Super Whisper mode — replace 'meeting' with one of the names
 # the previous query showed. `mode_name_lower` is an indexed generated
 # column, so case-insensitive matches are cheap.
-swrag sql "SELECT folder_name, datetime, duration_sec, llm_result
+swrag sql "SELECT folder_name, datetime_iso, duration_sec,
+                  COALESCE(processed_transcript, raw_transcript) AS transcript
            FROM recording
            WHERE mode_name_lower = 'meeting'
-             AND datetime >= datetime('now','-7 days')
+             AND datetime_iso >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-7 days')
              AND superseded_by IS NULL
-           ORDER BY datetime DESC"
+           ORDER BY datetime_iso DESC"
 
-# Keyword search with snippets
-swrag sql "SELECT r.folder_name, snippet(recording_fts, 1, '«', '»', '…', 5)
+# Keyword search with snippets. recording_fts indexes raw_transcript and
+# processed_transcript; the -1 in snippet() lets it pick whichever column
+# matched.
+swrag sql "SELECT r.folder_name, snippet(recording_fts, -1, '«', '»', '…', 5)
            FROM recording_fts JOIN recording r ON r.rowid = recording_fts.rowid
            WHERE recording_fts MATCH 'bullmq' AND r.superseded_by IS NULL
            ORDER BY bm25(recording_fts) LIMIT 10"
 
 # Semantic search — works in any language; the shell composes the embedding
-swrag sql "SELECT r.folder_name, r.llm_result,
+swrag sql "SELECT r.folder_name,
+                  COALESCE(r.processed_transcript, r.raw_transcript) AS transcript,
                   vec_distance_cosine(v.embedding,
                                       $(swrag embed 'how do notifications work')) AS dist
            FROM recording_vec v JOIN recording r USING (folder_name)
@@ -95,8 +101,9 @@ aware, deterministic, no LLM call) and embedded individually into
 `recording_chunk_vec` and `recording_chunk_fts`. The row-level
 `recording_vec` still works for coarse filtering — it's now the
 L2-normalized centroid of the row's chunks. Once you've found the
-chunk, `recording.llm_result` is the full transcript right there for
-context. Recipes 13–17 in the cookbook cover the chunk-level patterns.
+chunk, `COALESCE(processed_transcript, raw_transcript)` on the parent
+row is the full transcript right there for context. Recipes 13–17 in
+the cookbook cover the chunk-level patterns.
 
 ## Install
 

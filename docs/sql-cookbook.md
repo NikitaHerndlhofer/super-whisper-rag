@@ -20,6 +20,24 @@ propagate to `SKILL.md` at build time. The slice is delimited by the
 >   hard-code mode names without first checking which ones this user has
 >   (recipe 0 below). Filter with `mode_name_lower` (case-insensitive,
 >   indexed) once you know the names.
+> - **Two canonical transcript columns** (as of v1.1.0):
+>   - `raw_transcript` — what Scribe (STT) produced. Always present
+>     for a successful recording.
+>   - `processed_transcript` — what the LLM produced as post-processing.
+>     `NULL` for voice-only modes where no LLM ran.
+>
+>   Use `processed_transcript` when you want the polished text, and
+>   fall back to raw with `COALESCE(processed_transcript, raw_transcript)`
+>   when you want "the best available transcript for this row".
+>   Word counts: `raw_word_count` (from SW) and `processed_word_count`
+>   (derived; non-zero exactly when `processed_transcript IS NOT NULL`).
+>   The raw `result` / `llm_result` / `raw_result` columns are still
+>   present for debugging access to SW's own fields, but they shouldn't
+>   appear in day-to-day queries — they're noisy across SW versions.
+> - **Sort and filter by `datetime_iso`**, not the raw `datetime`. SW
+>   has shipped two `datetime` formats over time (`"2026-05-27 18:39:33.470"`
+>   and `"2026-05-27T18:39:33.470Z"`) and lex-ordering them mixes up.
+>   `datetime_iso` is the indexed, ISO-normalized form.
 > - **Long recordings are chunked**. Rows with a word count above the
 >   configured threshold (default 500) are also split into ~300-word
 >   chunks in `recording_chunk` + `recording_chunk_vec` + `recording_chunk_fts`.
@@ -40,26 +58,32 @@ WHERE superseded_by IS NULL
 GROUP BY mode_name
 ORDER BY n DESC;
 
--- 1. Today's recordings, newest first
-SELECT folder_name, datetime, mode_name, llm_result
+-- 1. Today's recordings, newest first. `COALESCE(processed, raw)`
+--    gives "best available transcript": the LLM-polished text when
+--    a mode ran an LLM, the Scribe text otherwise.
+SELECT folder_name, datetime_iso, mode_name,
+       COALESCE(processed_transcript, raw_transcript) AS transcript
 FROM recording
 WHERE superseded_by IS NULL
-  AND date(datetime) = date('now', 'localtime')
-ORDER BY datetime DESC;
+  AND date(datetime_iso) = date('now', 'localtime')
+ORDER BY datetime_iso DESC;
 
 -- 2. Meeting recordings from the last 7 days
 --    (replace 'meeting' with whatever recipe 0 surfaced for this user)
-SELECT folder_name, datetime, duration_sec, llm_result
+SELECT folder_name, datetime_iso, duration_sec,
+       COALESCE(processed_transcript, raw_transcript) AS transcript
 FROM recording
 WHERE superseded_by IS NULL
   AND mode_name_lower = 'meeting'
-  AND datetime >= datetime('now', '-7 days')
-ORDER BY datetime DESC;
+  AND datetime_iso >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-7 days')
+ORDER BY datetime_iso DESC;
 
--- 3. Keyword search with snippet (FTS5)
---    Inline the user's search term as a string literal.
-SELECT r.folder_name, r.datetime, r.mode_name,
-       snippet(recording_fts, 1, '«', '»', '…', 10) AS snip,
+-- 3. Keyword search with snippet (FTS5). `recording_fts` indexes
+--    `raw_transcript` (col 1) and `processed_transcript` (col 2),
+--    so MATCH finds hits in either; `snippet(recording_fts, -1, …)`
+--    auto-selects the first matched column for the excerpt.
+SELECT r.folder_name, r.datetime_iso, r.mode_name,
+       snippet(recording_fts, -1, '«', '»', '…', 10) AS snip,
        bm25(recording_fts) AS bm25
 FROM recording_fts
 JOIN recording r ON r.rowid = recording_fts.rowid
@@ -72,7 +96,8 @@ LIMIT 10;
 -- 4. Semantic search (any language) — shell composition via swrag embed.
 --    Run from a shell:
 --      swrag sql "<query below, with $(swrag embed ...) interpolated>"
-SELECT r.folder_name, r.datetime, r.mode_name, r.llm_result,
+SELECT r.folder_name, r.datetime_iso, r.mode_name,
+       COALESCE(r.processed_transcript, r.raw_transcript) AS transcript,
        vec_distance_cosine(v.embedding,
                            $(swrag embed 'how do notifications work')) AS dist
 FROM recording_vec v
@@ -82,7 +107,7 @@ ORDER BY dist
 LIMIT 10;
 
 -- 5. Semantic + structured filter
-SELECT r.folder_name, r.datetime, r.app_name,
+SELECT r.folder_name, r.datetime_iso, r.app_name,
        vec_distance_cosine(v.embedding,
                            $(swrag embed 'how do notifications work')) AS dist
 FROM recording_vec v
@@ -110,7 +135,8 @@ LIMIT 10;
 --                 ROW_NUMBER() OVER (ORDER BY vec_distance_cosine(embedding, $QV)) AS r
 --          FROM recording_vec LIMIT 50
 --        )
---        SELECT r.folder_name, r.datetime, r.mode_name, r.llm_result,
+--        SELECT r.folder_name, r.datetime_iso, r.mode_name,
+--               COALESCE(r.processed_transcript, r.raw_transcript) AS transcript,
 --               COALESCE(1.0/(60+kw.r), 0) + COALESCE(1.0/(60+vec.r), 0) AS rrf
 --        FROM recording r
 --        LEFT JOIN kw  ON kw.rid = r.rowid
@@ -122,16 +148,19 @@ LIMIT 10;
 --      )"
 
 -- 7. Daily dictation volume by mode
-SELECT date(datetime) AS day, mode_name, COUNT(*) AS n,
+SELECT date(datetime_iso) AS day, mode_name, COUNT(*) AS n,
        ROUND(SUM(duration_sec)/60.0, 1) AS minutes
 FROM recording
 WHERE superseded_by IS NULL
 GROUP BY day, mode_name
 ORDER BY day DESC, n DESC;
 
--- 8. Longest recordings
-SELECT folder_name, datetime, mode_name,
-       ROUND(duration_sec/60.0, 1) AS min, llm_word_count
+-- 8. Longest recordings. `processed_word_count` is non-zero exactly
+--    when the recording had an LLM stage; for voice-only modes,
+--    `raw_word_count` is what to read instead.
+SELECT folder_name, datetime_iso, mode_name,
+       ROUND(duration_sec/60.0, 1) AS min,
+       COALESCE(NULLIF(processed_word_count, 0), raw_word_count) AS words
 FROM recording
 WHERE superseded_by IS NULL
 ORDER BY duration_sec DESC
@@ -155,32 +184,34 @@ SELECT
 FROM recording;
 
 -- 11. Recordings in a specific language
-SELECT folder_name, datetime, mode_name, substr(llm_result, 1, 80) AS preview
+SELECT folder_name, datetime_iso, mode_name,
+       substr(COALESCE(processed_transcript, raw_transcript), 1, 80) AS preview
 FROM recording
 WHERE superseded_by IS NULL
   AND language = 'pt'
-ORDER BY datetime DESC;
+ORDER BY datetime_iso DESC;
 
 -- 12. Reprocessing history of a recording (rare; only when the user asks)
-SELECT folder_name, datetime, mode_name, model_name, language_model_name,
+SELECT folder_name, datetime_iso, mode_name, model_name, language_model_name,
        superseded_by, superseded_at
 FROM recording
 WHERE audio_hash = (
   SELECT audio_hash FROM recording WHERE folder_name = '1779143179'
 )
-ORDER BY datetime;
+ORDER BY datetime_iso;
 
 -- 13. Which recordings have chunks? (i.e., which crossed the long-form
 --     threshold and got chunked at ingest.) Useful as a sanity check
 --     before reaching for chunk-level recipes.
-SELECT r.folder_name, r.datetime, r.mode_name, r.llm_word_count,
+SELECT r.folder_name, r.datetime_iso, r.mode_name,
+       COALESCE(NULLIF(r.processed_word_count, 0), r.raw_word_count) AS words,
        COUNT(c.id) AS n_chunks
 FROM recording r
 LEFT JOIN recording_chunk c ON c.folder_name = r.folder_name
 WHERE r.superseded_by IS NULL
 GROUP BY r.folder_name
 HAVING n_chunks > 0
-ORDER BY r.datetime DESC;
+ORDER BY r.datetime_iso DESC;
 
 -- 14. Best moment per long recording + the full transcript inline.
 --     This is the canonical RAG pattern for long-form retrieval:
@@ -200,10 +231,10 @@ best AS (
   FROM ranked
   JOIN recording_chunk c ON c.id = ranked.chunk_id
 )
-SELECT r.folder_name, r.datetime, r.mode_name,
+SELECT r.folder_name, r.datetime_iso, r.mode_name,
        best.chunk_idx AS hit_idx,
        best.text      AS hit_chunk,
-       r.llm_result   AS full_transcript,
+       COALESCE(r.processed_transcript, r.raw_transcript) AS full_transcript,
        best.dist
 FROM best
 JOIN recording r USING (folder_name)
@@ -232,7 +263,7 @@ ORDER BY c.chunk_idx;
 -- 16. Chunk-level FTS5 keyword search. bm25() over 300-word chunks ranks
 --     much sharper than bm25() over 5,000-word transcripts. Returns one
 --     row per matching chunk (a meeting can hit multiple times).
-SELECT r.folder_name, r.datetime, r.mode_name,
+SELECT r.folder_name, r.datetime_iso, r.mode_name,
        c.chunk_idx,
        snippet(recording_chunk_fts, 1, '«', '»', '…', 10) AS snip,
        bm25(recording_chunk_fts) AS bm25
@@ -262,7 +293,7 @@ ORDER BY bm25 LIMIT 20;
 --                  ROW_NUMBER() OVER (ORDER BY vec_distance_cosine(embedding, $QV)) AS r
 --           FROM recording_chunk_vec LIMIT 50
 --         )
---         SELECT r.folder_name, r.datetime, c.chunk_idx, c.text,
+--         SELECT r.folder_name, r.datetime_iso, c.chunk_idx, c.text,
 --                COALESCE(1.0/(60+kw.r), 0) + COALESCE(1.0/(60+vec.r), 0) AS rrf
 --         FROM recording_chunk c
 --         JOIN recording r ON r.folder_name = c.folder_name
@@ -286,7 +317,7 @@ WITH eligible_chunks AS (
   JOIN recording r ON r.folder_name = c.folder_name
   WHERE r.superseded_by IS NULL
     AND r.mode_name_lower = 'meeting'           -- replace with user's mode
-    AND r.datetime >= datetime('now', '-90 days')
+    AND r.datetime_iso >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-90 days')
 )
 SELECT e.folder_name, e.chunk_idx, e.text,
        vec_distance_cosine(v.embedding,

@@ -81,14 +81,18 @@ describe("openArchive", () => {
     }
   });
 
-  test("FTS5 is populated by triggers", () => {
+  test("FTS5 is populated by triggers (raw_transcript + processed_transcript)", () => {
     const path = makeArchivePath();
     const db = openArchive(path);
     try {
+      // Post-v1.1 the FTS index is over the derived raw_transcript
+      // (= raw_result) and processed_transcript (= result when LLM
+      // modified it) columns. A MATCH on either column's text wins.
       db.exec(
         "INSERT INTO recording (folder_name, recording_id_hex, datetime, duration_ms, mode_name, " +
-          "llm_result, indexed_at, meta_path) " +
-          "VALUES ('f2', 'bb', '2026-01-01T00:00:00', 1000, 'Universal', 'hello bullmq world', '2026-01-01T00:00:00', '/tmp/m.json')",
+          "raw_result, result, indexed_at, meta_path) " +
+          "VALUES ('f2', 'bb', '2026-01-01T00:00:00', 1000, 'Universal', " +
+          "'hello bullmq world', 'hello bullmq world cleaned', '2026-01-01T00:00:00', '/tmp/m.json')",
       );
       const matches = queryAll(
         db,
@@ -97,6 +101,13 @@ describe("openArchive", () => {
       );
       expect(matches).toHaveLength(1);
       expect(matches[0]?.folder_name).toBe("f2");
+      // A token that lives ONLY in processed_transcript is also indexed.
+      const llmOnly = queryAll(
+        db,
+        FolderRowSchema,
+        "SELECT folder_name FROM recording_fts WHERE recording_fts MATCH 'cleaned'",
+      );
+      expect(llmOnly[0]?.folder_name).toBe("f2");
     } finally {
       db.close();
     }
