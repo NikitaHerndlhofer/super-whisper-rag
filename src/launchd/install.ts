@@ -6,13 +6,13 @@ import { DEFAULTS } from "../paths.ts";
 import { run } from "../spawn.ts";
 import { PLIST_LABEL, renderPlist } from "./plist.ts";
 
-export interface InstallSyncOptions {
+export interface InstallWatchOptions {
   binPath: string;
   logPath?: string;
-  intervalSeconds?: number;
+  throttleSeconds?: number;
 }
 
-export async function installLaunchAgent(opts: InstallSyncOptions): Promise<string> {
+export async function installLaunchAgent(opts: InstallWatchOptions): Promise<string> {
   const plistPath = DEFAULTS.launchPlist;
   await mkdir(dirname(plistPath), { recursive: true });
   await mkdir(dirname(opts.logPath ?? DEFAULTS.logFile), { recursive: true });
@@ -21,7 +21,7 @@ export async function installLaunchAgent(opts: InstallSyncOptions): Promise<stri
     binPath: opts.binPath,
     user: userInfo().username,
     logPath: opts.logPath ?? DEFAULTS.logFile,
-    intervalSeconds: opts.intervalSeconds,
+    throttleSeconds: opts.throttleSeconds,
   });
   await writeFile(plistPath, xml, "utf8");
 

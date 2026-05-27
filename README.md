@@ -112,29 +112,39 @@ in for you). `swrag bootstrap` then does everything else:
 
 1. Starts the Ollama service if it isn't already running.
 2. Pulls `bge-m3` if it isn't already pulled (~2 GB, one-time).
-3. Indexes your Super Whisper archive (applies schema migrations 1–4,
-   chunks any long-form recordings; see above).
-4. Installs the hourly background sync (launchd agent).
-5. Installs the manual-invocation agent skill for Cursor and Claude Code.
-6. Runs `swrag doctor` and prints a summary.
+3. Cleans up any launchd plists left over from a v0.9.x install (the
+   removed meeting-capture pipeline). No-op on a fresh install.
+4. Installs the event-driven watch agent (launchd) that keeps the
+   archive in sync as Super Whisper writes new recordings.
+5. Indexes your Super Whisper archive (applies schema migrations
+   1–5, chunks any long-form recordings; see above).
+6. Installs the manual-invocation agent skill for Cursor and Claude Code.
+7. Runs `swrag doctor` and prints a summary.
 
 Idempotent — re-run any time to restore the setup to known-good state.
 Each step is independently invokable too (`swrag index`,
-`swrag enable-sync`, `swrag install-skill`, `swrag doctor`) if you'd
+`swrag enable-watch`, `swrag install-skill`, `swrag doctor`) if you'd
 rather pick and choose.
 
-### About the background sync
+### About the watcher
 
-`swrag bootstrap` installs a launchd agent that runs `swrag index`
-hourly and at login, so the archive stays fresh without you thinking
-about it. Each run also applies any pending data updaters, so a
+v1.0 replaces the pre-v0.7 hourly `swrag index` cron with an
+FSEvents-based watcher (`swrag watch`) that runs as a single launchd
+keepalive agent (`com.superwhisper-rag.watch`). When Super Whisper
+writes a new recording — audio file, `meta.json`, or a row to its
+internal SQLite — the watcher detects it within ~2 seconds (a short
+debounce coalesces the burst Super Whisper emits per recording) and
+ingests it. Events on the source DB and the recordings tree are both
+watched, so either signal triggers a sync.
+
+Every ingest also applies any pending data updaters, so a
 `brew upgrade` that ships a new chunker or backfill catches your
 existing archive up automatically — no manual reindex. Even without
 the agent, every `swrag sql` runs a sub-millisecond mtime-fast-path
 ingest before the query, so on-demand freshness is automatic too.
 
-To remove the launchd agent: `swrag disable-sync`. To reinstall it:
-`swrag enable-sync` (or just `swrag bootstrap`).
+To remove the launchd agent: `swrag disable-watch`. To reinstall it:
+`swrag enable-watch` (or just `swrag bootstrap`).
 
 ### About the agent skill
 
@@ -155,8 +165,9 @@ Your edits are backed up to `SKILL.md.bak.<timestamp>` first.
 swrag doctor
 ```
 
-Should report 7/7 OK (sqlite3 + custom build + vec extension + Ollama +
-archive + data version + chunk coverage).
+Should report all 8 checks OK (sqlite3 binary + custom build + vec
+extension + Ollama + archive + data version + chunk coverage + watch
+agent).
 
 ## Configuration
 
@@ -176,16 +187,17 @@ All have sensible defaults; you shouldn't need to set any of them.
 
 ## Commands
 
-| Command                               | What it does                                                                                      |
-| ------------------------------------- | ------------------------------------------------------------------------------------------------- |
-| `swrag sql [SQL]`                     | Run SQL via sqlite3 (default: list mode). Omit SQL to open the REPL. Pass `-` to read from stdin. |
-| `swrag index`                         | Ingest changes from Super Whisper now.                                                            |
-| `swrag bootstrap`                     | One-shot post-install: start ollama, pull `bge-m3`, verify. Safe to re-run.                       |
-| `swrag doctor`                        | Verify the environment.                                                                           |
-| `swrag path [archive\|sqlite3\|vec0]` | Print a filesystem path. Default: `archive`.                                                      |
-| `swrag embed "TEXT"`                  | Print the embedding of `TEXT` as a SQLite blob literal (`x'…'`), for shell composition.           |
-| `swrag install-skill`                 | Install the manual-invocation `SKILL.md` to Cursor and Claude Code.                               |
-| `swrag enable-sync` / `disable-sync`  | Manage the hourly launchd background sync agent.                                                  |
+| Command                                | What it does                                                                                                            |
+| -------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `swrag sql [SQL]`                      | Run SQL via sqlite3 (default: list mode). Omit SQL to open the REPL. Pass `-` to read from stdin.                       |
+| `swrag index`                          | Ingest changes from Super Whisper now.                                                                                  |
+| `swrag bootstrap`                      | One-shot post-install: start ollama, pull `bge-m3`, migrate from v0.9.x, install the watch agent, verify. Safe to re-run. |
+| `swrag doctor`                         | Verify the environment.                                                                                                 |
+| `swrag path [archive\|sqlite3\|vec0]`  | Print a filesystem path. Default: `archive`.                                                                            |
+| `swrag embed "TEXT"`                   | Print the embedding of `TEXT` as a SQLite blob literal (`x'…'`), for shell composition.                                 |
+| `swrag install-skill`                  | Install the manual-invocation `SKILL.md` to Cursor and Claude Code.                                                     |
+| `swrag watch`                          | Run the event-driven watch daemon in the foreground (intended for launchd).                                             |
+| `swrag enable-watch` / `disable-watch` | Manage the launchd watch agent.                                                                                         |
 
 ## Forwarding flags to sqlite3
 

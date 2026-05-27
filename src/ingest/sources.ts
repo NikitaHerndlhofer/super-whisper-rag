@@ -78,6 +78,20 @@ LEFT JOIN recording_fts fts ON fts.recordingId = r.id
 /**
  * Open a Super Whisper SQLite file read-only and return rows newer than
  * `sinceDatetime` (ISO8601). Pass `null` to read everything.
+ *
+ * The WHERE clause normalises both sides through SQLite's `datetime()`
+ * function so we don't depend on the two strings sharing a separator
+ * shape. Super Whisper has historically written `r.datetime` as
+ * `"2025-05-18 23:18:42"` (space separator, no `Z`); our own
+ * `last_indexed_datetime` is a copy of that same value, so they match
+ * char-for-char today. But the same column has occasionally landed as
+ * `"2025-05-18T23:18:42.345Z"` after a Super Whisper migration, and a
+ * raw `>` comparison silently picks the lexicographically wrong row in
+ * those cases (`T` > space → every existing row looks "older" than the
+ * bookmark and bulk ingest stalls). `datetime()` parses every ISO8601
+ * shape SQLite supports and returns the canonical
+ * `YYYY-MM-DD HH:MM:SS` form for comparison, so the predicate is
+ * stable under either format.
  */
 export function readSourceRecordings(
   path: string,
@@ -90,7 +104,7 @@ export function readSourceRecordings(
   try {
     const sql =
       sinceDatetime != null
-        ? `${SELECT_ROWS} WHERE r.datetime > ? ORDER BY r.datetime ASC`
+        ? `${SELECT_ROWS} WHERE datetime(r.datetime) > datetime(?) ORDER BY r.datetime ASC`
         : `${SELECT_ROWS} ORDER BY r.datetime ASC`;
     const stmt = db.prepare(sql);
     const raw: unknown[] = sinceDatetime != null ? stmt.all(sinceDatetime) : stmt.all();

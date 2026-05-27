@@ -5,6 +5,8 @@ import { ensureExtensionCapableSqlite } from "../archive/open.ts";
 import { LATEST_DATA_VERSION } from "../archive/updaters.ts";
 import { vecDylibPath } from "../archive/vec-loader.ts";
 import { checkOllama } from "../embed/ollama.ts";
+import { PLIST_LABEL } from "../launchd/plist.ts";
+import { run } from "../spawn.ts";
 import { findSqlite3Binary } from "../sqlite3.ts";
 
 const VecVersionRowSchema = z.object({ v: z.string() });
@@ -14,6 +16,11 @@ export interface DoctorOptions {
   archive: string;
   embedModel: string;
   ollamaHost: string;
+  /**
+   * Override the watch-agent probe for tests. Returns true iff
+   * `launchctl print gui/<uid>/<label>` reports the agent is loaded.
+   */
+  probeWatchAgent?: () => boolean;
 }
 
 interface Check {
@@ -96,6 +103,8 @@ export async function runDoctor(opts: DoctorOptions): Promise<{
     checks.push(chunkCoverageCheck(opts.archive));
   }
 
+  checks.push(watchAgentCheck(opts.probeWatchAgent));
+
   const ok = checks.every((c) => c.ok);
   const lines: string[] = [];
   for (const c of checks) {
@@ -105,6 +114,36 @@ export async function runDoctor(opts: DoctorOptions): Promise<{
   lines.push("");
   lines.push(ok ? "All checks passed." : "One or more checks failed.");
   return { exitCode: ok ? 0 : 2, output: `${lines.join("\n")}\n` };
+}
+
+/**
+ * Probe the watch launchd agent by asking `launchctl print` whether
+ * the unit is loaded. Exit code 0 = loaded; any non-zero = not loaded
+ * (most commonly "service not loaded" but we don't distinguish — the
+ * fix is the same).
+ *
+ * We deliberately don't try to introspect the plist on disk. A plist
+ * file present but not loaded is a stale install from before a
+ * `launchctl bootout`; what the user cares about is "is my watcher
+ * actually running right now", which only `launchctl print` can
+ * answer.
+ */
+function watchAgentCheck(probe?: () => boolean): Check {
+  const name = "watch agent (launchd)";
+  const loaded = (probe ?? defaultProbeWatchAgent)();
+  return {
+    name,
+    ok: loaded,
+    detail: loaded ? `${PLIST_LABEL} loaded` : `${PLIST_LABEL} not loaded`,
+    hint: loaded ? undefined : "swrag enable-watch",
+  };
+}
+
+function defaultProbeWatchAgent(): boolean {
+  const uid = process.getuid?.();
+  if (uid == null) return false;
+  const r = run(["launchctl", "print", `gui/${uid}/${PLIST_LABEL}`], { timeoutMs: 3_000 });
+  return r.exitCode === 0;
 }
 
 function safeCheck(name: string, fn: () => string, hint: string): Check {

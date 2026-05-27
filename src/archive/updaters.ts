@@ -21,6 +21,7 @@
 import type { Database } from "bun:sqlite";
 import type { IngestOptions } from "../ingest/ingester.ts";
 import { backfillChunks } from "./updaters/004_backfill_chunks.ts";
+import { v09Marker } from "./updaters/005_v09_marker.ts";
 
 export interface Updater {
   /** Strictly increasing integer. By convention, matches the migration version it pairs with. */
@@ -38,6 +39,7 @@ export interface Updater {
 
 export const UPDATERS: readonly Updater[] = [
   { version: 4, name: "backfill_chunks", fn: backfillChunks },
+  { version: 5, name: "v09_marker", fn: v09Marker },
 ];
 
 /** Latest data version known to this binary. */

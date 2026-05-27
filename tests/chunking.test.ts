@@ -19,6 +19,7 @@ import {
 } from "../src/ingest/chunker.ts";
 import { ensureFresh } from "../src/ingest/ingester.ts";
 import { ensureExtensionCapableSqlite } from "../src/archive/open.ts";
+import { LATEST_DATA_VERSION } from "../src/archive/updaters.ts";
 import { vecDylibPath } from "../src/archive/vec-loader.ts";
 import { makeEnv, queryOne, stubEmbed, type TestEnv } from "./helpers.ts";
 
@@ -725,11 +726,14 @@ describe("ingester long-row branch", () => {
       );
       expect(cnt.n).toBeGreaterThanOrEqual(2);
 
-      // And data_version should now be present and current.
+      // And data_version should now be present and current. We compare
+      // against the binary's LATEST_DATA_VERSION rather than a hard
+      // constant so adding a future v6/v7 marker updater doesn't
+      // re-break this test.
       const dv: unknown = db
         .prepare("SELECT value FROM config WHERE key = 'data_version'")
         .get();
-      expect(z.object({ value: z.string() }).parse(dv).value).toBe("4");
+      expect(z.object({ value: z.string() }).parse(dv).value).toBe(String(LATEST_DATA_VERSION));
     } finally {
       db.close();
     }

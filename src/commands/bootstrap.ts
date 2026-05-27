@@ -13,23 +13,30 @@
  *   2. Embed model — `ollama pull <model>` (one-time ~2 GB) if not
  *      already present, with the live progress UI inherited so the
  *      user sees what's happening.
- *   3. Archive — run an initial `swrag index` to populate the SQLite
+ *   3. v0.9 cleanup — tear down any leftover meeting-pipeline launchd
+ *      plists and the legacy periodic sync plist. Safe no-op when the
+ *      user is on a fresh install.
+ *   4. Watch agent — install the keepalive launchd plist that runs
+ *      `swrag watch`, the event-driven daemon that replaces the
+ *      pre-v0.7 hourly sync.
+ *   5. Archive — run an initial `swrag index` to populate the SQLite
  *      database from Super Whisper's data (transcripts, embeddings,
- *      supersedence detection).
- *   4. Background sync — install the launchd agent so the archive
- *      stays in sync hourly without manual `swrag index` calls.
- *   5. Agent skill — write the manual-invocation SKILL.md to
+ *      supersedence detection). Runs AFTER the watch install so a
+ *      slow first ingest doesn't delay the daemon coming up.
+ *   6. Agent skill — write the manual-invocation SKILL.md to
  *      ~/.cursor/skills/superwhisper-rag/ and ~/.claude/skills/.
  *      Harmless if those tools aren't installed (the file just sits
  *      dormant).
- *   6. Final verify — run `swrag doctor`.
+ *   7. Final verify — run `swrag doctor`.
  *
  * Safe to re-run. Each step is a check-and-fix:
  *   - Ollama: skipped if reachable.
  *   - Model pull: skipped if `bge-m3` already present.
+ *   - v0.9 cleanup: per-plist exists() check, no-op when there's
+ *     nothing to remove.
+ *   - Watch install: bootouts the running instance first, idempotent.
  *   - Ingest: mtime fast-path makes it sub-millisecond when nothing
  *     in Super Whisper has changed.
- *   - launchd: bootouts the running instance first, idempotent.
  *   - Skill: only overwrites when content matches the last hash we
  *     wrote — user edits are preserved.
  *
@@ -43,6 +50,7 @@ import { installLaunchAgent } from "../launchd/install.ts";
 import { info, verbose } from "../log.ts";
 import { runDoctor } from "./doctor.ts";
 import { installSkill } from "./install-skill.ts";
+import { migrateFromV09 } from "./migrate-from-v09.ts";
 
 const SERVICE_START_WAIT_MS = 8_000;
 const SERVICE_START_POLL_INTERVAL_MS = 500;
@@ -72,16 +80,18 @@ export interface BootstrapOptions {
   serviceStartWaitMs?: number;
   /** Override the initial archive ingest for tests. */
   ingest?: () => Promise<void>;
-  /** Override the launchd sync installer for tests. */
-  installSync?: () => Promise<void>;
+  /** Override the v0.9 cleanup step for tests. */
+  migrateLegacy?: () => Promise<string[]>;
+  /** Override the launchd watch installer for tests. */
+  installWatch?: () => Promise<void>;
   /** Override the agent skill installer for tests. */
   installAgentSkill?: () => Promise<void>;
   /**
-   * Skip the launchd sync install. Useful in dev (running via
+   * Skip the launchd watch install. Useful in dev (running via
    * `bun run`) where the binary isn't yet at a stable Homebrew path
    * and `installLaunchAgent` would have nothing sensible to embed.
    */
-  skipSync?: boolean;
+  skipWatch?: boolean;
   /** Skip the agent skill install. */
   skipSkill?: boolean;
 }
@@ -91,8 +101,10 @@ export interface BootstrapResult {
   startedOllama: boolean;
   pulledModel: boolean;
   ingested: boolean;
-  installedSync: boolean;
+  installedWatch: boolean;
   installedSkill: boolean;
+  /** Plist files removed by the v0.9 cleanup step (empty on fresh installs). */
+  legacyRemoved: string[];
   doctorOutput: string;
 }
 
@@ -103,8 +115,9 @@ export async function runBootstrap(opts: BootstrapOptions): Promise<BootstrapRes
   let startedOllama = false;
   let pulledModel = false;
   let ingested = false;
-  let installedSync = false;
+  let installedWatch = false;
   let installedSkill = false;
+  let legacyRemoved: string[] = [];
 
   const reachable = opts.isOllamaReachable ?? (() => isOllamaReachable(host));
   const startOllama = opts.startOllama ?? (() => brewServicesStartOllama());
@@ -122,8 +135,9 @@ export async function runBootstrap(opts: BootstrapOptions): Promise<BootstrapRes
         ollamaHost: host,
       });
     });
-  const installSyncFn =
-    opts.installSync ??
+  const migrateFn = opts.migrateLegacy ?? (() => migrateFromV09());
+  const installWatchFn =
+    opts.installWatch ??
     (async () => {
       await installLaunchAgent({ binPath: resolveStableBinPath() });
     });
@@ -163,31 +177,40 @@ export async function runBootstrap(opts: BootstrapOptions): Promise<BootstrapRes
     verbose(`bootstrap: ${model} already pulled`);
   }
 
-  // 3. Archive ingest
-  info("bootstrap: indexing the archive (sub-ms fast-path if Super Whisper hasn't changed)");
-  await ingestFn();
-  ingested = true;
-
-  // 4. launchd background sync
-  if (opts.skipSync) {
-    verbose("bootstrap: skipping launchd sync (--skip-sync)");
+  // 3. v0.9 cleanup
+  info("bootstrap: checking for v0.9.x leftovers");
+  legacyRemoved = await migrateFn();
+  if (legacyRemoved.length > 0) {
+    info(`bootstrap: removed ${legacyRemoved.length} legacy plist(s)`);
   } else {
-    info("bootstrap: installing hourly background sync (launchd)");
+    verbose("bootstrap: no v0.9.x leftovers found");
+  }
+
+  // 4. launchd watch agent
+  if (opts.skipWatch) {
+    verbose("bootstrap: skipping launchd watch install (--skip-watch)");
+  } else {
+    info("bootstrap: installing event-driven watch agent (launchd)");
     try {
-      await installSyncFn();
-      installedSync = true;
+      await installWatchFn();
+      installedWatch = true;
     } catch (e) {
       // Most common failure: running from a `bun run` dev context
       // where there's no stable binary path. Surface the error but
       // don't abort — the rest of the bootstrap should still
       // complete.
       info(
-        `bootstrap: launchd sync install skipped (${e instanceof Error ? e.message : String(e)})`,
+        `bootstrap: launchd watch install skipped (${e instanceof Error ? e.message : String(e)})`,
       );
     }
   }
 
-  // 5. Agent skill
+  // 5. Archive ingest
+  info("bootstrap: indexing the archive (sub-ms fast-path if Super Whisper hasn't changed)");
+  await ingestFn();
+  ingested = true;
+
+  // 6. Agent skill
   if (opts.skipSkill) {
     verbose("bootstrap: skipping agent skill install (--skip-skill)");
   } else {
@@ -196,7 +219,7 @@ export async function runBootstrap(opts: BootstrapOptions): Promise<BootstrapRes
     installedSkill = true;
   }
 
-  // 6. Doctor — final verify
+  // 7. Doctor — final verify
   const doctor =
     opts.doctor ??
     (() =>
@@ -213,8 +236,11 @@ export async function runBootstrap(opts: BootstrapOptions): Promise<BootstrapRes
   const summary: string[] = [];
   summary.push(startedOllama ? "started ollama" : "ollama already up");
   summary.push(pulledModel ? `pulled ${model}` : `${model} already pulled`);
+  summary.push(
+    legacyRemoved.length > 0 ? `removed ${legacyRemoved.length} v0.9 plist(s)` : "no v0.9 cleanup",
+  );
+  summary.push(installedWatch ? "watch agent enabled" : "watch skipped");
   summary.push(ingested ? "archive indexed" : "archive skipped");
-  summary.push(installedSync ? "hourly sync enabled" : "sync skipped");
   summary.push(installedSkill ? "agent skill installed" : "skill skipped");
   info(`bootstrap done: ${summary.join("; ")}`);
 
@@ -223,15 +249,16 @@ export async function runBootstrap(opts: BootstrapOptions): Promise<BootstrapRes
     startedOllama,
     pulledModel,
     ingested,
-    installedSync,
+    installedWatch,
     installedSkill,
+    legacyRemoved,
     doctorOutput: r.output,
   };
 }
 
 /**
  * Resolve the stable Homebrew symlink path for the swrag binary, the
- * same way `cli.ts::resolveBinPath` does for `swrag enable-sync`.
+ * same way `cli.ts::resolveBinPath` does for `swrag enable-watch`.
  * Duplicated here intentionally — the CLI's version reaches into
  * `process.execPath` which we don't want bootstrap (a library
  * function) to depend on.

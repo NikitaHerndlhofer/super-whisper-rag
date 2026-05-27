@@ -22,7 +22,7 @@ export const DEFAULTS = {
   archive: join(HOME, "Library", "Application Support", "superwhisper-rag", "swrag.sqlite"),
   logFile: join(HOME, "Library", "Logs", "superwhisper-rag.log"),
   launchAgentsDir: join(HOME, "Library", "LaunchAgents"),
-  launchPlist: join(HOME, "Library", "LaunchAgents", "com.superwhisper-rag.sync.plist"),
+  launchPlist: join(HOME, "Library", "LaunchAgents", "com.superwhisper-rag.watch.plist"),
   cursorSkillDir: join(HOME, ".cursor", "skills", "superwhisper-rag"),
   claudeSkillDir: join(HOME, ".claude", "skills", "superwhisper-rag"),
   ollamaHost: "http://127.0.0.1:11434",

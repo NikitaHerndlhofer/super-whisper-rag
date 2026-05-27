@@ -8,11 +8,12 @@ import type { Env } from "./schemas.ts";
 import { runBootstrap } from "./commands/bootstrap.ts";
 import { runDoctor } from "./commands/doctor.ts";
 import { runEmbed } from "./commands/embed.ts";
-import { disableSync, enableSync } from "./commands/enable-sync.ts";
+import { disableWatch, enableWatch } from "./commands/enable-watch.ts";
 import { runIndex } from "./commands/index.ts";
 import { installSkill } from "./commands/install-skill.ts";
 import { getPath, PathTargetSchema } from "./commands/path.ts";
 import { runSql, readSqlInput } from "./commands/sql.ts";
+import { runWatchCommand } from "./commands/watch.ts";
 
 // The CLI surface is intentionally tiny — zero flags. Everything that used
 // to be a flag is an env var, parsed and validated through `getEnv()`.
@@ -187,12 +188,36 @@ const bootstrapCmd = defineCommand({
   meta: {
     name: "bootstrap",
     description:
-      "One-shot post-install: start ollama, pull the embed model, index the archive, enable hourly sync, install the agent skill, and verify. Safe to re-run.",
+      "One-shot post-install: start ollama, pull the embed model, migrate from any v0.9.x install, index the archive, enable the event-driven watch agent, install the agent skill, and verify. Safe to re-run.",
   },
   args: {},
   async run() {
     const r = await runBootstrap(ctx().paths);
     process.exit(r.exitCode);
+  },
+});
+
+/* -------------------------------------------------------------------------- */
+/* watch — long-running FSEvents daemon                                       */
+/* -------------------------------------------------------------------------- */
+
+const watchCmd = defineCommand({
+  meta: {
+    name: "watch",
+    description:
+      "Run the FSEvents-based watch daemon in the foreground (intended for launchd; use `swrag enable-watch` to install it).",
+  },
+  args: {},
+  async run() {
+    const { env, paths } = ctx();
+    await runWatchCommand({
+      archive: paths.archive,
+      sourceDir: paths.sourceDir,
+      sourceDb: paths.sourceDb,
+      embedModel: paths.embedModel,
+      ollamaHost: paths.ollamaHost,
+      skipEmbeddings: env.SWRAG_SKIP_EMBED,
+    });
   },
 });
 
@@ -245,7 +270,7 @@ const embedCmd = defineCommand({
 });
 
 /* -------------------------------------------------------------------------- */
-/* install-skill / enable-sync / disable-sync                                 */
+/* install-skill / enable-watch / disable-watch                               */
 /* -------------------------------------------------------------------------- */
 
 const installSkillCmd = defineCommand({
@@ -262,22 +287,22 @@ const installSkillCmd = defineCommand({
   },
 });
 
-const enableSyncCmd = defineCommand({
+const enableWatchCmd = defineCommand({
   meta: {
-    name: "enable-sync",
-    description: "Install hourly launchd sync agent",
+    name: "enable-watch",
+    description: "Install the keepalive launchd watch agent (event-driven ingest)",
   },
   args: {},
   async run() {
-    await enableSync({ binPath: resolveBinPath() });
+    await enableWatch({ binPath: resolveBinPath() });
   },
 });
 
-const disableSyncCmd = defineCommand({
-  meta: { name: "disable-sync", description: "Remove the launchd sync agent" },
+const disableWatchCmd = defineCommand({
+  meta: { name: "disable-watch", description: "Remove the launchd watch agent" },
   args: {},
   async run() {
-    await disableSync();
+    await disableWatch();
   },
 });
 
@@ -289,7 +314,7 @@ const disableSyncCmd = defineCommand({
  * the new bottle lands at a fresh Cellar dir, the symlink is rewired
  * atomically, and `brew cleanup` deletes the old Cellar — which would
  * leave a launchd plist pointing at a deleted realpath. The symlink
- * survives upgrades, so the plist captured by `swrag enable-sync` keeps
+ * survives upgrades, so the plist captured by `swrag enable-watch` keeps
  * working across versions without re-running the command.
  *
  * Resolution order:
@@ -299,8 +324,8 @@ const disableSyncCmd = defineCommand({
  *
  * If none of those resolve we throw rather than write a plist that
  * points at a path which is known not to exist — the user would only
- * discover the breakage when launchd silently failed to fire the
- * hourly sync.
+ * discover the breakage when launchd silently failed to start the
+ * watch daemon.
  */
 function resolveBinPath(): string {
   for (const p of ["/opt/homebrew/bin/swrag", "/usr/local/bin/swrag"]) {
@@ -317,7 +342,7 @@ function resolveBinPath(): string {
   throw new Error(
     "cannot resolve a stable swrag binary path for launchd. " +
       "Install via Homebrew (`brew install NikitaHerndlhofer/tap/superwhisper-rag`) " +
-      "and re-run `swrag enable-sync`.",
+      "and re-run `swrag enable-watch`.",
   );
 }
 
@@ -330,7 +355,7 @@ const main = defineCommand({
     name: "swrag",
     version: VERSION,
     description:
-      "Thin sqlite3 wrapper for your Super Whisper dictation archive. Adds a sync ingester and an embed() shortcut.",
+      "Thin sqlite3 wrapper for your Super Whisper dictation archive. Adds an event-driven watch daemon and an embed() shortcut.",
   },
   subCommands: {
     sql: sqlCmd,
@@ -340,8 +365,9 @@ const main = defineCommand({
     path: pathCmd,
     embed: embedCmd,
     "install-skill": installSkillCmd,
-    "enable-sync": enableSyncCmd,
-    "disable-sync": disableSyncCmd,
+    watch: watchCmd,
+    "enable-watch": enableWatchCmd,
+    "disable-watch": disableWatchCmd,
   },
 });
 

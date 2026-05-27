@@ -36,7 +36,8 @@ function withDefaults<T extends object>(over: T) {
     pullModel: async () => {},
     checkOllamaModel: () => Promise.resolve(null),
     ingest: async () => {},
-    installSync: async () => {},
+    migrateLegacy: async () => [],
+    installWatch: async () => {},
     installAgentSkill: async () => {},
     doctor: stubDoctorOk,
     ...over,
@@ -63,37 +64,45 @@ describe("runBootstrap", () => {
           order.push("pull-model");
         },
         checkOllamaModel: () => Promise.resolve('embed model "x" not pulled. Run: ollama pull x'),
+        migrateLegacy: async () => {
+          order.push("migrate-legacy");
+          return [];
+        },
+        installWatch: async () => {
+          order.push("install-watch");
+        },
         ingest: async () => {
           order.push("ingest");
-        },
-        installSync: async () => {
-          order.push("install-sync");
         },
         installAgentSkill: async () => {
           order.push("install-skill");
         },
       }),
     );
-    // Order is the spec: ollama → model → ingest → sync → skill.
+    // Order is the v1.0 spec: ollama → model → migrate → watch → ingest → skill.
+    // (Watch goes before ingest so a slow first index doesn't delay the
+    // daemon coming up.)
     expect(order).toEqual([
       "start-ollama",
       "pull-model",
+      "migrate-legacy",
+      "install-watch",
       "ingest",
-      "install-sync",
       "install-skill",
     ]);
     expect(r.exitCode).toBe(0);
     expect(r.startedOllama).toBe(true);
     expect(r.pulledModel).toBe(true);
     expect(r.ingested).toBe(true);
-    expect(r.installedSync).toBe(true);
+    expect(r.installedWatch).toBe(true);
     expect(r.installedSkill).toBe(true);
+    expect(r.legacyRemoved).toEqual([]);
   });
 
   test("no-op-friendly: nothing executes when everything is already in good shape", async () => {
     let startCalls = 0;
     let pullCalls = 0;
-    let syncCalls = 0;
+    let watchCalls = 0;
     let skillCalls = 0;
     const r = await runBootstrap(
       withDefaults({
@@ -103,8 +112,8 @@ describe("runBootstrap", () => {
         pullModel: async () => {
           pullCalls++;
         },
-        installSync: async () => {
-          syncCalls++;
+        installWatch: async () => {
+          watchCalls++;
         },
         installAgentSkill: async () => {
           skillCalls++;
@@ -113,17 +122,31 @@ describe("runBootstrap", () => {
     );
     expect(startCalls).toBe(0);
     expect(pullCalls).toBe(0);
-    // Sync + skill always run (they're idempotent themselves). The
+    // Watch + skill always run (they're idempotent themselves). The
     // *bootstrap* doesn't need to know whether they were already
     // installed because their internal install logic handles that.
-    expect(syncCalls).toBe(1);
+    expect(watchCalls).toBe(1);
     expect(skillCalls).toBe(1);
     expect(r.startedOllama).toBe(false);
     expect(r.pulledModel).toBe(false);
     expect(r.ingested).toBe(true);
-    expect(r.installedSync).toBe(true);
+    expect(r.installedWatch).toBe(true);
     expect(r.installedSkill).toBe(true);
     expect(r.exitCode).toBe(0);
+  });
+
+  test("v0.9 cleanup: reports which legacy plists were removed", async () => {
+    const r = await runBootstrap(
+      withDefaults({
+        migrateLegacy: async () => [
+          "/Users/x/Library/LaunchAgents/com.superwhisper-rag.meeting-watch.plist",
+          "/Users/x/Library/LaunchAgents/com.superwhisper-rag.sync.plist",
+        ],
+      }),
+    );
+    expect(r.legacyRemoved).toHaveLength(2);
+    expect(r.legacyRemoved[0]).toContain("meeting-watch.plist");
+    expect(r.legacyRemoved[1]).toContain("sync.plist");
   });
 
   test("starts ollama when not reachable, then succeeds", async () => {
@@ -181,7 +204,7 @@ describe("runBootstrap", () => {
     let skillRan = false;
     const r = await runBootstrap(
       withDefaults({
-        installSync: async () => {
+        installWatch: async () => {
           throw new Error("no stable bin path (dev mode)");
         },
         installAgentSkill: async () => {
@@ -189,30 +212,30 @@ describe("runBootstrap", () => {
         },
       }),
     );
-    expect(r.installedSync).toBe(false);
+    expect(r.installedWatch).toBe(false);
     expect(skillRan).toBe(true);
     expect(r.installedSkill).toBe(true);
     expect(r.exitCode).toBe(0);
   });
 
-  test("skipSync / skipSkill flags do what they say", async () => {
-    let syncCalls = 0;
+  test("skipWatch / skipSkill flags do what they say", async () => {
+    let watchCalls = 0;
     let skillCalls = 0;
     const r = await runBootstrap(
       withDefaults({
-        skipSync: true,
+        skipWatch: true,
         skipSkill: true,
-        installSync: async () => {
-          syncCalls++;
+        installWatch: async () => {
+          watchCalls++;
         },
         installAgentSkill: async () => {
           skillCalls++;
         },
       }),
     );
-    expect(syncCalls).toBe(0);
+    expect(watchCalls).toBe(0);
     expect(skillCalls).toBe(0);
-    expect(r.installedSync).toBe(false);
+    expect(r.installedWatch).toBe(false);
     expect(r.installedSkill).toBe(false);
   });
 
