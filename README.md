@@ -90,6 +90,13 @@ swrag sql "SELECT r.folder_name, c.chunk_idx, c.text,
 See [`docs/sql-cookbook.md`](docs/sql-cookbook.md) for the full set of
 recipes.
 
+`processed_transcript`, `raw_transcript`, and `datetime_iso` are the
+v1.1.0 canonical columns — stable across Super Whisper versions, indexed,
+safe to query. Super Whisper's own `result`, `llm_result`, and
+`raw_result` columns are mirrored into the archive as-is for raw access
+when you need it; they shift shape between SW releases, so the canonical
+columns are what you want in day-to-day queries.
+
 ## Long-form recordings
 
 Meetings are too long for a single embedding to be useful — `bge-m3`'s
@@ -119,14 +126,12 @@ in for you). `swrag bootstrap` then does everything else:
 
 1. Starts the Ollama service if it isn't already running.
 2. Pulls `bge-m3` if it isn't already pulled (~2 GB, one-time).
-3. Cleans up any launchd plists left over from a v0.9.x install (the
-   removed meeting-capture pipeline). No-op on a fresh install.
-4. Installs the event-driven watch agent (launchd) that keeps the
+3. Installs the event-driven watch agent (launchd) that keeps the
    archive in sync as Super Whisper writes new recordings.
-5. Indexes your Super Whisper archive (applies schema migrations
-   1–5, chunks any long-form recordings; see above).
-6. Installs the manual-invocation agent skill for Cursor and Claude Code.
-7. Runs `swrag doctor` and prints a summary.
+4. Indexes your Super Whisper archive (chunks any long-form
+   recordings; see above).
+5. Installs the manual-invocation agent skill for Cursor and Claude Code.
+6. Runs `swrag doctor` and prints a summary.
 
 Idempotent — re-run any time to restore the setup to known-good state.
 Each step is independently invokable too (`swrag index`,
@@ -135,14 +140,14 @@ rather pick and choose.
 
 ### About the watcher
 
-v1.0 replaces the pre-v0.7 hourly `swrag index` cron with an
-FSEvents-based watcher (`swrag watch`) that runs as a single launchd
-keepalive agent (`com.superwhisper-rag.watch`). When Super Whisper
-writes a new recording — audio file, `meta.json`, or a row to its
-internal SQLite — the watcher detects it within ~2 seconds (a short
-debounce coalesces the burst Super Whisper emits per recording) and
-ingests it. Events on the source DB and the recordings tree are both
-watched, so either signal triggers a sync.
+The archive stays in sync via an FSEvents-based watcher
+(`swrag watch`) that runs as a single launchd keepalive agent
+(`com.superwhisper-rag.watch`). When Super Whisper writes a new
+recording — audio file, `meta.json`, or a row to its internal
+SQLite — the watcher detects it within ~2 seconds (a short debounce
+coalesces the burst Super Whisper emits per recording) and ingests
+it. Events on the source DB and the recordings tree are both
+watched, so either signal triggers a sync. No cron, no polling.
 
 Every ingest also applies any pending data updaters, so a
 `brew upgrade` that ships a new chunker or backfill catches your
@@ -198,7 +203,7 @@ All have sensible defaults; you shouldn't need to set any of them.
 | -------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
 | `swrag sql [SQL]`                      | Run SQL via sqlite3 (default: list mode). Omit SQL to open the REPL. Pass `-` to read from stdin.                       |
 | `swrag index`                          | Ingest changes from Super Whisper now.                                                                                  |
-| `swrag bootstrap`                      | One-shot post-install: start ollama, pull `bge-m3`, migrate from v0.9.x, install the watch agent, verify. Safe to re-run. |
+| `swrag bootstrap`                      | One-shot post-install: start ollama, pull `bge-m3`, install the watch agent, index, install the agent skill, verify. Safe to re-run. |
 | `swrag doctor`                         | Verify the environment.                                                                                                 |
 | `swrag path [archive\|sqlite3\|vec0]`  | Print a filesystem path. Default: `archive`.                                                                            |
 | `swrag embed "TEXT"`                   | Print the embedding of `TEXT` as a SQLite blob literal (`x'…'`), for shell composition.                                 |
